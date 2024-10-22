@@ -10,10 +10,10 @@ bash <(curl -fsSL https://github.com/mi1314cat/sing-box-core/raw/refs/heads/main
 ```bash
 bash <(curl -fsSL https://github.com/mi1314cat/sing-box-core/raw/refs/heads/main/beta.sh)
 ```
-### 尝鲜区
- tcp-brutal reality(双端sing-box 1.7.0及以上可用)
 
-[文档](https://github.com/apernet/tcp-brutal/blob/master/README.zh.md)
+## tcp-brutal reality(双端sing-box 1.7.0及以上可用)
+
+
 
 ```bash
 bash <(curl -fsSL https://github.com/mi1314cat/sing-box-core/raw/refs/heads/main/tcp-brutal-reality.sh)
