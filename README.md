@@ -23,3 +23,67 @@ bash <(curl -fsSL https://github.com/mi1314cat/sing-box-core/raw/refs/heads/main
 ```bash
 bash <(curl -fsSL https://github.com/mi1314cat/sing-box-core/raw/refs/heads/main/brutal-reality-hysteria.sh)
 ```
+# sing-box服务管理
+
+## 启用
+```
+sudo systemctl enable sing-box
+```
+## 禁用
+```
+sudo systemctl disable sing-box
+```
+## 启动
+```
+sudo systemctl start sing-box
+```
+## 停止	
+```
+sudo systemctl stop sing-box
+```
+## 强行停止
+```
+sudo systemctl kill sing-box
+```
+## 重新启动	
+```
+sudo systemctl restart sing-box
+```
+## 查看状态
+```
+sudo systemctl status sing-box
+```
+## 查看日志	
+```
+sudo journalctl -u sing-box --output cat -e
+```
+## 实时日志	
+```
+sudo journalctl -u sing-box --output cat -f
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
