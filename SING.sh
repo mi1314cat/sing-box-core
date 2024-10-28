@@ -95,13 +95,14 @@ read -rp "请输入回落域名: " dest_server
 # 生成 UUID 
 UUID=$(generate_uuid)
 KEY_DIR="$TARGET_DIR"  # 修改为你想要的路径
+
 PRIVATE_KEY_FILE="$KEY_DIR/private.key"
 PUBLIC_KEY_FILE="$KEY_DIR/public.key"
 
 
 
-# 生成私钥
-openssl genpkey -algorithm RSA -out "$PRIVATE_KEY_FILE"
+# 生成 2048 位的私钥
+openssl genpkey -algorithm RSA -out "$PRIVATE_KEY_FILE" -pkeyopt rsa_keygen_bits:2048
 
 # 从私钥生成公钥
 openssl rsa -pubout -in "$PRIVATE_KEY_FILE" -out "$PUBLIC_KEY_FILE"
@@ -109,7 +110,6 @@ openssl rsa -pubout -in "$PRIVATE_KEY_FILE" -out "$PUBLIC_KEY_FILE"
 # 输出结果
 echo "私钥已生成：$PRIVATE_KEY_FILE"
 echo "公钥已生成：$PUBLIC_KEY_FILE"
-
 # Hysteria2
 Hysteria2_PORT=$(generate_port "Hysteria2")
 # 生成自签证书
