@@ -248,8 +248,8 @@ cat << EOF > /etc/sing-box/config.json
       ],
       "tls": {
         "enabled": true,
-        "certificate_path": "$TARGET_DIR/fullchain.cer",
-        "key_path": "$TARGET_DIR/private.key"
+        "certificate_path": "$TARGET_DIR/fullchain.pem",
+        "key_path": "$TARGET_DIR/privkey.pem"
       }
     }
   ],
