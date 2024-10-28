@@ -206,7 +206,7 @@ cat << EOF > /etc/sing-box/config.json
             "server": "$dest_server",
             "server_port": 443
           },
-          "private_key": "$(cat $TARGET_DIR/privatekey)"",
+          "private_key": "$(cat $TARGET_DIR/privatekey)",
           "short_id": [
             "$short_id"
           ]
