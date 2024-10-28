@@ -93,7 +93,7 @@ reality_PORT=$(generate_port "vless-reality")
 read -rp "请输入回落域名: " dest_server
 [ -z "$dest_server" ] && dest_server=$(random_website)
 # 生成 UUID 
-UUID=$(generate_uuid)
+reality_UUID=$(generate_uuid)
 # 生成密钥并保存输出
 output=$(sing-box generate reality-keypair)
 
@@ -124,7 +124,9 @@ openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) \
 AUTH_PASSWORD=$(openssl rand -base64 16)
 
 # vless_tls
-vless_PORT=$(generate_port "vless-tls")
+vless_PORT=$(generate_port "vless")
+# 生成 UUID 
+vless_UUID=$(generate_uuid)
 # 提示用户输入域名
 read -p "请输入域名: " DOMAIN
 
@@ -193,7 +195,7 @@ cat << EOF > /etc/sing-box/config.json
       "listen_port": $reality_PORT,
       "users": [
         {
-          "uuid": "$UUID",
+          "uuid": "$reality_UUID",
           "flow": "xtls-rprx-vision"
         }
       ],
@@ -240,7 +242,7 @@ cat << EOF > /etc/sing-box/config.json
       "listen_port": $vless_PORT,
       "users": [
         {
-          "uuid": "$UUID",
+          "uuid": "$vless_UUID",
           "flow": "xtls-rprx-vision"
         }
       ],
@@ -332,14 +334,14 @@ proxies:
     reality-opts:
       public-key: $public_key
       short-id: $short_id
-    uuid: "$UUID"
+    uuid: "$reality_UUID"
     flow: xtls-rprx-vision
     client-fingerprint: chrome  
   - name: SING-vless
     port: $vless_PORT  
     server: $DOMAIN_LOWER
     type: vless
-    uuid: "$UUID"
+    uuid: "$vless_UUID"
     flow: xtls-rprx-vision
     tls:
       enabled: true
