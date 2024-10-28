@@ -211,8 +211,7 @@ cat << EOF > /etc/sing-box/config.json
             "$short_id"
           ]
         }
-      },
-      
+      }
     },
     {
       "sniff": true,
@@ -240,19 +239,19 @@ cat << EOF > /etc/sing-box/config.json
       "listen": "::",
       "listen_port": $vless_PORT,
       "users": [
-          {
-              "uuid": "$UUID",
-              "flow": "xtls-rprx-vision"
-          }
+        {
+          "uuid": "$UUID",
+          "flow": "xtls-rprx-vision"
+        }
       ],
       "tls": {
-          "enabled": true,
-          "certificate_path": "$TARGET_DIR/fullchain.cer",
-          "key_path": "$TARGET_DIR/private.key"
+        "enabled": true,
+        "certificate_path": "$TARGET_DIR/fullchain.cer",
+        "key_path": "$TARGET_DIR/private.key"
       }
-  }
-],
-   "outbounds": [
+    }
+  ],
+  "outbounds": [
     {
       "type": "direct",
       "tag": "direct"
@@ -263,6 +262,7 @@ cat << EOF > /etc/sing-box/config.json
     }
   ]
 }
+
 
 EOF
 
