@@ -5,6 +5,11 @@
 ```bash
 bash <(curl -fsSL https://github.com/mi1314cat/sing-box-core/raw/refs/heads/main/install.sh)
 ```
+### reality和hysteria2 vless+tls三合一脚本 **需要域名**
+
+```bash
+bash <(curl -fsSL https://github.com/mi1314cat/sing-box-core/raw/refs/heads/main/SING.sh)
+```
 ### reality和hysteria2 vmess ws三合一脚本
 
 ```bash
