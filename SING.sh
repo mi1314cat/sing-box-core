@@ -94,27 +94,22 @@ read -rp "请输入回落域名: " dest_server
 [ -z "$dest_server" ] && dest_server=$(random_website)
 # 生成 UUID 
 UUID=$(generate_uuid)
-KEY_DIR="$TARGET_DIR"  # 修改为你想要的路径
-PRIVATE_KEY_FILE="$KEY_DIR/private.key"
-PUBLIC_KEY_FILE="$KEY_DIR/public.key"
+# 生成密钥并保存输出
+output=$(sing-box generate reality-keypair)
 
-# 创建目录（如果不存在）
-mkdir -p "$KEY_DIR"
+# 提取私钥和公钥
+private_key=$(echo "$output" | grep "PrivateKey" | awk '{print $2}')
+public_key=$(echo "$output" | grep "PublicKey" | awk '{print $2}')
 
-# 生成 2048 位的 RSA 私钥
-openssl genpkey -algorithm RSA -out "$PRIVATE_KEY_FILE" -pkeyopt rsa_keygen_bits:2048
+# 保存私钥和公钥到不同文件
+echo "$private_key" > $TARGET_DIR/private_key.txt
+echo "$public_key" > $TARGET_DIR/public_key.txt
 
-# 从私钥生成公钥
-openssl rsa -pubout -in "$PRIVATE_KEY_FILE" -out "$PUBLIC_KEY_FILE"
+# 输出保存成功的提示
+echo "私钥已保存到 $TARGET_DIR/private_key.txt"
+echo "公钥已保存到 $TARGET_DIR/public_key.txt"
 
-# 将私钥和公钥转换为 Base64 编码
-PRIVATE_KEY_BASE64=$(openssl enc -base64 -in "$PRIVATE_KEY_FILE" | tr -d '\n')
-PUBLIC_KEY_BASE64=$(openssl enc -base64 -in "$PUBLIC_KEY_FILE" | tr -d '\n')
 
-# 输出结果
-echo "私钥（Base64 编码）：$PRIVATE_KEY_BASE64"
-echo "公钥（Base64 编码）：$PUBLIC_KEY_BASE64"
-private_key="$(cat $TARGET_DIR/privatekey)"
 # Hysteria2
 Hysteria2_PORT=$(generate_port "Hysteria2")
 # 生成自签证书
@@ -335,7 +330,7 @@ proxies:
     servername: $dest_server
     skip-cert-verify: true
     reality-opts:
-      public-key: $(cat $TARGET_DIR/publickey)
+      public-key: $public_key
       short-id: $short_id
     uuid: "$UUID"
     flow: xtls-rprx-vision
