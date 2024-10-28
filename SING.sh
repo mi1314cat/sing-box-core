@@ -99,7 +99,7 @@ getkey() {
     
 
     # 生成密钥并保存到文件
-    /usr/bin/sing-box TLS_RSA_WITH_AES_128_GCM_SHA256 > /usr/local/etc/sing-box/key || {
+    /usr/bin/sing-box generate tls-keypair > /usr/local/etc/sing-box/key || {
         print_error "生成密钥失败"
         return 1
     }
