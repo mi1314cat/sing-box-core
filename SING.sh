@@ -110,6 +110,7 @@ openssl rsa -pubout -in "$PRIVATE_KEY_FILE" -out "$PUBLIC_KEY_FILE"
 # 输出结果
 echo "私钥已生成：$PRIVATE_KEY_FILE"
 echo "公钥已生成：$PUBLIC_KEY_FILE"
+private_key="$(cat $TARGET_DIR/privatekey)"
 # Hysteria2
 Hysteria2_PORT=$(generate_port "Hysteria2")
 # 生成自签证书
@@ -206,7 +207,7 @@ cat << EOF > /etc/sing-box/config.json
             "server": "$dest_server",
             "server_port": 443
           },
-          "private_key": "$(cat $TARGET_DIR/privatekey)",
+          "private_key": "$private_key",
           "short_id": [
             "$short_id"
           ]
@@ -238,7 +239,7 @@ cat << EOF > /etc/sing-box/config.json
     {
       "type": "vless",
       "listen": "::",
-      "listen_port": $vless_tls,
+      "listen_port": $vless_PORT,
       "users": [
           {
               "uuid": "$UUID",
