@@ -35,6 +35,7 @@ generate_port() {
 generate_uuid() {
     cat /proc/sys/kernel/random/uuid
 }
+sudo apt install openssl -y
 
 print_with_delay "**************sing-box*************" 0.03
 # 自动安装 sing-box
@@ -93,32 +94,21 @@ read -rp "请输入回落域名: " dest_server
 [ -z "$dest_server" ] && dest_server=$(random_website)
 # 生成 UUID 
 UUID=$(generate_uuid)
-getkey() {
-    echo "正在生成私钥和公钥，请妥善保管好..."
-     mkdir -p /usr/local/etc/sing-box
-    
+KEY_DIR="$TARGET_DIR"  # 修改为你想要的路径
+PRIVATE_KEY_FILE="$KEY_DIR/private.key"
+PUBLIC_KEY_FILE="$KEY_DIR/public.key"
 
-    # 生成密钥并保存到文件
-    /usr/bin/sing-box generate tls-keypair > /usr/local/etc/sing-box/key || {
-        print_error "生成密钥失败"
-        return 1
-    }
 
-    # 提取私钥和公钥
-    private_key=$(awk 'NR==1 {print $3}' /usr/local/etc/sing-box/key)
-    public_key=$(awk 'NR==2 {print $3}' /usr/local/etc/sing-box/key)
 
-    # 保存密钥到文件
-    echo "$private_key" > $TARGET_DIR/privatekey
-    echo "$public_key" > $TARGET_DIR/publickey
+# 生成私钥
+openssl genpkey -algorithm RSA -out "$PRIVATE_KEY_FILE"
 
-    # 输出密钥
-    KEY=$(cat /usr/local/etc/sing-box/key)
-    print_blue "$KEY"
+# 从私钥生成公钥
+openssl rsa -pubout -in "$PRIVATE_KEY_FILE" -out "$PUBLIC_KEY_FILE"
 
-    echo ""
-}
-getkey
+# 输出结果
+echo "私钥已生成：$PRIVATE_KEY_FILE"
+echo "公钥已生成：$PUBLIC_KEY_FILE"
 
 # Hysteria2
 Hysteria2_PORT=$(generate_port "Hysteria2")
