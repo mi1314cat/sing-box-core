@@ -340,12 +340,10 @@ proxies:
     type: vless
     uuid: "$vless_UUID"
     flow: xtls-rprx-vision
-    tls:
-      enabled: true
-      server_name: "$DOMAIN_LOWER"
-      utls:
-        enabled: true
-        fingerprint: chrome
+    tls: true
+    server_name: "$DOMAIN_LOWER"
+    utls: true
+    fingerprint: chrome
     packet_encoding: xudp    
 
 proxy-groups:
