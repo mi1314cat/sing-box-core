@@ -158,20 +158,23 @@ PUBLIC_IP_V6=$(curl -s https://api64.ipify.org)
 echo "公网 IPv4 地址: $PUBLIC_IP_V4"
 echo "公网 IPv6 地址: $PUBLIC_IP_V6"
 
+# 默认选择 IPv4
+PUBLIC_IP=$PUBLIC_IP_V4
+
 # 选择使用哪个公网 IP 地址
-echo "请选择要使用的公网 IP 地址:"
+echo "请选择要使用的公网 IP 地址 (默认 IPv4):"
 echo "1. $PUBLIC_IP_V4"
 echo "2. $PUBLIC_IP_V6"
-read -p "请输入对应的数字选择: " IP_CHOICE
+read -p "请输入对应的数字选择 (按 Enter 使用默认): " IP_CHOICE
 
-if [ "$IP_CHOICE" -eq 1 ]; then
-    PUBLIC_IP=$PUBLIC_IP_V4
-elif [ "$IP_CHOICE" -eq 2 ]; then
+if [ "$IP_CHOICE" -eq 2 ]; then
     PUBLIC_IP=$PUBLIC_IP_V6
-else
-    echo "无效选择，退出脚本"
-    exit 1
+elif [ "$IP_CHOICE" -ne 1 ]; then
+    echo "无效选择，使用默认公网 IP"
 fi
+
+echo "使用的公网 IP 地址: $PUBLIC_IP"
+
 
 # 创建sing-box 服务端配置文件
 print_with_delay "生成 sing-box 配置文件..." 0.03
