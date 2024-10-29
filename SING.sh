@@ -145,15 +145,12 @@ echo "将进行手动获取 SSL 证书并移动到 $TARGET_DIR 文件夹..."
     echo "手动获取证书..."
     sudo certbot certonly --manual --preferred-challenges dns -d "$DOMAIN_LOWER"
 
-    # 移动生成的证书到目标文件夹中
-    echo "移动证书到 $TARGET_DIR ..."
-    sudo mv "/etc/letsencrypt/live/$DOMAIN_LOWER/fullchain.pem" "$TARGET_DIR/"
-    sudo mv "/etc/letsencrypt/live/$DOMAIN_LOWER/privkey.pem" "$TARGET_DIR/"
-
+    
     # 创建自动续期的 cron 任务
-    (crontab -l 2>/dev/null; echo "0 0 * * * certbot renew --post-hook 'mv /etc/letsencrypt/live/$DOMAIN_LOWER/fullchain.pem $TARGET_DIR/fullchain.pem && mv /etc/letsencrypt/live/$DOMAIN_LOWER/privkey.pem $TARGET_DIR/privkey.pem'") | crontab -
+    (crontab -l 2>/dev/null; echo "0 0 * * * certbot renew") | crontab -
 
-    echo "SSL 证书已安装并移动至 $TARGET_DIR 目录中"
+
+    echo "SSL 证书已安装至 /etc/letsencrypt/live/$DOMAIN_LOWER 目录中"
 
 # 获取公网 IP 地址
 PUBLIC_IP_V4=$(curl -s https://api.ipify.org)
@@ -248,8 +245,8 @@ cat << EOF > /etc/sing-box/config.json
       ],
       "tls": {
         "enabled": true,
-        "certificate_path": "$TARGET_DIR/fullchain.pem",
-        "key_path": "$TARGET_DIR/privkey.pem"
+        "certificate_path": "/etc/letsencrypt/live/$DOMAIN_LOWER/fullchain.pem",
+        "key_path": "/etc/letsencrypt/live/$DOMAIN_LOWER/privkey.pem"
       }
     }
   ],
