@@ -333,19 +333,19 @@ proxies:
       short-id: $short_id
     uuid: "$reality_UUID"
     flow: xtls-rprx-vision
-    client-fingerprint: chrome  
-  - name: SING-vless
-    port: $vless_PORT  
-    server: $DOMAIN_LOWER
+    client-fingerprint: chrome 
+  - name: SING-vless               
     type: vless
-    uuid: "$vless_UUID"
-    flow: xtls-rprx-vision
+    server: $DOMAIN_LOWER                     
+    port: $vless_PORT                                    
+    uuid: "$vless_UUID"    
+    network: tcp
     tls: true
-    server_name: "$DOMAIN_LOWER"
-    utls: true
-    fingerprint: chrome
-    packet_encoding: xudp    
-
+    udp: true
+    flow: xtls-rprx-vision
+    client-fingerprint: chrome  
+  
+   
 proxy-groups:
   - name: 节点选择
     type: select
