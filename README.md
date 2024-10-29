@@ -17,7 +17,7 @@ bash <(curl -fsSL https://github.com/mi1314cat/sing-box-core/raw/refs/heads/main
 ```
 # sing-box max 多协议选择
 ```bash
-bash <(curl -fsSLhttps://github.com/mi1314cat/sing-box-max/raw/refs/heads/main/sing-box.sh)
+bash <(curl -fsSL https://github.com/mi1314cat/sing-box-max/raw/refs/heads/main/sing-box.sh)
 ```
 ## tcp-brutal reality(双端sing-box 1.7.0及以上可用)
 
