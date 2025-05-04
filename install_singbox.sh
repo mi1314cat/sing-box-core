@@ -109,4 +109,4 @@ EOF
     echo "   rc-service singbox status"
 fi
 
-
+echo "🎉 安装完成"
