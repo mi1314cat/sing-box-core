@@ -5,7 +5,7 @@ bash <(curl -fsSL https://github.com/mi1314cat/sing-box-core/raw/refs/heads/main
 ```
 ## sing-box 4 
 ```bash
-bash <(curl -Ls https://github.com/mi1314cat/sing-box-core/raw/refs/heads/main/nsb.sh)
+bash <(curl -fsSL https://github.com/mi1314cat/sing-box-core/raw/refs/heads/main/nsb.sh)
 ```
 ### reality hysteria2二合一脚本
 
