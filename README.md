@@ -1,5 +1,8 @@
 # 简介一键安装脚本
 ## sing-box内核
+```bash
+bash <(curl -fsSL https://github.com/mi1314cat/sing-box-core/raw/refs/heads/main/singbox.sh)
+```
 ### reality hysteria2二合一脚本
 
 ```bash
