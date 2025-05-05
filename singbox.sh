@@ -59,9 +59,21 @@ mkdir -p /root/catmi/singbox
 
 
 
+#!/bin/bash
+
 set -e
 
 install_singbox() {
+    echo "----------------------------------------"
+    echo "                       |\\__/,|   (\\"
+    echo "                     _.|o o  |_   ) )"
+    echo "       -------------(((---(((-------------------"
+    echo "                   catmi.singbox"
+    echo "       -----------------------------------------"
+    echo "System: $(lsb_release -ds || cat /etc/*release | head -n1)"
+    echo "Architecture: $(uname -m)"
+    echo "Version: 1.0.0"
+    echo "----------------------------------------"
     echo "----------------------------------------"
     echo "请选择需要安装的 SING-BOX 版本:"
     echo "1. 正式版"
@@ -69,14 +81,28 @@ install_singbox() {
     read -p "输入你的选项 (1-2, 默认: 1): " version_choice
     version_choice=${version_choice:-1}
 
-    api_response=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases")
+    echo "🛠 正在获取版本信息..."
+
+    api_data=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases")
 
     if [ "$version_choice" -eq 2 ]; then
-        echo "🛠 安装测试版..."
-        latest_version_tag=$(echo "$api_response" | grep -Pzo '"prerelease":\s*true.*?"tag_name":\s*"\K(v[0-9\.]+)' | head -n1)
+        # 测试版：找到第一个 "prerelease": true 的 tag
+        latest_version_tag=$(echo "$api_data" | awk '
+            /"prerelease": true/ {p=1}
+            p && /"tag_name":/ {
+                gsub(/"|,/, "", $2);
+                print $2;
+                exit
+            }' FS=': ')
     else
-        echo "🛠 安装正式版..."
-        latest_version_tag=$(echo "$api_response" | grep -Pzo '"prerelease":\s*false.*?"tag_name":\s*"\K(v[0-9\.]+)' | head -n1)
+        # 正式版：找到第一个 "prerelease": false 的 tag
+        latest_version_tag=$(echo "$api_data" | awk '
+            /"prerelease": false/ {p=1}
+            p && /"tag_name":/ {
+                gsub(/"|,/, "", $2);
+                print $2;
+                exit
+            }' FS=': ')
     fi
 
     if [ -z "$latest_version_tag" ]; then
@@ -87,7 +113,6 @@ install_singbox() {
     latest_version=${latest_version_tag#v}
     echo "✅ 最新版本: $latest_version_tag"
 
-    # 检测架构
     arch=$(uname -m)
     echo "🖥 本机架构: $arch"
     case ${arch} in
@@ -99,7 +124,6 @@ install_singbox() {
     esac
     echo "✅ 转换后架构: $arch"
 
-    # 下载并解压
     package_name="sing-box-${latest_version}-linux-${arch}"
     url="https://github.com/SagerNet/sing-box/releases/download/${latest_version_tag}/${package_name}.tar.gz"
     temp_dir=$(mktemp -d)
@@ -117,19 +141,16 @@ install_singbox() {
 
     tar -xzf "${temp_dir}/${package_name}.tar.gz" -C "$temp_dir"
 
-    # 安装到目标目录
     install_dir="/root/catmi/singbox"
     mkdir -p "$install_dir"
     mv "${temp_dir}/${package_name}/sing-box" "$install_dir/"
     chown root:root "$install_dir/sing-box"
     chmod +x "$install_dir/sing-box"
 
-    # 清理
     rm -rf "$temp_dir"
 
     echo "✅ sing-box 已安装到 $install_dir"
 
-    # 生成 systemd 文件
     cat > /etc/systemd/system/singbox.service <<EOF
 [Unit]
 Description=sing-box Service
