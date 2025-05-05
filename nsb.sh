@@ -454,8 +454,7 @@ cat << EOF > /root/catmi/singbox/clash-meta.yaml
     flow: xtls-rprx-vision
     client-fingerprint: chrome
     
-  - {"name":"vmess-ws-tls","type":"vmess","server":"$PUBLIC_IP","port":$Vmess_port,"cipher":"auto","uuid":"$UUID","alterId":0,"tls":true,"network":"ws","ws-opts":{"path":"${WS_PATH1}","headers":{"Host":"$DOMAIN_LOWER"}},"servername":"$PUBLIC_IP"}
-  
+  - {"name":"vmess-ws-tls","type":"vmess","server":"$PUBLIC_IP","port":$Vmess_port,"cipher":"auto","uuid":"$UUID","alterId":0,"tls":false,"network":"ws","ws-opts":{"path":"${WS_PATH1}","headers":{}}}
   - {name: "anytls", type: anytls, server: $PUBLIC_IP, port: $anytls_port, password: $UUID, client-fingerprint: chrome, udp: true, idle-session-check-interval: 30, idle-session-timeout: 30, skip-cert-verify: true }
   
   - {name: "tuic", type: tuic, server: $PUBLIC_IP, port: $tuic_port, uuid: $UUID, password: $hy_password, alpn: [h3], disable-sni: true, reduce-rtt: true, request-timeout: 8000, udp-relay-mode: native, congestion-controller: bbr, skip-cert-verify: true}
@@ -468,7 +467,7 @@ share_link="
 tuic://$UUID:$hy_password@$link_ip:$tuic_port?alpn=h3&congestion_control=bbr#tuic
 hysteria2://$hy_password@$link_ip:$hysteria2_port??sni=bing.com&insecure=1#Hysteria2
 vless://$UUID@$link_ip:$reality_port?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$dest_server&fp=chrome&pbk=$public_key&sid=$short_id&type=tcp&headerType=none#Reality
-vmess://$UUID@$PUBLIC_IP:$Vmess_port?encryption=none&security=tls&sni=$DOMAIN_LOWER&allowInsecure=1&type=ws&host=$PUBLIC_IP&path=${WS_PATH1}#vmess-ws-tls
+vmess://$UUID@$PUBLIC_IP:$Vmess_port?encryption=none&allowInsecure=1&type=ws&path=${WS_PATH1}#vmess-ws-tls
 
 "
 echo "${share_link}" > /root/catmi/singbox/v2ray.txt
