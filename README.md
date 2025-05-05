@@ -1,7 +1,11 @@
 # 简介一键安装脚本
-## sing-box内核
+## sing-box内核6+nginx
 ```bash
 bash <(curl -fsSL https://github.com/mi1314cat/sing-box-core/raw/refs/heads/main/singbox.sh)
+```
+## sing-box 4 
+```bash
+bash <(curl -Ls https://github.com/mi1314cat/sing-box-core/raw/refs/heads/main/nsb.sh)
 ```
 ### reality hysteria2二合一脚本
 
