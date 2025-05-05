@@ -503,8 +503,7 @@ cat <<EOF > /root/catmi/singbox/config.json
       "listen_port": 9998,
       "users": [
         {
-          "uuid": "${UUID}",
-          "alter_id": 64
+          "uuid": "${UUID}"
         }
       ],
       "transport": {
@@ -556,8 +555,8 @@ cat <<EOF > /root/catmi/singbox/config.json
             "alpn": [
                 "h3"
             ],
-            "certificate_path": "/root/catmi/singbox/cert.pem",
-            "key_path": "/root/catmi/singbox/private.key"
+            "certificate_path": "/root/catmi/singbox/server.crt",
+            "key_path": "/root/catmi/singbox/server.key"
         }
     },
     {
@@ -578,8 +577,8 @@ cat <<EOF > /root/catmi/singbox/config.json
                 "alpn":[
                     "h3"
                 ],
-                "certificate_path":"/root/catmi/singbox/cert.pem",
-                "key_path":"/root/catmi/singbox/private.key"
+                "certificate_path":"/root/catmi/singbox/server.crt",
+                "key_path":"/root/catmi/singbox/server.key"
             }
         },
         {
@@ -595,21 +594,21 @@ cat <<EOF > /root/catmi/singbox/config.json
             "padding_scheme":[],
             "tls":{
                 "enabled":true,
-                "certificate_path":"/root/catmi/singbox/cert.pem",
-                "key_path":"/root/catmi/singbox/private.key"
+                "certificate_path":"/root/catmi/singbox/server.crt",
+                "key_path":"/root/catmi/singbox/server.key"
             }
         }
   ],
-    "outbounds": [
-        {
-            "type": "direct",
-            "tag": "direct"
-        },
-        {
-            "type": "block",
-            "tag": "block"
-        }
+    "outbounds": [],
+  "route": {
+    "rules": [
+      {
+        "type": "default",
+        "action": "direct"
+      }
     ]
+  }
+}
 }
 
 
