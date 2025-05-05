@@ -404,9 +404,13 @@ fi
 read -p "请输入 Vless 监听端口 (默认为 443): " PORT
 PORT=${PORT:-443}
 reality_port=$(generate_port "reality")
+
 hysteria2_port=$(generate_port "hysteria2")
+
 tuic_port=$(generate_port "tuic")
+
 anytls_port=$(generate_port "anytls")
+
 # 生成 UUID 和 WS 路径
 UUID=$(generate_uuid)
 WS_PATH=$(generate_ws_path)
