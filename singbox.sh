@@ -64,16 +64,7 @@ mkdir -p /root/catmi/singbox
 set -e
 
 install_singbox() {
-    echo "----------------------------------------"
-    echo "                       |\\__/,|   (\\"
-    echo "                     _.|o o  |_   ) )"
-    echo "       -------------(((---(((-------------------"
-    echo "                   catmi.singbox"
-    echo "       -----------------------------------------"
-    echo "System: $(lsb_release -ds || cat /etc/*release | head -n1)"
-    echo "Architecture: $(uname -m)"
-    echo "Version: 1.0.0"
-    echo "----------------------------------------"
+   
     echo "----------------------------------------"
     echo "请选择需要安装的 SING-BOX 版本:"
     echo "1. 正式版"
