@@ -59,6 +59,8 @@ mkdir -p /root/catmi/singbox
 
 
 
+set -e
+
 install_singbox() {
     echo "----------------------------------------"
     echo "请选择需要安装的 SING-BOX 版本:"
@@ -67,12 +69,14 @@ install_singbox() {
     read -p "输入你的选项 (1-2, 默认: 1): " version_choice
     version_choice=${version_choice:-1}
 
+    api_response=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases")
+
     if [ "$version_choice" -eq 2 ]; then
         echo "🛠 安装测试版..."
-        latest_version_tag=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases" | grep '"tag_name":' | grep -m1 -B5 '"prerelease": true' | head -n1 | sed -E 's/.*"v([^"]+)".*/v\1/')
+        latest_version_tag=$(echo "$api_response" | grep -Pzo '"prerelease":\s*true.*?"tag_name":\s*"\K(v[0-9\.]+)' | head -n1)
     else
         echo "🛠 安装正式版..."
-        latest_version_tag=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases" | grep '"tag_name":' | grep -m1 -B5 '"prerelease": false' | head -n1 | sed -E 's/.*"v([^"]+)".*/v\1/')
+        latest_version_tag=$(echo "$api_response" | grep -Pzo '"prerelease":\s*false.*?"tag_name":\s*"\K(v[0-9\.]+)' | head -n1)
     fi
 
     if [ -z "$latest_version_tag" ]; then
@@ -153,6 +157,9 @@ EOF
 }
 
 install_singbox
+
+
+
 
 openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) \
     -keyout /root/catmi/singbox/server.key -out /root/catmi/singbox/server.crt \
