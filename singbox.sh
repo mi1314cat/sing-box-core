@@ -57,8 +57,45 @@ generate_ws_path() {
 }
 mkdir -p /root/catmi/singbox
 
-bash <(curl -Ls https://github.com/mi1314cat/sing-box-core/raw/refs/heads/main/install_singbox.sh)
+install_singbox(){
+		echo "请选择需要安装的SING-BOX版本:"
+		echo "1. 正式版"
+		echo "2. 测试版"
+		read -p "输入你的选项 (1-2, 默认: 1): " version_choice
+		version_choice=${version_choice:-1}
+		# Set the tag based on user choice
+		if [ "$version_choice" -eq 2 ]; then
+			echo "Installing Alpha version..."
+			latest_version_tag=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases" | jq -r '[.[] | select(.prerelease==true)][0].tag_name')
+		else
+			echo "Installing Stable version..."
+			latest_version_tag=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases" | jq -r '[.[] | select(.prerelease==false)][0].tag_name')
+		fi
+		# No need to fetch the latest version tag again, it's already set based on user choice
+		latest_version=${latest_version_tag#v}  # Remove 'v' prefix from version number
+		echo "Latest version: $latest_version"
+		# Detect server architecture
+		arch=$(uname -m)
+		echo "本机架构为: $arch"
+    case ${arch} in
+      x86_64) arch="amd64" ;;
+      aarch64) arch="arm64" ;;
+      armv7l) arch="armv7" ;;
+    esac
+    # latest_version_tag=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases" | grep -Po '"tag_name": "\K.*?(?=")' | sort -V | tail -n 1)
+    # latest_version=${latest_version_tag#v}
+    echo "最新版本为: $latest_version"
+    package_name="sing-box-${latest_version}-linux-${arch}"
+    url="https://github.com/SagerNet/sing-box/releases/download/${latest_version_tag}/${package_name}.tar.gz"
+    curl -sLo "/root/${package_name}.tar.gz" "$url"
+    tar -xzf "/root/${package_name}.tar.gz" -C /root
+    mv "/root/${package_name}/sing-box" /root/catmi/singbox
+    rm -r "/root/${package_name}.tar.gz" "/root/${package_name}"
+    chown root:root /root/catmi/singbox/sing-box
+    chmod +x /root/catmi/singbox/sing-box
+}
 
+install_singbox
 openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) \
     -keyout /root/catmi/singbox/server.key -out /root/catmi/singbox/server.crt \
     -subj "/CN=bing.com" -days 36500 && \
