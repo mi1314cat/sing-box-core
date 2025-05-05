@@ -283,7 +283,7 @@ else
     echo "无效选择，退出脚本"
     exit 1
 fi
-ssl
+
 # 配置文件生成
 
 cat <<EOF > /root/catmi/singbox/config.json
@@ -476,6 +476,6 @@ echo "${share_link}" > /root/catmi/singbox/v2ray.txt
 
 
 sudo systemctl status singbox
-nginx 
+
 cat /root/catmi/singbox/v2ray.txt
 cat /root/catmi/singbox/clash-meta.yaml
