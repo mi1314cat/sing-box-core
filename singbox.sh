@@ -57,9 +57,7 @@ generate_ws_path() {
 }
 mkdir -p /root/catmi/singbox
 
-#!/bin/bash
 
-set -e
 
 install_singbox() {
     echo "----------------------------------------"
