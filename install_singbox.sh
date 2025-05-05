@@ -45,7 +45,17 @@ DOWNLOAD_URL="https://github.com/SagerNet/sing-box/releases/download/${VERSION}/
 TEMP_DIR=$(mktemp -d)
 cd "$TEMP_DIR"
 echo "📥 正在下载 $DOWNLOAD_URL"
-curl -LO "$DOWNLOAD_URL"
+curl -L -o "sing-box-${VERSION}-linux-${ARCH}.tar.gz" "$DOWNLOAD_URL"
+if [ $? -ne 0 ]; then
+    echo "❌ 下载失败"
+    exit 1
+fi
+
+# 检查 tar 包有效性
+if ! tar -tzf "sing-box-${VERSION}-linux-${ARCH}.tar.gz" >/dev/null 2>&1; then
+    echo "❌ 下载的文件不是有效的 tar.gz 包"
+    exit 1
+fi
 
 # 解压
 tar -xzf "sing-box-${VERSION}-linux-${ARCH}.tar.gz"
@@ -70,6 +80,7 @@ After=network.target
 [Service]
 ExecStart=$TARGET_DIR/sing-box run -c $TARGET_DIR/config.json
 Restart=on-failure
+RestartSec=5
 User=root
 
 [Install]
@@ -94,6 +105,7 @@ command="$TARGET_DIR/sing-box"
 command_args="run -c $TARGET_DIR/config.json"
 pidfile="/run/singbox.pid"
 command_background=true
+start_stop_daemon_args="--background --make-pidfile --pidfile \$pidfile"
 
 depend() {
     need net
@@ -108,5 +120,9 @@ EOF
     echo "   rc-service singbox stop"
     echo "   rc-service singbox status"
 fi
+
+# 清理临时文件
+cd ~
+rm -rf "$TEMP_DIR"
 
 echo "🎉 安装完成"
