@@ -427,7 +427,7 @@ sudo systemctl restart singbox || { echo "重启 singbox 服务失败"; exit 1; 
 OUTPUT_DIR="/root/catmi/singbox"
 mkdir -p "$OUTPUT_DIR"
 cat << EOF > /root/catmi/singbox/clash-meta.yaml
-   - name: Hysteria2
+  - name: Hysteria2
     server: $PUBLIC_IP
     port: $hysteria2_port
     type: hysteria2
