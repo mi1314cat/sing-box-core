@@ -233,6 +233,7 @@ hysteria2_port=$((reality_port + 1))
 tuic_port=$((reality_port + 2))
 anytls_port=$((reality_port + 3))
 Vmess_port=$((reality_port + 4))
+anyreality_port=$((reality_port + 5))
 
 echo "已设置端口如下："
 echo "reality:   $reality_port"
@@ -396,6 +397,41 @@ cat <<EOF > /root/catmi/singbox/config.json
                 "certificate_path":"/root/catmi/singbox/server.crt",
                 "key_path":"/root/catmi/singbox/server.key"
             }
+        },{
+            "type": "anytls",
+            "tag":"anyreality",
+            "listen": "::",
+            "listen_port": $anyreality_port,
+            "users": [
+                {
+                    "name": "catmicos",
+                    "password": "$UUID"
+                }
+            ],
+            "padding_scheme": [
+                "stop=8",
+                "0=30-30",
+                "1=100-400",
+                "2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000",
+                "3=9-9,500-1000",
+                "4=500-1000",
+                "5=500-1000",
+                "6=500-1000",
+                "7=500-1000"
+            ],
+            "tls": {
+                "enabled": true,
+                "server_name": "$dest_server",
+                "reality": {
+                    "enabled": true,
+                    "handshake": {
+                        "server": "$dest_server",
+                        "server_port": 443
+                    },
+                    "private_key": "$private_key",
+                    "short_id": ["$short_id"]
+                }
+            }
         }
   ],
     "outbounds": [],
@@ -493,9 +529,82 @@ cat << EOF > /root/catmi/singbox/clash-meta.yaml
     
  
 EOF
+cat << EOF > /root/catmi/singbox/anyreality.json
+{
+    "dns": {
+        "servers": [
+            {
+                "tag": "google",
+                "type": "tls",
+                "server": "8.8.8.8"
+            },
+            {
+                "tag": "local",
+                "type": "udp",
+                "server": "223.5.5.5"
+            }
+        ],
+        "strategy": "ipv4_only"
+    },
+    "inbounds": [
+        {
+            "type": "tun",
+            "address": "172.19.0.1/30",
+            "auto_route": true,
+            "strict_route": true
+        }
+    ],
+    "outbounds": [
+        {
+            "type": "anytls",
+            "tag": "anytls-out",
+            "server": "$PUBLIC_IP",
+            "server_port": $anyreality_port,
+            "password": "$UUID",
+            "idle_session_check_interval": "30s",
+            "idle_session_timeout": "30s",
+            "min_idle_session": 5,
+            "tls": {
+                "enabled": true,
+                "disable_sni": false,
+                "server_name": "$dest_server",
+                "insecure": false,
+                "utls": {
+                    "enabled": true,
+                    "fingerprint": "chrome"
+                },
+                "reality": {
+                    "enabled": true,
+                    "public_key": "$public_key",
+                    "short_id": "$short_id"
+                }
+            }
+        },
+        {
+            "type": "direct",
+            "tag": "direct"
+        }
+    ],
+    "route": {
+        "rules": [
+            {
+                "action": "sniff"
+            },
+            {
+                "protocol": "dns",
+                "action": "hijack-dns"
+            },
+            {
+                "ip_is_private": true,
+                "outbound": "direct"
+            }
+        ],
+        "default_domain_resolver": "local",
+        "auto_detect_interface": true
+    }
+}
 
-
-
+EOF
 share_link="
 tuic://$UUID:$hy_password@$link_ip:$tuic_port?alpn=h3&congestion_control=bbr#tuic
 hysteria2://$hy_password@$link_ip:$hysteria2_port??sni=bing.com&insecure=1#Hysteria2
