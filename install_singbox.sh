@@ -66,7 +66,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=$BIN_PATH run -c $CONF_DIR
+ExecStart=$BIN_PATH run -C $CONF_DIR
 Restart=always
 RestartSec=3
 LimitNOFILE=1048576
