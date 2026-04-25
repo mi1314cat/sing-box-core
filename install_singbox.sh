@@ -1,128 +1,88 @@
-#!/bin/bash
+install_singbox() {
+    BASE_DIR="/root/catmi/singbox"
+    CONF_DIR="$BASE_DIR/conf"
+    BIN_PATH="$BASE_DIR/sing-box"
+    SERVICE_FILE="/etc/systemd/system/sing-box.service"
 
-set -e
+    echo "请选择需要安装的 SING-BOX 版本:"
+    echo "1. 正式版"
+    echo "2. 测试版"
+    read -p "输入选项 (1-2, 默认: 1): " version_choice
+    version_choice=${version_choice:-1}
 
-# 检测系统架构
-ARCH=$(uname -m)
-if [[ "$ARCH" == "x86_64" ]]; then
-    ARCH="amd64"
-elif [[ "$ARCH" == "aarch64" ]] || [[ "$ARCH" == "arm64" ]]; then
-    ARCH="arm64"
-elif [[ "$ARCH" == "armv7l" ]] || [[ "$ARCH" == "armv6l" ]]; then
-    ARCH="armv7"
-elif [[ "$ARCH" == "i386" ]] || [[ "$ARCH" == "i686" ]]; then
-    ARCH="386"
-else
-    echo "❌ 不支持的架构: $ARCH"
-    exit 1
-fi
+    mkdir -p "$CONF_DIR"
 
-# 检测系统类型
-if [ -f /etc/alpine-release ]; then
-    OS="alpine"
-elif grep -qi ubuntu /etc/os-release; then
-    OS="ubuntu"
-elif grep -qi debian /etc/os-release; then
-    OS="debian"
-else
-    echo "❌ 不支持的系统，仅支持 Ubuntu、Debian、Alpine"
-    exit 1
-fi
+    # 获取版本
+    if [ "$version_choice" -eq 2 ]; then
+        echo "Installing Alpha version..."
+        latest_version_tag=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases \
+            | jq -r '[.[] | select(.prerelease==true)][0].tag_name')
+    else
+        echo "Installing Stable version..."
+        latest_version_tag=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases \
+            | jq -r '[.[] | select(.prerelease==false)][0].tag_name')
+    fi
 
-# 获取最新版本号
-VERSION=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | grep tag_name | cut -d '"' -f4)
-if [ -z "$VERSION" ]; then
-    echo "❌ 无法获取 sing-box 最新版本"
-    exit 1
-fi
+    latest_version=${latest_version_tag#v}
+    echo "Latest version: $latest_version"
 
-echo "✅ 检测到系统: $OS"
-echo "✅ 检测到架构: $ARCH"
-echo "✅ 最新版本: $VERSION"
+    # 架构识别
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64) arch="amd64" ;;
+        aarch64) arch="arm64" ;;
+        armv7l) arch="armv7" ;;
+        *) echo "不支持的架构: $arch" ; return 1 ;;
+    esac
 
-# 下载文件
-DOWNLOAD_URL="https://github.com/SagerNet/sing-box/releases/download/${VERSION}/sing-box-${VERSION}-linux-${ARCH}.tar.gz"
-TEMP_DIR=$(mktemp -d)
-cd "$TEMP_DIR"
-echo "📥 正在下载 $DOWNLOAD_URL"
-curl -L -o "sing-box-${VERSION}-linux-${ARCH}.tar.gz" "$DOWNLOAD_URL"
-if [ $? -ne 0 ]; then
-    echo "❌ 下载失败"
-    exit 1
-fi
+    echo "本机架构: $arch"
 
-# 检查 tar 包有效性
-if ! tar -tzf "sing-box-${VERSION}-linux-${ARCH}.tar.gz" >/dev/null 2>&1; then
-    echo "❌ 下载的文件不是有效的 tar.gz 包"
-    exit 1
-fi
+    package_name="sing-box-${latest_version}-linux-${arch}"
+    url="https://github.com/SagerNet/sing-box/releases/download/${latest_version_tag}/${package_name}.tar.gz"
 
-# 解压
-tar -xzf "sing-box-${VERSION}-linux-${ARCH}.tar.gz"
+    TMP_DIR="/tmp/singbox_install"
+    rm -rf "$TMP_DIR"
+    mkdir -p "$TMP_DIR"
 
-# 创建目标目录
-TARGET_DIR="/root/catmi/singbox"
-mkdir -p "$TARGET_DIR"
+    echo "下载中..."
+    curl -L -o "$TMP_DIR/pkg.tar.gz" "$url" || {
+        echo "下载失败"
+        return 1
+    }
 
-# 移动文件
-cp "sing-box-${VERSION}-linux-${ARCH}/sing-box" "$TARGET_DIR/"
-chmod +x "$TARGET_DIR/sing-box"
+    tar -xzf "$TMP_DIR/pkg.tar.gz" -C "$TMP_DIR"
 
-echo "✅ sing-box 已安装到 $TARGET_DIR"
+    install -m 755 "$TMP_DIR/${package_name}/sing-box" "$BIN_PATH"
 
-# 设置 systemd (Ubuntu/Debian) 或 OpenRC (Alpine)
-if [ "$OS" == "ubuntu" ] || [ "$OS" == "debian" ]; then
-    cat > /etc/systemd/system/singbox.service <<EOF
+    rm -rf "$TMP_DIR"
+
+    echo "安装完成: $BIN_PATH"
+
+    # 创建 systemd 服务
+    cat > "$SERVICE_FILE" <<EOF
 [Unit]
-Description=sing-box Service
+Description=Sing-box Service
 After=network.target
 
 [Service]
-ExecStart=$TARGET_DIR/sing-box run -c $TARGET_DIR/config.json
-Restart=on-failure
-RestartSec=5
-User=root
+Type=simple
+ExecStart=$BIN_PATH run -c $CONF_DIR
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
     systemctl daemon-reload
-    systemctl enable singbox
-    echo "✅ 已安装 systemd 服务文件：singbox.service"
-    echo "👉 使用以下命令管理："
-    echo "   systemctl start singbox"
-    echo "   systemctl stop singbox"
-    echo "   systemctl status singbox"
+    systemctl enable sing-box
 
-elif [ "$OS" == "alpine" ]; then
-    cat > /etc/init.d/singbox <<EOF
-#!/sbin/openrc-run
-
-description="sing-box Service"
-
-command="$TARGET_DIR/sing-box"
-command_args="run -c $TARGET_DIR/config.json"
-pidfile="/run/singbox.pid"
-command_background=true
-start_stop_daemon_args="--background --make-pidfile --pidfile \$pidfile"
-
-depend() {
-    need net
+    echo "systemd 服务已创建: sing-box"
+    echo "配置目录: $CONF_DIR"
+    echo "请手动创建 config.json 后启动:"
+    echo "systemctl start sing-box"
 }
-EOF
 
-    chmod +x /etc/init.d/singbox
-    rc-update add singbox default
-    echo "✅ 已安装 OpenRC 服务文件：singbox"
-    echo "👉 使用以下命令管理："
-    echo "   rc-service singbox start"
-    echo "   rc-service singbox stop"
-    echo "   rc-service singbox status"
-fi
 
-# 清理临时文件
-cd ~
-rm -rf "$TEMP_DIR"
-
-echo "🎉 安装完成"
+install_singbox
