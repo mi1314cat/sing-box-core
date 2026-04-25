@@ -78,10 +78,7 @@ EOF
     systemctl daemon-reload
     systemctl enable sing-box
 
-    echo "systemd 服务已创建: sing-box"
-    echo "配置目录: $CONF_DIR"
-    echo "请手动创建 config.json 后启动:"
-    echo "systemctl start sing-box"
+
 }
 
 
