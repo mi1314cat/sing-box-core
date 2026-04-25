@@ -88,7 +88,7 @@ generate_reality_keys() {
 # ============================================================
 
 generate_ports() {
-    print_info "生成端口（方案 A + 端口占用检测）"
+    print_info "生成端口"
 
     update_env "$ENV_FILE" VLESS_PORT "$(generate_free_port)"
     update_env "$ENV_FILE" ANYTLS_PORT "$(generate_free_port)"
@@ -98,7 +98,7 @@ generate_ports() {
     update_env "$ENV_FILE" SHADOWTLS_PORT "$(generate_free_port)"
     update_env "$ENV_FILE" SS_PORT "$(generate_free_port)"
 
-    print_info "端口生成完成（全部未占用）"
+    print_info "端口生成完成"
 }
 
 # ============================================================
