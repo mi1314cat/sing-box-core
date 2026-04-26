@@ -15,7 +15,7 @@ print_error() { echo -e "${RED}[Error]${PLAIN} $1"; }
 
 INSTALL_DIR="/root/catmi/singbox"
 ENV_FILE="$INSTALL_DIR/install_info.env"
-
+SbINSTALL_DIR="/root/catmi/singbox/sing-box"
 mkdir -p "$INSTALL_DIR"
 
 # ============================================================
@@ -71,15 +71,22 @@ generate_free_port() {
 
 generate_reality_keys() {
     print_info "生成 Reality 密钥对..."
-
-    PRIVATE_KEY=$(openssl rand -base64 32 | tr -d '=' | tr '/+' '_-')
-    PUBLIC_KEY=$(openssl rand -base64 32 | tr -d '=' | tr '/+' '_-')
-    SHORT_ID=$(random_hex)
-
+    
+    # 使用 sing-box 生成真正的 X25519 密钥对
+    local keys=$("$SbINSTALL_DIR" generate reality-keypair 2>/dev/null)
+    if [[ -z "$keys" ]]; then
+        print_error "无法使用 sing-box 生成密钥对，请检查路径或版本"
+        return 1
+    fi
+    PRIVATE_KEY=$(echo "$keys" | grep "PrivateKey" | awk '{print $2}')
+    PUBLIC_KEY=$(echo "$keys" | grep "PublicKey" | awk '{print $2}')
+    
+    SHORT_ID=$(random_hex)  # 短ID仍是随机十六进制
+    
     update_env "$ENV_FILE" PRIVATE_KEY "$PRIVATE_KEY"
     update_env "$ENV_FILE" PUBLIC_KEY "$PUBLIC_KEY"
     update_env "$ENV_FILE" SHORT_ID "$SHORT_ID"
-
+    
     print_info "Reality 密钥生成完成"
 }
 
