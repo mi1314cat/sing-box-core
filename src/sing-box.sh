@@ -76,7 +76,7 @@ show_menu() {
     version_line=$(sb_current_version 2>/dev/null || echo "未安装")
     clear
     echo -e "
-${GREEN}SB-Panel — sing-box 管理脚本${RESET}
+${GREEN}SB-Panel — Sing-box 管理脚本${RESET}
 ----------------------
 ${GREEN}1.${RESET} 初始化基础配置 (00-log / direct outbound)
 ${GREEN}2.${RESET} 安装/重装内核          ${GREEN}3.${RESET} 更新内核 (已是最新则跳过)
@@ -100,7 +100,7 @@ ${GREEN}0.${RESET} 退出
 sing-box 状态: $([[ "$status_text" == "active" ]] && echo -e "${GREEN}运行中${RESET}" || echo -e "${RED}未运行${RESET}")
 内核版本:      ${GREEN}$version_line${RESET}
 ----------------------"
-    read -r -p "请输入选项 [0-16]: " choice
+    read -r -p "请输入选项 [0-16]: " choice || { clear; exit 0; }
     case "$choice" in
         1)  init_base ;;
         2)  run_module core.sh install ;;
@@ -114,14 +114,14 @@ sing-box 状态: $([[ "$status_text" == "active" ]] && echo -e "${GREEN}运行�
         10) run_module outbound.sh ;;
         11) service_menu ;;
         12) check_all ;;
-        13) sb_journal 100; read -r -p "按回车返回..." ;;
+        13) sb_journal 100; read -r -p "按回车键返回主菜单..." ;;
         15) run_module share.sh ;;
         16) client_info_menu ;;
         14) list_configs ;;
         0)  clear; exit 0 ;;
         *)  echo -e "${RED}无效选项 $choice${RESET}" ;;
     esac
-    echo && read -r -p "按回车键返回主菜单..." && echo
+    echo && read -r -p "按回车键返回主菜单..." _ </dev/tty <&0 && echo 2>/dev/null || true
 }
 
 init_base() {
@@ -225,7 +225,7 @@ ${GREEN}0.${RESET} 返回主菜单
 }
 
 if [[ -n "${1:-}" ]]; then
-    # CLI 模式（供自动化/其他模块调用）
+    # CLI 模式（供自动化/其他模块调用）; 各分支透传真实 exit code
     case "$1" in
         init)    init_base ;;
         check)   sb_check ;;
@@ -237,7 +237,7 @@ if [[ -n "${1:-}" ]]; then
         menu)    while true; do show_menu; done ;;
         *) echo "用法: sing-box.sh [init|check|reload|restart|status|list|node|menu]" >&2 ;;
     esac
-    exit 0
+    exit $?
 fi
 
 while true; do
