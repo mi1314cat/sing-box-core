@@ -69,6 +69,79 @@ check_all() {
     fi
 }
 
+# ---- 安装 / 内核子菜单 (脚本更新与内核更新分离) ----
+update_scripts() {
+    local up="$SELF_DIR/src-upstream"
+    if [[ ! -d "$up/.git" ]]; then
+        print_info "本地无源码缓存, 全量安装后可用此热更新 (安装源: $up)"
+        return 0
+    fi
+    git -C "$up" fetch -q origin main 2>/dev/null || { print_error "无法从 GitHub 获取最新脚本, 检查网络"; return 1; }
+    local lo re; lo=$(git -C "$up" rev-parse --short HEAD); re=$(git -C "$up" rev-parse --short FETCH_HEAD)
+    if [[ "$lo" == "$re" ]]; then print_ok "管理脚本已是最新版本 (当前: $lo)"; return 0; fi
+    print_info "当前版本: $lo"; print_info "最新版本: $re"
+    read -r -p "确认更新? [y/N]: " m
+    [[ "$(clean_input "$m")" == y* || -z "$m" ]] || return 0
+    git -C "$up" reset -q --hard FETCH_HEAD
+    cp -f "$up/src/sing-box.sh" "$SELF_DIR/" && cp -rf "$up/src/conf/." "$SELF_DIR/conf/"
+    chmod +x "$SELF_DIR/sing-box.sh" "$SELF_DIR/conf/"*.sh
+    sb_check && print_ok "管理脚本已更新到 $re (配置检查通过)" || print_error "更新后配置检查失败, 请检查 config/"
+}
+
+core_menu() {
+    while true; do
+        print_title "安装 / 内核管理"
+        echo -e "${CYAN}1)${RESET} 初始化基础配置 (00-log / direct)"
+        echo -e "${CYAN}2)${RESET} 安装/重装内核"
+        echo -e "${CYAN}3)${RESET} 更新内核 (已是最新则跳过)"
+        echo -e "${CYAN}4)${RESET} 版本管理 (当前/最新/指定)"
+        echo -e "${CYAN}5)${RESET} 卸载内核"
+        echo -e "${CYAN}6)${RESET} 更新管理脚本 (git, 与内核更新分离)"
+        echo -e "${CYAN}0)${RESET} 返回"
+        read -r -p "请选择: " c || { clear; exit 0; }
+        case "$c" in
+            1) init_base ;;
+            2) run_module core.sh install ;;
+            3) run_module core.sh update ;;
+            4) version_menu ;;
+            5) run_module core.sh uninstall ;;
+            6) update_scripts ;;
+            0) return ;;
+            *) echo -e "${RED}无效选项 $c${RESET}" ;;
+        esac
+        read -r -p "按回车键返回..." _ || return 0
+    done
+}
+
+net_menu() {
+    while true; do
+        print_title "网络管理 (转发/DNS/规则/出站)"
+        echo -e "${CYAN}1)${RESET} 端口转发 (direct inbound)"
+        echo -e "${CYAN}2)${RESET} DNS 管理"
+        echo -e "${CYAN}3)${RESET} 规则集管理 (rule-set)"
+        echo -e "${CYAN}4)${RESET} 出站管理 (outbound)"
+        echo -e "${CYAN}0)${RESET} 返回"
+        read -r -p "请选择: " c || { clear; exit 0; }
+        case "$c" in
+            1) run_module portforward.sh ;;
+            2) run_module dns.sh ;;
+            3) run_module ruleset.sh ;;
+            4) run_module outbound.sh ;;
+            0) return ;;
+            *) echo -e "${RED}无效选项 $c${RESET}" ;;
+        esac
+        read -r -p "按回车键返回..." _ || { clear; exit 0; }
+    done
+}
+
+sys_info() {
+    print_title "系统信息"
+    sys_status
+    echo -e "系统: $(uname -srm)   在线: $(awk '{u=$2+$4; t=$2+$4+$5; if (NR==1){x=u; y=t}} END{printf "%.0f%%", (x*100/y)}' /proc/uptime 2>/dev/null || echo -)"
+    echo -e "端口占用 (本机):"
+    ss -tlnp 2>/dev/null | awk 'NR>1 {print $4}' | grep -oE "[0-9]+$" | sort -un | tr '\n' ' '; echo
+}
+
 # ---- 主菜单 ----
 show_menu() {
     local version_line status_text
@@ -78,46 +151,32 @@ show_menu() {
     echo -e "
 ${GREEN}SB-Panel — Sing-box 管理脚本${RESET}
 ----------------------
-${GREEN}1.${RESET} 初始化基础配置 (00-log / direct outbound)
-${GREEN}2.${RESET} 安装/重装内核          ${GREEN}3.${RESET} 更新内核 (已是最新则跳过)
-${GREEN}4.${RESET} 版本管理 (当前/最新/指定)
-${GREEN}5.${RESET} 卸载内核
-----------------------
-${GREEN}6.${RESET} 添加节点 (add_node_menu)
-${GREEN}7.${RESET} 端口转发管理 (direct inbound)
-${GREEN}8.${RESET} DNS 管理 (服务器/分流/去广告/FakeIP)
-${GREEN}9.${RESET} 规则集管理 (rule-set)
-${GREEN}10.${RESET} 出站管理 (outbound)
-----------------------
-${GREEN}11.${RESET} 服务管理 (启动/停止/重启/软重载)
-${GREEN}12.${RESET} 校验配置 + 重载
-${GREEN}13.${RESET} 查看日志
-${GREEN}14.${RESET} 列出全部配置文件
-${GREEN}15.${RESET} 分享链接管理 (share.sh)
-${GREEN}16.${RESET} 客户端地址 / Web UI 信息
+${GREEN}1.${RESET} 安装 / 内核 (初始化/安装/更新/版本/卸载/脚本更新)
+${GREEN}2.${RESET} 节点管理
+${GREEN}3.${RESET} 分享链接管理
+${GREEN}4.${RESET} 客户端地址 / Web UI 信息
+${GREEN}5.${RESET} 网络 (端口转发/DNS/规则集/出站)
+${GREEN}6.${RESET} 服务管理 (启动/停止/重启/软重载)
+${GREEN}7.${RESET} 校验配置 + 重载
+${GREEN}8.${RESET} 查看日志
+${GREEN}9.${RESET} 列出全部配置文件
 ${GREEN}0.${RESET} 退出
 ----------------------
-sing-box 状态: $([[ "$status_text" == "active" ]] && echo -e "${GREEN}运行中${RESET}" || echo -e "${RED}未运行${RESET}")
-内核版本:      ${GREEN}$version_line${RESET}
+sing-box 服务状态: $([[ "$status_text" == "active" ]] && echo -e "${GREEN}运行中${RESET}" || echo -e "${RED}未运行${RESET}")
+内核版本: ${GREEN}$version_line${RESET}
+节点数:   ${GREEN}$(ls "$SB_CONFIG_DIR"/*.json 2>/dev/null | grep -cv '^-')${RESET}
 ----------------------"
-    read -r -p "请输入选项 [0-16]: " choice || { clear; exit 0; }
+    read -r -p "请输入选项 [0-9]: " choice || { clear; exit 0; }
     case "$choice" in
-        1)  init_base ;;
-        2)  run_module core.sh install ;;
-        3)  run_module core.sh update ;;
-        4)  version_menu ;;
-        5)  run_module core.sh uninstall ;;
-        6)  add_node_menu ;;
-        7)  run_module portforward.sh ;;
-        8)  run_module dns.sh ;;
-        9)  run_module ruleset.sh ;;
-        10) run_module outbound.sh ;;
-        11) service_menu ;;
-        12) check_all ;;
-        13) sb_journal 100; read -r -p "按回车键返回主菜单..." ;;
-        15) run_module share.sh ;;
-        16) client_info_menu ;;
-        14) list_configs ;;
+        1)  core_menu ;;
+        2)  add_node_menu ;;
+        3)  run_module share.sh ;;
+        4)  client_info_menu ;;
+        5)  net_menu ;;
+        6)  service_menu ;;
+        7)  check_all ;;
+        8)  sb_journal 100; read -r -p "按回车键返回主菜单..." ;;
+        9)  list_configs ;;
         0)  clear; exit 0 ;;
         *)  echo -e "${RED}无效选项 $choice${RESET}" ;;
     esac
