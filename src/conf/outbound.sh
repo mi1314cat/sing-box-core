@@ -79,19 +79,31 @@ delete_config() {
     list_configs
     read -r -p "输入要删除的编号: " num
     num=$(clean_input "$num"); [[ "$num" =~ ^[0-9]+$ ]] || { print_error "编号必须数字"; return 1; }
-    local idx file tag
+    local idx file tag refs
     idx=$(printf "%02d" "$num")
     file="$SB_CONFIG_DIR/$PROTO-$idx.json"
     tag="$(jq -r '.outbounds[0].tag' "$file")"
     [[ -f "$file" ]] || { print_error "编号不存在"; return 1; }
-    rm -f "$file"
-    # 清理 03-route.json 中引用该 out 的规则
-    local rf="$SB_CONFIG_DIR/03-route.json"
-    if [[ -f "$rf" ]]; then
-        write_config "$rf" "$(jq --arg t "$tag" '.route.rules |= map(select((.outbound? // "-x-") != $t))' "$rf")" || true
+    refs=$(jq '[.route.rules[]? | select(.outbound? == $t)] | length' --arg t "$tag" "$SB_CONFIG_DIR/03-route.json" 2>/dev/null || echo 0)
+    if (( refs > 0 )); then
+        read -r -p "该出站被 $refs 条 分流/绑定 规则引用; 删除后规则改回 direct? [Y/n]: " fc
+        fc=$(clean_input "$fc"); [[ -z "$fc" ]] && fc=y
+        [[ "$fc" =~ ^[yY] ]] || { print_warn "已取消"; return 0; }
     fi
+    selftest_outbound "$file" "$tag" 2 || swap_outbound_rules "$tag"
+    rm -f "$file"
     sb_check && sb_reload || true
-    print_ok "已删除出站 $tag 及其路由规则"
+    print_ok "已删除出站 $tag; 引用它的规则已切回 direct"
+}
+
+# 批量自检: 所有自定义出站
+selftest_all() {
+    local f tag
+    for f in "$SB_CONFIG_DIR"/outbound-*.json; do
+        [[ -f "$f" ]] || continue
+        tag=$(jq -r '.outbounds[0].tag' "$f")
+        selftest_outbound "$f" "$tag" 2 || { swap_outbound_rules "$tag"; print_warn "$tag 自检失败 -> 规则改回 direct"; }
+    done
 }
 
 
@@ -231,12 +243,53 @@ PYS
 }
 bind_list(){ jq -r '.route.rules[]? | select(.inbound != null) | "\(.inbound|join(","))  ->  \(.outbound)"' "$ROUTE_FILE" 2>/dev/null | nl -ba; }
 
+
+# ==============================================================
+# QA: 默认出站保护 / 失败回退 (借鉴 xary-core outbound.sh selftest)
+#   - 自检失败 -> 所有引用改回 direct; 文件 quarantine
+# ==============================================================
+QUARANTINE_DIR="$SB_CONFIG_DIR/.quarantine"
+
+selftest_outbound() {  # selftest_outbound <out_file> <tag> [tries]
+    local file="$1" tag="$2" tries="${3:-3}" k port pid r ok=0
+    [[ -f "$file" ]] || return 1
+    for ((k=1; k<=tries; k++)); do
+        local port=$(( 23000 + RANDOM % 2000 ))
+        python3 - "$file" "$port" "$tag" <<'PYS'
+import json,sys
+o=json.load(open(sys.argv[1]))["outbounds"]
+cfg={"log":{"level":"warn"},
+     "inbounds":[{"type":"mixed","tag":"mix","listen":"127.0.0.1","listen_port":int(sys.argv[2])}],
+     "outbounds":o,
+     "route":{"final":sys.argv[3]}}
+json.dump(cfg,open("/tmp/sb-out-selftest.json","w"))
+PYS
+        timeout 20 "$SB_BIN" run -c /tmp/sb-out-selftest.json >/dev/null 2>/tmp/sb-selftest.err &
+        local pid=$!
+        sleep 1
+        r=$(timeout 12 curl -s --max-time 10 -x "http://127.0.0.1:$port" -o /dev/null -w "%{http_code}" https://www.gstatic.com/generate_204 2>/dev/null)
+        kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+        [[ "$r" == "204" ]] && ok=$((ok+1))
+    done
+    if (( ok == tries )); then print_ok "出站 [$tag] 自检通过 ($tries/$tries)"; return 0
+    elif (( ok > 0 )); then print_warn "出站 [$tag] 自检部分通过 ($ok/$tries) - 按可用处理"; return 0
+    else print_error "出站 [$tag] 自检失败 0/$tries"; return 1; fi
+}
+
+swap_outbound_rules() {  # swap_outbound_rules <tag> -> 所有引用 tag 的规则改回 direct
+    local tag="$1" rf="$SB_CONFIG_DIR/03-route.json"
+    [[ -f "$rf" ]] || return 0
+    jq --arg t "$tag" '.route.rules |= map(if (.outbound? == $t) then (.outbound = "direct") else . end)' "$rf" > "$rf.tmp"         && mv "$rf.tmp" "$rf"
+}
+
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     case "${1:-}" in
         add)  add_config ;;
         list) list_configs ;;
         del)  delete_config ;;
         check) sb_check ;;
+        selftest) shift; selftest_outbound "$@" || true ;;
+        swap) swap_outbound_rules "$2"; sb_check && sb_reload || true ;;
         *)
             while true; do
                 print_title "出站管理"
@@ -248,6 +301,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
                 echo -e "${CYAN}6)${RESET} 域名分流 (删除规则)"
                 echo -e "${CYAN}7)${RESET} 入站绑定出站 (添加: 节点/端口 → 出站)"
                 echo -e "${CYAN}8)${RESET} 入站绑定出站 (删除)"
+                echo -e "${CYAN}9)${RESET} 出站自检+失败自动回退 direct (全量自检)"
                 echo -e "${CYAN}0)${RESET} 返回"
                 read -r -p "请选择: " c
                 case "$(clean_input "$c")" in
@@ -259,6 +313,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
                     6) split_del ;;
                     7) bind_add ;;
                     8) bind_del ;;
+                    9) selftest_all ;;
                     0) break ;;
                     *) ;;
                 esac
