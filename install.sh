@@ -181,11 +181,11 @@ do_client() {
 
 # 已装机器重复运行: 不覆盖配置, 交给面板
 existing() {
-    echo -e "${GREEN}Sing-box 管理脚本${PLAIN}"
+    printf "${GREEN}Sing-box 管理脚本${PLAIN}\n"
     echo "----------------------"
     local srvSta=$(systemctl is-active sing-box 2>/dev/null || echo inactive)
-    local col=RED; [[ $srvSta == active ]] && col=GREEN
-    printf "服务状态: ${col}%s${PLAIN}\n" "$srvSta"
+    local col="$RED"; [[ $srvSta == active ]] && col="$GREEN"
+    printf "服务状态: %b%s%b\n" "$col" "$srvSta" "$PLAIN"
     printf "版本:     %s\n" "$(server_ver)"
     printf "节点数:   %s\n" "$(ls "$SRV_ROOT"/config/*.json 2>/dev/null | grep -cv '^-')"
     echo "----------------------"
