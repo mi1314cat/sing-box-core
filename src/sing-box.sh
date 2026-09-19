@@ -180,7 +180,7 @@ sing-box 服务状态: $([[ "$status_text" == "active" ]] && echo -e "${GREEN}�
         0)  clear; exit 0 ;;
         *)  echo -e "${RED}无效选项 $choice${RESET}" ;;
     esac
-    echo && read -r -p "按回车键返回主菜单..." _ </dev/tty <&0 && echo 2>/dev/null || true
+    echo && read -r -p "按回车键返回主菜单..." _ || true
 }
 
 init_base() {
