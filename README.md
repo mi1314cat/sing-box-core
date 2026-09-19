@@ -65,3 +65,30 @@ bash src/client/client.sh install-ui       # metacubexd (Clash API UI)
 - 多节点 = selector `PROXY` + urltest `AUTO`（`final=PROXY`），detour 辅助出站（如 shadowtls-out）自动排除；
 - **不实现 TUN/透明代理/FakeIP**（有意避免）；
 - 端口避让已有服务（metacubexd 默认不再占 9090：默认 **19090**）；面板设计一个"端口占用清单"页展示 server 端口全量。
+
+## 分享链接管理（服务端菜单 3）
+- **1) 生成链接**：先列本机可分享节点（编号+协议+端口），回车=全部节点一条链接。
+- **2) 全部节点一条链接**：列出“共 N 个可分享节点”，标准创建流程 (`max_uses` + 有效期菜单)。
+- **3) 列表/4) 删除/5) 禁用/6) regen**：带编号列表，输入编号或 token 前缀均可定位。
+- `max_uses`：`0=不限` / N=次数；`有效期` 菜单：1h / 24h / 7d / 30d / 永久 / 自定义。
+- 已修复：`max_uses=abc`/负数不再误删旧链接；`ttl=0` 语义统一为"永久"；410/404/503 错误分支明确文案；sing-box 停机时分发 503 且不消耗额度（HEAD 预检支持）。
+
+## 客户端
+```bash
+bash client.sh                     # 交互面板 [ 客户端 · CLIENT ] 无参进入
+sb-client add <share-url>
+sb-client del <tag>                # 支持 tag 编号
+sb-client update                   # 重新拉取其 share 源并重载
+```
+- 链接导入支持**同一 URL 三连导入零副本**（`source` meta 记录唯一身份）。
+- 错误文案区分 `410 已用尽/404 不存在/503 服务未运行`，curl -f 陷阱已移除。
+
+## Reality flow 与节点删除级联
+- 服务端 Reality `users` 内建 `flow = xtls-rprx-vision`，与客户端一致（修复 QA 发现的全 flow mismatch 不可连）。
+- 任何节点删除动作:**自动清理其 share token** 并刷新 all 聚合（token 不变内容即时更新），不会再把已删节点悄悄分发出去。
+
+## 卸载 (不影响 Other 服务)
+```bash
+bash conf/uninstall.sh       # CLI 菜单: 1) 卸载 SB 整套  2) 仅停服务
+```
+停止并移除仅 SB 自家的 systemd 单元 (`sing-box.service` / `sing-box-share.service`), 可选删数据目录 / `/root/catmi/sing-box`。绝不触碰其它 systemd 服务、证书 (`/etc/letsencrypt` 等)、客户端侧 `sb-client`。删除前会显示确切影响范围, 必须 yes 确认。

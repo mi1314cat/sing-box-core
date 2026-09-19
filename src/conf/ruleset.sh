@@ -164,7 +164,7 @@ menu() {
             0) break ;;
             *) print_error "无效选项" ;;
         esac
-        read -r -p "按回车继续..." _
+        read -r -p "按回车继续..." _ || { echo; exit 0; }
     done
 }
 

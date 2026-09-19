@@ -90,11 +90,30 @@ node_list_banner(){
     print_title "按编号选择要分享的节点"
 }
 
+ttl_prompt() {
+    echo "有效期:" >&2
+    echo "  1) 1 小时   2) 24 小时 (默认)   3) 7 天   4) 30 天   5) 永久   6) 自定义小时" >&2
+    local c; read -r -p "选择 (回车=2): " c
+    c=$(clean_input "$c")
+    case "$c" in
+        1) echo 1 ;;
+        2|"") echo 24 ;;
+        3) echo 168 ;;
+        4) echo 720 ;;
+        5) echo 0 ;;
+        6) read -r -p "小时数: " x; [[ "$x" =~ ^[0-9]+$ ]] && echo "$x" || { print_error "无效小时数, 已回退 24"; echo 24; } ;;
+        *) echo 24 ;;
+    esac
+}
+
 create_share() { 
     local tag="$1" max_uses="${2:-1}" ttl="${3:-24}"
     [[ -n "$tag" ]] || { print_error "用法: share.sh create <tag> [max_uses] [ttl_hours]"; return 1; }
     local client_file="$SB_OUT_DIR/sb_client-$tag.json"
     [[ -f "$client_file" ]] || { print_error "找不到 $tag 的客户端配置 ($client_file)"; return 1; }
+    # 参数校验 (在任何旧数据被改动之前)
+    [[ "$max_uses" =~ ^[0-9]+$ ]] || { print_error "max_uses 必须是非负整数 (0=不限), 收到: $max_uses"; return 1; }
+    [[ "$ttl" =~ ^[0-9]+$ ]] || { print_error "ttl_hours 必须是小时数 (0=永久), 收到: $ttl"; return 1; }
     # 同 tag 旧 token 全部下架
     local old token now expires f
     for f in "$SHARED"/*.json; do
@@ -102,7 +121,9 @@ create_share() {
         [[ "$(jq -r .tag "$f" 2>/dev/null)" == "$tag" ]] && rm -f "$f"
     done
     token=$(openssl rand -hex 16)      # 128-bit 密码学随机
-    now=$(date +%s); expires=$((now + ttl*3600))
+    now=$(date +%s)
+    # ttl=0 => 永久 (expires_at=0 表示永不过期; 服务端 0 跳过过期检查)
+    if [[ "$ttl" -gt 0 ]]; then expires=$((now + ttl*3600)); else expires=0; fi
     python3 - "$SHARED" "$token" "$tag" "$client_file" "$max_uses" "$expires" <<'PY'
 import json,sys,os,time
 d,token,tag,cf,maxu,exp = sys.argv[1:7]
@@ -113,14 +134,21 @@ open(os.path.join(d,f"{token}.json"),"w").write(json.dumps(meta,indent=1))
 PY
     local url; url="$(share_url_for "$SHARED/$token.json")"
     echo "$url" | tee "$SB_OUT_DIR/share_tag-$tag.txt"
-    print_ok "max_uses=$max_uses ttl=${ttl}h"
+    if [[ "$ttl" -gt 0 ]]; then
+        print_ok "max_uses=$max_uses, 有效期 ${ttl} 小时 ($(date -d @$expires '+%F %T'))"
+    else
+        print_ok "max_uses=$max_uses, 有效期: 永久"
+    fi
 }
+
+share_files_sorted() { ls "$SHARED"/*.json 2>/dev/null | sort; }
 
 list_shares() {
     print_title "分享链接"
     local now; now=$(date +%s)
-    local f
-    for f in "$SHARED"/*.json; do
+    local f i=0
+    local entries=()
+    while IFS= read -r f; do
         [[ -f "$f" ]] || continue
         local tg tok mu u ex en st=Active
         tg=$(jq -r .tag "$f"); tok=$(jq -r .share_token "$f")
@@ -129,11 +157,37 @@ list_shares() {
         [[ "$en" == "false" ]] && st=Disabled
         [[ "$ex" != "0" && "$now" -gt "$ex" ]] && st=Expired
         [[ "$mu" != "0" && "$u" -ge "$mu" ]] && st=UsedUp
-        printf "%s...  tag=%s  uses=%s/%s  expires=%s  %s\n" "${tok:0:16}" "$tg" "$u" "$mu" "$([[ $ex == 0 ]] && echo never || date -d @$ex '+%F %T')" "$st"
-    done
+        i=$((i+1)); entries+=("$f")
+        printf "%s) %s…  tag=%s  uses=%s/%s  有效期=%s  %s\n" "$i" "${tok:0:16}" "$tg" "$u" "$mu" "$([[ $ex == 0 ]] && echo 永久 || date -d @$ex '+%F %T')" "$st"
+    done < <(share_files_sorted)
+    [[ $i -eq 0 ]] && { print_warn "当前没有任何分享链接"; return 0; }
+    printf '%s\n' "${entries[@]}" > /tmp/.sb-share-entries
 }
 
-meta_file_for() { meta_file "$@"; }
+meta_file_for() {
+    local out
+    out=$(meta_file "$@" 2>/dev/null || true)
+    if [[ -z "$out" ]]; then out=$(_ByNumber "$1" 2>/dev/null || true); fi
+    echo "$out"
+}
+_ByNumber() { # ByNumber <choice> -> token file (auto pick when multiple match)
+    local c="$1"
+    if [[ "$c" =~ ^[0-9]+$ ]]; then
+        local files=(); local f
+        for f in $(share_files_sorted); do files+=("$f"); done
+        local n=${#files[@]}
+        (( n > 0 && c >= 1 && c <= n )) || { echo ""; return 1; }
+        echo "${files[c-1]}"; return 0
+    fi
+    local hit
+    hit=$(for f in $(share_files_sorted); do
+        local tok tg; tok=$(jq -r .share_token "$f"); tg=$(jq -r .tag "$f")
+        [[ "$tok" == "*$c*" || "$tok" == "$c" || "$tg" == "$c" ]] && echo "$f"
+    done | head -1)
+    [[ -n "$hit" ]] && { echo "$hit"; return 0; }
+    return 1
+}
+
 del_share() {
     local f; f=$(meta_file_for "$1")
     [[ -z "$f" ]] && { print_error "token|tag 不存在: $1"; return 1; }
@@ -172,8 +226,11 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
             gen_full_profile >/dev/null 2>&1 || { print_error "聚合生成失败 (out/sb_client-*.json 为空?)"; exit 1; }
             shift; create_share "all" "$@"
             ;;
+        regen-aggregate) gen_full_profile >/dev/null 2>&1 || { print_error "聚合生成失败"; exit 1; } ;;
         list) list_shares ;;
-        del) del_share "$2" ;;
+        del)
+            f=$(meta_file_for "$2" 2>/dev/null); [[ -z "$f" ]] && f=$( _ByNumber "$2" )
+            [[ -n "$f" ]] && { rm -f "$f" && print_ok "分享已删除"; } || { print_error "token|tag|编号 不存在: $2"; return 1; } ;;
         toggle) toggle_share "$2" ;;
         regen) regen_share "$2" ;;
         *) while true; do
@@ -191,22 +248,25 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
                     node_list_banner
                     tag=$(pick_node_tag)
                     [[ -n "$tag" ]] || { print_error "无节点可选 / 无效选择"; continue; }
-                    m=$(safe_read "max_uses (0=不限)" "1")
-                    h=$(safe_read "ttl_hours" "24")
+                    m=$(safe_read "max_uses (0=不限, 回车=1)" "1")
+                    h=$(ttl_prompt)
                     create_share "$tag" "$m" "$h" ;;
                 2)
                     gen_full_profile >/dev/null 2>&1 || { print_error "聚合生成失败 (没有 sb_client-*.json?)"; continue; }
-                    m=$(safe_read "max_uses (0=不限)" "2")
-                    h=$(safe_read "ttl_hours" "24")
+                    n=$(ls "$SB_OUT_DIR"/sb_client-*.json 2>/dev/null | grep -v all | wc -l)
+                    echo "当前共有 $n 个可分享节点, 将全部包含:" >&2
+                    ls "$SB_OUT_DIR"/sb_client-*.json 2>/dev/null | grep -v all | sed "s|.*/sb_client-||; s/.json//; s/^/  [node] /" >&2
+                    m=$(safe_read "max_uses (0=不限, 回车=2)" "2")
+                    h=$(ttl_prompt)
                     create_share "all" "$m" "$h" ;;
                 3) list_shares ;;
-                4) read -r -p "token 或 tag (回车取消): " t; [[ -n "$t" ]] && del_share "$t" ;;
-                5) read -r -p "token 或 tag: " t; toggle_share "$t" ;;
-                6) read -r -p "token 或 tag: " t; regen_share "$t" ;;
+                4) list_shares; read -r -p "输入编号/token/tag (回车取消): " t; [[ -n "$t" ]] && del_share "$t" ;;
+                5) list_shares; read -r -p "输入编号/token/tag (回车取消): " t; [[ -n "$t" ]] && toggle_share "$t" ;;
+                6) list_shares; read -r -p "输入编号/token/tag (回车取消): " t; [[ -n "$t" ]] && regen_share "$t" ;;
                 0) break ;;
                 *) print_error "无效选项 $c" ;;
             esac
-            read -r -p "回车继续..." _
+            read -r -p "回车继续..." _ || { echo; exit 0; }
         done ;;
     esac
 fi

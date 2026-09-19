@@ -37,7 +37,13 @@ sb_arch() {
 sb_current_version() { "$SB_BIN" version 2>/dev/null | head -1 | awk '{print $3}'; }
 
 sb_latest_version() {
-    curl -s --max-time 10 "$SB_REPO_API/releases/latest" | jq -r '.tag_name // empty' | sed 's/^v//'
+    local v
+    v=$(curl -s --max-time 10 "$SB_REPO_API/releases/latest" | jq -r '.tag_name // empty' | sed 's/^v//')
+    # fallback: GitHub API rate-limited (403) -> resolve tag from releases/latest redirect target
+    if [[ -z "$v" ]]; then
+        v=$(curl -sIL --max-time 15 -o /dev/null -w '%{url_effective}' https://github.com/SagerNet/sing-box/releases/latest 2>/dev/null | sed -E -n 's|.*/tag/v([0-9][^/]*)$|\1|p')
+    fi
+    echo "$v"
 }
 
 sb_latest_pre() { # 最新（含 pre-release）—— 仅 --pre 用
@@ -203,7 +209,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
         install)
             ver="${2:-$(sb_latest_version)}"
             ver="${ver#v}"
-            if [[ "$#" -lt 2 && "${3:-}" != "pre" ]]; then :; fi
+            if [[ -z "$ver" ]]; then print_error "无法查询最新版本 (API/网络), 请稍后重试或手动指定: core.sh install 1.12.0"; exit 1; fi
             if [[ -n "$ver" ]]; then
                 do_install "$ver"
                 if [[ ! -f /etc/systemd/system/sing-box.service ]]; then

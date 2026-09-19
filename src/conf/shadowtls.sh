@@ -51,6 +51,7 @@ EOF
     backup_config config
     if ! write_config "$file" "$json"; then return 1; fi
     if ! sb_check; then rm -f "$file"; print_error "已删除非法配置（现网未受影响）"; return 1; fi
+    cleanup_node_shares "$tag"
     sb_reload || true
     server_ip=$(safe_read "服务器对外 IP" "$(default_server_ip)")
     local link="shadowtls://$st_password@$server_ip:$listen_port?sni=$rnd&version=3#$tag"
@@ -90,6 +91,8 @@ delete_config() {
     list_configs
     read -r -p "输入要删除的编号: " num; num=$(clean_input "$num")
     [[ "$num" =~ ^[0-9]+$ ]] || { print_error "编号必须数字"; return 1; }
+    read -r -p "确认删除编号 $num ($PROTO) 的节点? [y/N]: " dconfirm
+    [[ "$(clean_input "$dconfirm")" =~ ^[yY] ]] || { print_warn "已取消"; return 0; }
     local idx file tag
     idx=$(printf "%02d" "$num"); file="$SB_CONFIG_DIR/$PROTO-$idx.json"; tag="${PROTO}${idx}"
     [[ -f "$file" ]] || { print_error "编号不存在"; return 1; }
@@ -106,7 +109,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
             echo -e "${CYAN}1)${RESET} 添加\n${CYAN}2)${RESET} 列出\n${CYAN}3)${RESET} 删除\n${CYAN}0)${RESET} 返回"
             read -r -p "请选择: " c
             case "$(clean_input "$c")" in 1) add_config ;; 2) list_configs ;; 3) delete_config ;; 0) break ;; esac
-            read -r -p "按回车继续..." _
+            read -r -p "按回车继续..." _ || { echo; exit 0; }
         done ;;
     esac
 fi

@@ -9,8 +9,18 @@ GET  /status                   -> 文本健康
 并发安全: flock(SHARE_DIR/.share.lock) 串行化 read-modify-write
 */
 """
-import json, os, sys, time, fcntl, struct, http.server, socketserver, threading
+import json, os, sys, time, fcntl, struct, http.server, socketserver, threading, subprocess
 from urllib.parse import urlsplit
+
+
+def core_healthy():
+    """sing-box 健康: systemd is-active; systemd 不可用时视为健康 (兼容非 systemd 环境)"""
+    if not os.path.isdir("/run/systemd/system"):
+        return True
+    try:
+        return subprocess.run(["systemctl", "is-active", "--quiet", "sing-box"]).returncode == 0
+    except Exception:
+        return True
 
 SHARE_DIR = os.environ.get("SHARE_DIR", "/root/catmi/sing-box/share")
 LOCK = os.path.join(SHARE_DIR, ".share.lock")
@@ -45,14 +55,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
     def _send(self, code, body, ctype="text/plain; charset=utf-8"):
+        if isinstance(body, str):
+            body = body.encode()
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
         self.end_headers()
         try:
             self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError):
             pass
+    def do_HEAD(self):
+        """订阅预检: 只送状态/长度, 不进额度逻辑, 不送正文."""
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_GET(self):
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
         if path == "/status":
@@ -76,6 +96,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             used = int(meta.get("used_count", 0))
             if maxu and used >= maxu:
                 return self._send(410, "used up\n")
+            if not core_healthy():
+                return self._send(503, "sing-box service inactive\n")   # 主服务未运行: 不下发, 不消耗额度
             cpath = meta.get("client_file")
             if not cpath or not os.path.isfile(cpath):
                 return self._send(503, "config unavailable\n")   # 未成功提供则不消耗

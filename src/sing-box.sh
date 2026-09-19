@@ -43,7 +43,7 @@ service_menu() {
             4) sb_reload ;;
             5) sys_status ;;
             0) return ;;
-            *) ;;
+            *) echo -e "${RED}无效选项 $c${RESET}" ;;
         esac
     done
 }
@@ -171,7 +171,7 @@ ${GREEN}0.${RESET} 退出
 ----------------------
 sing-box 服务状态: $([[ "$status_text" == "active" ]] && echo -e "${GREEN}运行中${RESET}" || echo -e "${RED}未运行${RESET}")
 内核版本: ${GREEN}$version_line${RESET}
-节点数:   ${GREEN}$(ls "$SB_CONFIG_DIR"/*.json 2>/dev/null | grep -cv '^-')${RESET}
+节点数:   ${GREEN}$(ls "$SB_CONFIG_DIR"/*.json 2>/dev/null | grep -v 'config/00-' | grep -cv '^-')${RESET}
 ----------------------"
     read -r -p "请输入选项 [0-8]: " choice || { clear; exit 0; }
     case "$choice" in

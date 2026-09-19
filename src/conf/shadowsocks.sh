@@ -41,6 +41,7 @@ EOF
     backup_config config
     write_config "$file" "$json" || return 1
     if ! sb_check; then rm -f "$file"; print_error "已删除非法配置文件（现网未受影响）"; return 1; fi
+    cleanup_node_shares "$tag"
     sb_reload || print_warn "请确认服务状态"
 
     local server_ip; server_ip=$(default_server_ip)
@@ -85,6 +86,8 @@ delete_config() {
     list_configs
     read -r -p "输入要删除的编号: " num
     num=$(clean_input "$num"); [[ "$num" =~ ^[0-9]+$ ]] || { print_error "编号必须数字"; return 1; }
+    read -r -p "确认删除编号 $num ($PROTO) 的节点? [y/N]: " dconfirm
+    [[ "$(clean_input "$dconfirm")" =~ ^[yY] ]] || { print_warn "已取消"; return 0; }
     local idx file tag
     idx=$(printf "%02d" "$num"); file="$SB_CONFIG_DIR/$PROTO-$idx.json"; tag="${PROTO}${idx}"
     [[ -f "$file" ]] || { print_error "编号不存在"; return 1; }
@@ -102,7 +105,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
                 echo -e "${CYAN}1)${RESET} 添加节点"; echo -e "${CYAN}2)${RESET} 列出节点"; echo -e "${CYAN}3)${RESET} 删除节点"; echo -e "${CYAN}0)${RESET} 返回"
                 read -r -p "请选择: " c
                 case "$c" in 1) add_config ;; 2) list_configs ;; 3) delete_config ;; 0) break ;; esac
-                read -r -p "按回车继续..." _
+                read -r -p "按回车继续..." _ || { echo; exit 0; }
             done ;;
     esac
 fi

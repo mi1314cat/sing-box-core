@@ -18,9 +18,9 @@ extract_cert_domain() {
 }
 
 ask_tls() { # 输出: CERT_MODE|cert_file|key_file|cert_domain|trusted(0|1) 到 stdout
-    echo "TLS 选项: 1) no-TLS(裸 ws) 2) 真证书 3) 自签(pin) 4) Reality" >&2
-    read -r -p "选择 (默认 2): " c
-    c=$(clean_input "$c"); [[ -z "$c" ]] && c=2
+    echo "TLS 选项: 1) no-TLS(裸 ws) 2) 真证书 3) 自签(pin) 4) Reality (回车=1 no-TLS)" >&2
+    read -r -p "选择 (默认 1): " c
+    c=$(clean_input "$c"); [[ -z "$c" ]] && c=1
     case "$c" in
         1) echo "none|||" ;;
         3)
@@ -65,6 +65,7 @@ add_config() {
         local rnd; rnd=$(reality_random_domain)
         local sid; sid=$(openssl rand -hex 8)
     fi
+    local sid="${sid:-}"  # 保证 PYGEN 位置参数在非 reality 模式下也定义为空
 
     local idx file tag json
     idx=$(get_next_index "$PROTO"); file="$SB_CONFIG_DIR/$PROTO-$idx.json"; tag="${PROTO}${idx}"
@@ -107,12 +108,14 @@ EOF
     backup_config config
     write_config "$file" "$base" || return 1
     if ! sb_check; then rm -f "$file"; print_error "已删除非法配置（现网未受影响）"; return 1; fi
+    cleanup_node_shares "$tag"
     sb_reload || true
 
     # server对外IP / 客户端
     local server_ip; server_ip=$(default_server_ip)
     server_ip=$(safe_read "服务器对外 IP" "$server_ip")
 
+    local DOM="$CERT_DOMAIN"; [[ "${CERT_MODE:-}" == "reality" ]] && DOM="$rnd"
     local pbk sidq urlsec secpin=""
     if [[ "$CERT_MODE" == "reality" ]]; then
         pbk="$REAL_PUB"
@@ -128,22 +131,28 @@ EOF
         [[ -n "$secpin" ]] && url="$url&pinSHA256=$secpin"
     fi
     url="$url#$tag"
-    python3 - "$SB_OUT_DIR/sb_client-$tag.json" "$tag" "$server_ip" "$listen_port" "$uuid" "$CERT_MODE" "$CERT_FILE" "$KEY_FILE" "$CERT_DOMAIN" "$ttype" "$tpath" "$svc" "$secpin" <<'PYGEN'
-import json,sys,os
-_,ofile,tag,srv,port,uuid,mode,crt,key,ttype,tpath,svc,pin=sys.argv
-ob={"type":"vmess","tag":tag,"server":srv,"server_port":int(port),"uuid":uuid,"alterId":0}
+    python3 - "$SB_OUT_DIR/sb_client-$tag.json" "$tag" "$server_ip" "$listen_port" "$uuid" "$CERT_MODE" "$CERT_DOMAIN" "$ttype" "$tpath" "$svc" "$secpin" "$REAL_PUB" "$sid" "$CERT_FILE" "$DOM" <<'PYGEN'
+import json,sys
+_,ofile,tag,srv,port,uuid,mode,domain,ttype,tpath,svc,pin,pbk,xsid,crt,dom2=sys.argv
+ob={"type":"vmess","tag":tag,"server":srv,"server_port":int(port),"uuid":uuid,"alter_id":0}
 if ttype=="ws": ob["transport"]={"type":"ws","path":tpath}
 if ttype=="grpc": ob["transport"]={"type":"grpc","service_name":svc}
 if ttype=="http": ob["transport"]={"type":"http"}
 if mode=="real":
-    ob["tls"]={"enabled":True,"server_name":os.popen(f'openssl x509 -in {crt} -noout -ext subjectAltName 2>/dev/null | grep -oE "DNS:[^,]+" | head -1 | cut -d: -f2').read().strip() or "unknown"}
+    sn = os.popen(f'openssl x509 -in {crt} -noout -ext subjectAltName 2>/dev/null | grep -oE "DNS:[^,]+" | head -1 | cut -d: -f2').read().strip()
+    ob["tls"]={"enabled":True,"insecure":True,"server_name": sn or domain}
 elif mode=="selfsign":
-    ob["tls"]={"enabled":True,"certificate_public_key_sha256":pin}
+    ob["tls"]={"enabled":True,"insecure":True,"server_name":dom2,"certificate_public_key_sha256":pin}
+elif mode=="reality":
+    ob["tls"]={"enabled":True,"server_name":dom2,"utls":{"enabled":True,"fingerprint":"chrome"},
+               "reality":{"enabled":True,"public_key":pbk,"short_id":xsid}}
 json.dump({"outbounds":[ob]},open(ofile,"w"),indent=2)
 PYGEN
-    echo "$link" | tee "$SB_OUT_DIR/sb_share-$tag.txt" | tail -1 >&2
-    grep -vF "$link" "$SB_OUT_DIR/sb_links-all.txt" 2>/dev/null > /tmp/l.$$ && mv /tmp/l.$$ "$SB_OUT_DIR/sb_links-all.txt"
-    echo "$link" >> "$SB_OUT_DIR/sb_links-all.txt"
+    echo "$url" | tee "$SB_OUT_DIR/sb_share-$tag.txt" | tail -1 >&2
+    if [[ -n "$url" ]]; then
+        grep -vF "$url" "$SB_OUT_DIR/sb_links-all.txt" 2>/dev/null > /tmp/l.$$ && mv /tmp/l.$$ "$SB_OUT_DIR/sb_links-all.txt"
+        echo "$url" >> "$SB_OUT_DIR/sb_links-all.txt"
+    fi
     echo "{\"tag\":\"$tag\",\"port\":$listen_port,\"mode\":\"$CERT_MODE\",\"path\":\"$tpath\",\"svc\":\"$svc\"}" | jq . > "$SB_OUT_DIR/sb_meta-$tag.json"
     open_port "$listen_port"
     print_ok "VMess 节点添加完成: $file"
@@ -165,6 +174,8 @@ delete_config() {
     list_configs
     read -r -p "输入要删除的编号: " num; num=$(clean_input "$num")
     [[ "$num" =~ ^[0-9]+$ ]] || { print_error "编号必须数字"; return 1; }
+    read -r -p "确认删除编号 $num ($PROTO) 的节点? [y/N]: " dconfirm
+    [[ "$(clean_input "$dconfirm")" =~ ^[yY] ]] || { print_warn "已取消"; return 0; }
     local idx file tag
     idx=$(printf "%02d" "$num"); file="$SB_CONFIG_DIR/$PROTO-$idx.json"; tag="${PROTO}${idx}"
     [[ -f "$file" ]] || { print_error "编号不存在"; return 1; }
@@ -181,7 +192,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
             echo -e "${CYAN}1)${RESET} 添加\n${CYAN}2)${RESET} 列出\n${CYAN}3)${RESET} 删除\n${CYAN}0)${RESET} 返回"
             read -r -p "请选择: " c
             case "$(clean_input "$c")" in 1) add_config ;; 2) list_configs ;; 3) delete_config ;; 0) break ;; esac
-            read -r -p "按回车继续..." _
+            read -r -p "按回车继续..." _ || { echo; exit 0; }
         done ;;
     esac
 fi

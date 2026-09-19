@@ -80,6 +80,9 @@ add_config() {
     idx=$(get_next_index "$PROTO")
     local file="$SB_CONFIG_DIR/$PROTO-$idx.json" tag="${PROTO}${idx}"
 
+    # QA-F1: 服务端 users 必须带与客户端一致的 flow (vision 才有), 否则客户端 flow mismatch 全部不可连
+    local FLOW_JSON=""
+    [[ "$TRANSPORT" == "vision" || -z "$TRANSPORT" ]] && FLOW_JSON=', "flow": "xtls-rprx-vision"'
     local json
     json=$(cat <<EOF
 {
@@ -201,11 +204,14 @@ delete_config() {
     read -r -p "输入要删除的编号: " num
     num=$(clean_input "$num")
     [[ "$num" =~ ^[0-9]+$ ]] || { print_error "编号必须数字"; return 1; }
+    read -r -p "确认删除编号 $num ($PROTO) 的节点? [y/N]: " dconfirm
+    [[ "$(clean_input "$dconfirm")" =~ ^[yY] ]] || { print_warn "已取消"; return 0; }
     local idx file tag
     idx=$(printf "%02d" "$num")
     file="$SB_CONFIG_DIR/$PROTO-$idx.json"; tag="${PROTO}${idx}"
     if [[ ! -f "$file" ]]; then print_error "编号不存在"; return 1; fi
     rm -f "$file" "$SB_OUT_DIR/sb_share-$tag.txt" "$SB_OUT_DIR/sb_client-$tag.json" "$SB_OUT_DIR/sb_client-$tag.yaml"
+    cleanup_node_shares "$tag"
     sb_check && sb_reload || print_warn "请手动确认服务状态"
     print_ok "已删除 $tag"
 }
@@ -232,7 +238,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
                     0) break ;;
                     *) ;;
                 esac
-                read -r -p "按回车继续..." _
+                read -r -p "按回车继续..." _ || { echo; exit 0; }
             done
             ;;
     esac

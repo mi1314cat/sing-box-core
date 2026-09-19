@@ -397,3 +397,23 @@ sb_selfgen_cert() {
     CERT_DOMAIN="$d"; CERT_TRUSTED=false
     print_ok "自签证书 (pin 认证): $d (crt/key 已生成)"
 }
+
+# ---- QA: 节点删除后清理其分享 token, 并刷新 all 聚合 ----
+cleanup_node_shares() { # cleanup_node_shares <tag>
+    local tag="$1" f
+    [[ -n "$tag" && -d "$SB_OUT_DIR/../share/shares" ]] || return 0
+    local SHARES_DIR="$SB_ROOT/share/shares"
+    for f in "$SHARES_DIR"/*.json; do
+        [[ -f "$f" ]] || continue
+        [[ "$(jq -r .tag "$f" 2>/dev/null)" == "$tag" ]] && rm -f "$f"
+    done
+    # 若存在 all 分享, 刷新聚合文件 (token 不变, 内容即时更新)
+    for f in "$SHARES_DIR"/*.json; do
+        [[ -f "$f" ]] || continue
+        if [[ "$(jq -r .tag "$f" 2>/dev/null)" == "all" ]]; then
+            bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/share.sh" regen-aggregate >/dev/null 2>&1
+            break
+        fi
+    done
+    return 0
+}

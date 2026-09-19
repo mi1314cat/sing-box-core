@@ -115,7 +115,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
                     0) break ;;
                     *) ;;
                 esac
-                read -r -p "按回车继续..." _
+                read -r -p "按回车继续..." _ || { echo; exit 0; }
             done ;;
     esac
 fi

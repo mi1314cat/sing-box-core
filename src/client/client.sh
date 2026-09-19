@@ -122,7 +122,7 @@ add_node() {
 
     if [[ "$src" =~ ^https?:// ]]; then
         local code
-        code=$(curl -fsSL -o "$tmp" -w '%{http_code}' --max-time 30 "$src" 2>/dev/null) || { rm -f "$tmp"; print_err "下载失败"; return 1; }
+        code=$(curl -sSL -o "$tmp" -w '%{http_code}' --max-time 30 "$src" 2>/dev/null) || { rm -f "$tmp"; print_err "网络错误, 下载失败"; return 1; }
         case "$code" in
             200) ;;
             410) rm -f "$tmp"; print_err "分享链接已失效(用尽/过期/禁用)"; return 1 ;;
@@ -152,12 +152,12 @@ add_node() {
         for t in $tags; do
             jq "{outbounds: [.outbounds[] | select(.tag == \"$t\")]}" "$tmp" > "$CLIENT_NODE_DIR/node-$t.json"
             echo "$src" > "$CLIENT_NODE_DIR/node-$t.txt"
-            echo "{\"tag\":\"$t\",\"source\":\"share\",\"imported_at\":\"$(date -Is)\"}" > "$CLIENT_NODE_DIR/node-$t.meta.json"
+            echo "{\"tag\":\"$t\",\"source\":\"share\",\"imported_at\":\"$(date -Is)\"}" > "$CLIENT_NODE_DIR/node-$t.meta"
             n=$((n+1))
         done
         # 去重: 同 tag 多链接时 helper 也作 node 保存? 把内层 detour 目标也保留
         for t in $(jq -r '.outbounds[] | select(.type == "selector" or .type == "urltest" or .type == "direct") | .tag' "$tmp"); do
-            rm -f "$CLIENT_NODE_DIR/node-$t.json" "$CLIENT_NODE_DIR/node-$t.txt" "$CLIENT_NODE_DIR/node-$t.meta.json"
+            rm -f "$CLIENT_NODE_DIR/node-$t.json" "$CLIENT_NODE_DIR/node-$t.txt" "$CLIENT_NODE_DIR/node-$t.meta"
         done
         rm -f "$tmp"
         regen_selector
@@ -172,7 +172,7 @@ import_one_outbound() {
     # 节点池化: 只保留 outbound 定义 (去 route/selector 冲突)
     jq '{outbounds}' "$tmp" > "$CLIENT_NODE_DIR/node-$tag.json"
     echo "$IF_SOURCE" > "$CLIENT_NODE_DIR/node-$tag.txt"
-    echo "{\"tag\":\"$tag\",\"source\":\"share\",\"imported_at\":\"$(date -Is)\"}" > "$CLIENT_NODE_DIR/node-$tag.meta.json"
+    echo "{\"tag\":\"$tag\",\"source\":\"share\",\"imported_at\":\"$(date -Is)\"}" > "$CLIENT_NODE_DIR/node-$tag.meta"
     rm -f "$tmp"
     regen_selector
     print_ok "节点 $tag 已导入 ($CLIENT_NODE_DIR/node-$tag.json); 共 $(ls "$CLIENT_NODE_DIR"/node-*.json 2>/dev/null | wc -l) 个节点"
@@ -191,7 +191,7 @@ update_node() {
 del_node() {
     local tag="$1"
     [[ -f "$CLIENT_NODE_DIR/node-$tag.json" ]] || { print_err "无此节点"; return 1; }
-    rm -f "$CLIENT_NODE_DIR"/node-"$tag".{json,txt,meta.json}
+    rm -f "$CLIENT_NODE_DIR"/node-"$tag".{json,txt,meta,meta.json}
     regen_selector
     print_ok "已删除 $tag"
 }
@@ -300,9 +300,9 @@ case "${1:-}" in
     install) do_install ;;
     init) do_init ;;
     add) shift; add_node "$@" ;;
-    list) regen_selector; ls "$CLIENT_NODE_DIR" | sed 's/^node-//;s/\.json$//' ;;
-    del) del_node "$@" ;;
-    update) update_node "$@" ;;
+    list) regen_selector; for f in "$CLIENT_NODE_DIR"/node-*.json; do [[ -f "$f" ]] && echo "$(basename "$f" .json | sed 's/^node-//')"; done ;;
+    del) shift; del_node "$@" ;;
+    update) shift; update_node "$@" ;;
     check) client_check ;;
     start) do_start ;;
     stop) do_stop ;;
