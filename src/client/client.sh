@@ -25,6 +25,7 @@ CLASH_LISTEN="${CLASH_LISTEN:-0.0.0.0}"   # LAN Web UI(ui 由 secret 保护)
 CLASH_SECRET_FILE="${CLASH_SECRET_FILE:-$CLIENT_ROOT/.clash-secret}"
 UI_ZIP_URL="${UI_ZIP_URL:-https://github.com/MetaCubeX/metacubexd/archive/refs/heads/gh-pages.zip}"
 
+RED="${RED:-\e[31m}"; GREEN="${GREEN:-\e[32m}"; CYAN="${CYAN:-\e[96m}"; RESET="${RESET:-\e[0m}"
 print_msg(){ printf "\033[36m[SB-Client] %s\033[0m\n" "$1" >&2; }
 print_ok(){ printf "\033[32m[OK]   %s\033[0m\n" "$1" >&2; }
 print_err(){ printf "\033[31m[ERR]  %s\033[0m\n" "$1" >&2; }
@@ -130,19 +131,47 @@ add_node() {
             *)   rm -f "$tmp"; print_err "HTTP $code"; return 1 ;;
         esac
         print_ok "分享配置已获取"
+        IF_SOURCE="$src"
     else
         cp "$src" "$tmp"
+        export IF_SOURCE="$src"
     fi
     # 验证 (客户端 check)
     if ! "$CLIENT_BIN" check -c "$tmp" >/dev/null 2>&1 && ! "$CLIENT_BIN" check "$tmp" >/dev/null 2>&1; then
         rm -f "$tmp"; print_err "sing-box check 失败, 旧配置未变"; return 1
     fi
-    local tag
+    # 单节点 payload: outbounds[0] 一个; 全量分享 payload: outbounds N 个 (每个节点一篇)
+    local n_count
+    n_count=$(jq '[.outbounds[] | select(.type != "selector" and .type != "urltest" and .type != "direct")] | length' "$tmp")
+    if (( n_count <= 1 )); then
+        import_one_outbound "$tmp"
+    else
+        # 全量: 每个 outbound 单独立 node-<tag>.json (helper/selector/urltest/direct 由 regen 再过滤)
+        local n=0 t tags
+        tags=$(jq -r '.outbounds[] | select(.type != "selector" and .type != "urltest" and .type != "direct") | .tag' "$tmp")
+        for t in $tags; do
+            jq "{outbounds: [.outbounds[] | select(.tag == \"$t\")]}" "$tmp" > "$CLIENT_NODE_DIR/node-$t.json"
+            echo "$src" > "$CLIENT_NODE_DIR/node-$t.txt"
+            echo "{\"tag\":\"$t\",\"source\":\"share\",\"imported_at\":\"$(date -Is)\"}" > "$CLIENT_NODE_DIR/node-$t.meta.json"
+            n=$((n+1))
+        done
+        # 去重: 同 tag 多链接时 helper 也作 node 保存? 把内层 detour 目标也保留
+        for t in $(jq -r '.outbounds[] | select(.type == "selector" or .type == "urltest" or .type == "direct") | .tag' "$tmp"); do
+            rm -f "$CLIENT_NODE_DIR/node-$t.json" "$CLIENT_NODE_DIR/node-$t.txt" "$CLIENT_NODE_DIR/node-$t.meta.json"
+        done
+        rm -f "$tmp"
+        regen_selector
+        print_ok "已导入 $n 个节点 (单个链接全量分享); 现 $(ls "$CLIENT_NODE_DIR"/node-*.json 2>/dev/null | wc -l) 个节点"
+    fi
+}
+
+import_one_outbound() {
+    local tmp="$1" tag
     tag=$(jq -r '.outbounds[0].tag // empty' "$tmp")
     [[ -n "$tag" ]] || { rm -f "$tmp"; print_err "配置无 outbound"; return 1; }
     # 节点池化: 只保留 outbound 定义 (去 route/selector 冲突)
     jq '{outbounds}' "$tmp" > "$CLIENT_NODE_DIR/node-$tag.json"
-    echo "$src" > "$CLIENT_NODE_DIR/node-$tag.txt"          # 来源记录: share_url / local path
+    echo "$IF_SOURCE" > "$CLIENT_NODE_DIR/node-$tag.txt"
     echo "{\"tag\":\"$tag\",\"source\":\"share\",\"imported_at\":\"$(date -Is)\"}" > "$CLIENT_NODE_DIR/node-$tag.meta.json"
     rm -f "$tmp"
     regen_selector
@@ -199,6 +228,73 @@ download_ui() {
     rm -rf "$tmp"
     print_ok "UI 已就绪: $CLIENT_UI (访问 http://<client_ip>:$PORT_CLASH/ui (带 secret))"
 }
+
+
+
+# ---------- 交互面板 (无参数运行) ----------
+panel_banner() {
+    cat <<CATART
+                       |\__/,|   (\\
+                     _.|o o  |_   ) )
+   -------------(((---(((-------------------
+                   catmi.singbox
+   -----------------------------------------
+CATART
+}
+
+show_panel() {
+    local status n ver
+    status=$(systemctl is-active sb-client 2>/dev/null || echo inactive)
+    ver=$("$CLIENT_BIN" version 2>/dev/null | head -1 | awk '{print $3}')
+    n=$(ls "$CLIENT_NODE_DIR"/node-*.json 2>/dev/null | wc -l)
+    clear
+    cat <<CATART
+                       |\__/,|   (\\
+                     _.|o o  |_   ) )
+   -------------(((---(((-------------------
+                   catmi.singbox
+   -----------------------------------------
+CATART
+    echo -e "${GREEN}SB-Panel — Sing-box 客户端${RESET}   ${GREEN}[ 客户端 · CLIENT ]${RESET}"
+    echo "----------------------"
+    echo -e "服务状态: $([[ $status == active ]] && echo -e "${GREEN}运行中${RESET}" || echo -e "${RED}未运行${RESET}")"
+    echo -e "内核版本: ${GREEN}${ver:-未安装}${RESET}"
+    echo -e "节点数量: ${GREEN}${n:-0}${RESET}"
+    echo -e "本机端口: ${GREEN}HTTP/SOCKS=$PORT_MIXED  Clash_API=$PORT_CLASH${RESET}"
+    echo "----------------------"
+    echo -e "${GREEN}1.${RESET} 安装内核          ${GREEN}2.${RESET} 初始化基础配置"
+    echo -e "${GREEN}3.${RESET} 添加节点 (share-url)"
+    echo -e "${GREEN}4.${RESET} 删除节点          ${GREEN}5.${RESET} 列出节点"
+    echo -e "${GREEN}6.${RESET} 更新节点 (重拉 share)"
+    echo -e "${GREEN}7.${RESET} 启动 / 8. 停止 / 9. 重启服务"
+    echo -e "${GREEN}10.${RESET} 查看状态         ${GREEN}11.${RESET} Web UI / Clash API 信息"
+    echo -e "${GREEN}12.${RESET} 配置检查"
+    echo -e "${GREEN}0.${RESET} 退出"
+    echo "----------------------"
+    read -r -p "请输入选项 [0-12]: " c || { clear; exit 0; }
+    case "$c" in
+        1) do_install ;;
+        2) do_init ;;
+        3) read -r -p "分享链接/URL: " u; add_node "$u" ;;
+        4) read -r -p "tag: " t; del_node "$t" ;;
+        5) regen_selector; ls "$CLIENT_NODE_DIR" | grep '\.json$' | sed 's/^node-//;s/\.json$//' ;;
+        6) update_node ;;
+        7) do_start ;;
+        8) do_stop ;;
+        9) do_restart ;;
+        10) do_status ;;
+        11) do_info ;;
+        12) client_check ;;
+        0) clear; exit 0 ;;
+        *) echo -e "${RED}无效选项 $c${RESET}" ;;
+    esac
+    read -r -p "按回车键返回主菜单..." _ || true
+}
+
+# 无参数运行 → 面板; CLI 子命令照旧
+if [[ $# -eq 0 ]]; then
+    while true; do show_panel; done
+fi
 
 case "${1:-}" in
     install) do_install ;;

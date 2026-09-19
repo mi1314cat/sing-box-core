@@ -148,8 +148,15 @@ show_menu() {
     status_text=$(systemctl is-active "$SB_SERVICE" 2>/dev/null || echo "inactive")
     version_line=$(sb_current_version 2>/dev/null || echo "未安装")
     clear
+    cat <<CATART
+                       |\__/,|   (\\
+                     _.|o o  |_   ) )
+   -------------(((---(((-------------------
+                   catmi.singbox
+   -----------------------------------------
+CATART
     echo -e "
-${GREEN}SB-Panel — Sing-box 管理脚本${RESET}
+${GREEN}SB-Panel — Sing-box 管理脚本${RESET}   ${GREEN}[ 服务端 · SERVER ]${RESET}
 ----------------------
 ${GREEN}1.${RESET} 安装 / 内核 (初始化/安装/更新/版本/卸载/脚本更新)
 ${GREEN}2.${RESET} 节点管理

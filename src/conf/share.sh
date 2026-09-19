@@ -27,6 +27,34 @@ meta_file() {
 
 share_url_for() { echo "http://$(default_server_ip):9292/share/$(jq -r .share_token "$1")"; }
 
+# 聚合全部节点 outbound → 一份 client profile (selector PROXY + urltest AUTO + route.final)
+gen_full_profile() {
+    local out="$SB_OUT_DIR/sb_client-all.json"
+    python3 - "$SB_OUT_DIR" "$out" <<'PY'
+import json,glob,sys,os
+odir,ofile=sys.argv[1],sys.argv[2]
+obs=[]; seen=set()
+for f in sorted(glob.glob(os.path.join(odir,"sb_client-*.json"))):
+    base=os.path.basename(f)
+    if base=="sb_client-all.json": continue
+    for o in json.load(open(f)).get("outbounds",[]):
+        if o.get("type") in ("selector","urltest","direct","block","dns"): continue
+        if o.get("tag") in seen: continue
+        seen.add(o.get("tag")); obs.append(o)
+helper=set(o["detour"] for o in obs if o.get("detour"))
+taglist=[o["tag"] for o in obs if o["tag"] not in helper]
+if not taglist:
+    print("no node payloads", file=sys.stderr); sys.exit(1)
+cfg={"outbounds":obs+[
+    {"type":"selector","tag":"PROXY","outbounds":taglist,"default":taglist[0]},
+    {"type":"urltest","tag":"AUTO","outbounds":taglist,
+     "url":"https://www.gstatic.com/generate_204","interval":"3m"}],
+    "route":{"final":"PROXY"}}
+json.dump(cfg,open(ofile,"w"),indent=1)
+PY
+    printf "%s" "$out"
+}
+
 create_share() {
     local tag="$1" max_uses="${2:-1}" ttl="${3:-24}"
     [[ -n "$tag" ]] || { print_error "用法: share.sh create <tag> [max_uses] [ttl_hours]"; return 1; }
@@ -104,6 +132,12 @@ regen_share() {
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     case "${1:-}" in
         create) shift; create_share "$@" ;;
+        create-all)
+            # share.sh create-all <max_uses> <ttl_hours>: 一个链接承载全部节点
+            gen_full_profile >/dev/null 2>&1 || { print_error "聚合生成失败 (out/sb_client-*.json 为空?)"; exit 1; }
+            allf="$(gen_full_profile)" || { print_error "聚合生成失败 (out/sb_client-*.json 为空?)"; exit 1; }
+            shift; create_share "all" "$@"
+            ;;
         list) list_shares ;;
         del) del_share "$2" ;;
         toggle) toggle_share "$2" ;;
