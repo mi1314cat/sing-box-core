@@ -40,14 +40,15 @@ do_install() {
     ver_url=$(curl -fsSL --max-time 20 "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | grep -oE '"tag_name": *"[^"]+' | cut -d'"' -f4 | head -1)
     [[ -n "$ver_url" ]] || { print_err "获取最新版本号失败"; return 1; }
     local tag="$ver_url"
-    local ok=0 url
-    for url in "https://github.com/SagerNet/sing-box/releases/download/$tag/sing-box-${ver_url}-linux-${arch}-glibc.tar.gz" \
-               "https://github.com/SagerNet/sing-box/releases/download/$tag/sing-box-${ver_url}-linux-${arch}.tar.gz" \
-               "https://github.com/SagerNet/sing-box/releases/download/$tag/sing-box-${ver_url}-linux-${arch}-musl.tar.gz"; do
+    local ok=0 url vn="${ver_url#v}"
+    [[ "$vn" == "$ver_url" ]] && vn="$ver_url"        # 兼容 v 前缀缺失场景
+    local libc_suffix=""
+    for libc_suffix in "-glibc" "" "-musl"; do
+        url="https://github.com/SagerNet/sing-box/releases/download/$tag/sing-box-${vn}-linux-${arch}${libc_suffix}.tar.gz"
         if curl -fsSL --max-time 300 "$url" -o "$CLIENT_ROOT/core/core.tgz" 2>/dev/null; then ok=1; break; fi
     done
     [[ "$ok" == 1 ]] || { print_err "内核下载失败 (试过 glibc/generic/musl 命名)"; return 1; }
-    tar -xzf "$CLIENT_ROOT/core/core.tgz" -C "$CLIENT_ROOT/core" --strip-components=1 "sing-box-${ver_url}-linux-${arch}/sing-box" \
+    tar -xzf "$CLIENT_ROOT/core/core.tgz" -C "$CLIENT_ROOT/core" --strip-components=1 "sing-box-${vn}-linux-${arch}${libc_suffix}/sing-box" \
         || { print_err "解包失败"; return 1; }
     rm -f "$CLIENT_ROOT/core/core.tgz"
     chmod +x "$CLIENT_BIN" 2>/dev/null || true

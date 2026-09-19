@@ -7,6 +7,27 @@
 - 协议模块独立 `src/conf/*.sh`，Reality 伪装域名运行时拉取
   https://raw.githubusercontent.com/mi1314cat/One-click-script/main/domains.sh 统一源 `random_website()`（本地不复制），失败才回退 `www.oracle.com`。
 
+## 一键安装（从 GitHub 拉取）
+```bash
+# 服务端 (面板 + sing-box 内核 + share 服务)
+bash <(curl -Ls https://github.com/mi1314cat/sing-box-core/raw/refs/heads/main/install.sh) server
+# 客户端 (sing-box 内核 + LAN HTTP/SOCKS:2080 + Web UI)
+bash <(curl -Ls https://github.com/mi1314cat/sing-box-core/raw/refs/heads/main/install.sh) client
+# 升级已装机器
+bash <(curl -Ls https://github.com/mi1314cat/sing-box-core/raw/refs/heads/main/install.sh) update
+```
+
+
+## 一键安装（从 GitHub 拉取）
+```bash
+# 服务端
+bash <(curl -Ls https://github.com/mi1314cat/sing-box-core/raw/refs/heads/main/install.sh) server
+# 客户端
+bash <(curl -Ls https://github.com/mi1314cat/sing-box-core/raw/refs/heads/main/install.sh) client
+# 升级
+bash <(curl -Ls https://github.com/mi1314cat/sing-box-core/raw/refs/heads/main/install.sh) update
+```
+
 ## Server
 
 ```bash
