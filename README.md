@@ -23,10 +23,14 @@ bash sing-box.sh {init|check|reload|restart|status|list|node}   # CLI
 | 模块 | 职责 |
 |---|---|
 | core.sh | 安装/卸载/指定版本/更新事务（备份→下载→新内核预检→原子替换→失败回滚） |
-| reality.sh | VLESS-REALITY/Vision; keypair 共享 out/reality-keys.json; dest 默认 www.oracle.com |
+| reality.sh | VLESS-REALITY/Vision; keypair 共享 out/reality-keys.json; dest 统一来源于 mi1314cat/One-click-script 的 domains.sh (random_website)，运行时拉取，本地不复制 |
 | hysteria2.sh | hysteria2; 证书扫描（xary-core 清单）+自签 ECDSA+pin 分享; 端口跳跃 DNAT |
 | anyreality.sh | AnyTLS+REALITY(1.12+); 复用 REALITY keypair; mihomo 不兼容提示 |
 | vless.sh | VLESS WS+TLS |
+| vmess.sh | VMess (ws/grpc/h2/tcp + TLS/自签/Reality) |
+| trojan.sh | Trojan TCP+TLS (真证书/自签 SPKI pin) |
+| naive.sh | Naive HTTP/2 (真证书必须; 自签仅半客户端) |
+| shadowtls.sh | ShadowTLS v3 + 内层 SS-2022 (双 inbound detour) |
 | shadowsocks.sh | 2022-blake3 |
 | tuic.sh | TUIC v5 (1.14: 无 authentication_timeout) |
 | dns.sh | 01-dns.json: 服务器/分流/去广告/FakeIP; 1.14 对象格式 (永不生成 legacy 字段) |
