@@ -266,3 +266,134 @@ cert_spki_pin_base64() {
         | openssl pkey -pubin -outform der 2>/dev/null \
         | openssl dgst -sha256 -binary 2>/dev/null | base64 -w0
 }
+
+
+# ==============================================================
+# 统一 TLS 证书设施 (对齐 xary-core hysteria2.sh ask_cert 的语义)
+#   SB_ask_cert 输出: CERT_FILE, KEY_FILE, CERT_DOMAIN, CERT_TRUSTED
+#   1) 扫描本机已有证书 (ACME/nginx/CF Origin/ca 可信) 2) 手动路径 3) 自签
+# ==============================================================
+SB_CERT_SCAN_PIDIR="/etc/letsencrypt/live"
+cert_not_expired() { openssl x509 -in "$1" -noout -checkend 86400 >/dev/null 2>&1; }
+sb_has_key_for() {
+    local crt="$1" k
+    for k in "${crt%_cert.pem}_key.pem" "${crt%.pem}_key.pem" "${crt%.crt}.key" "${crt%.pem}.key" "${crt%.pem}_privkey.pem"; do
+        [[ -f "$k" ]] && { echo "$k"; return 0; }
+    done
+    return 1
+}
+sb_scan_certs() {
+    local dirs=() lbls=() src cid f
+    # 1) 统一 cert 目录 (catmi 主目录)
+    [[ -d "$SB_ROOT/cert" ]] && { dirs+=("$SB_ROOT/cert"); lbls+=("sb-cert-dir"); }
+    # 2) certbot/ACME 正式目录 (真实域 CA 可信, 特别适合 naive/vmess)
+    if [[ -d /etc/letsencrypt/live ]]; then
+        for f in /etc/letsencrypt/live/*/*_cert.pem; do [[ -f "$f" ]] && { dirs+=("$f" ""); lbls+=("certbot"); }; done 2>/dev/null
+    fi
+    # 3) acme.sh 默认目录
+    [[ -d /root/.acme.sh ]] && dirs+=("/root/.acme.sh") && lbls+=("acme.sh")
+    # 4) nginx / cloudflare / docker
+    [[ -d /etc/nginx/certs ]] && dirs+=("/etc/nginx/certs") && lbls+=("nginx-certs")
+    [[ -d /root/catmi/cloudflare/certs ]] && dirs+=("/root/catmi/cloudflare/certs") && lbls+=("catmi/cloudflare-certs")
+    if command -v docker >/dev/null 2>&1; then
+        for cid in $(docker ps -q 2>/dev/null); do
+            src=$(docker inspect "$cid" --format '{{range .Mounts}}{{if eq .Destination "/etc/nginx/certs"}}{{.Source}}{{end}}{{end}}' 2>/dev/null)
+            [[ -z "$src" && -d /etc/nginx/certs ]] && src="/etc/nginx/certs"
+            [[ -n "$src" ]] && { dirs+=("$src"); lbls+=("docker-nginx($cid)"); }
+        done
+    fi
+    sb_FOUND_CERTS=()
+    local lbl idx
+    for ((i=0; i<${#dirs[@]}; i++)); do
+        lbl="${lbls[$i]}"
+        for f in "${dirs[$i]}"/*.crt "${dirs[$i]}"/*.pem "${dirs[$i]}"/*/*_cert.pem; do
+            [[ -f "$f" ]] || continue
+            case "$f" in *CA*|*ca.crt) continue ;; esac
+            # 排除 CA 证书
+            openssl x509 -in "$f" -noout -text 2>/dev/null | grep -q "CA:TRUE" && continue
+            local k
+            k=$(sb_key_for "$f") || true
+            [[ -n "$k" && -f "$k" ]] && cert_not_expired "$f" && sb_FOUND_CERTS+=("${f}|${k}|${lbl}")
+        done 2>/dev/null
+    done
+    # certbot live 目录单独处理 (fullchain/privkey 命名 特殊)
+    for f in /etc/letsencrypt/live/*/fullchain.pem; do
+        [[ -f "$f" ]] || continue
+        sb_FOUND_CERTS+=("$f|$(dirname "$f")/privkey.pem|certbot-live")
+    done 2>/dev/null
+    # 去重 (find key)
+    if ((${#sb_FOUND_CERTS[@]} == 0)); then return 1; fi
+    return 0
+}
+sb_key_for() {  # sb_scan_certs 的 key 匹配 (规则与 ask_cert 一致)
+    local crt="$1"
+    local k
+    for k in "${crt%_cert.pem}_key.pem" "${crt%.pem}_key.pem" "${crt%.crt}.key" "${crt%.pem}.key" "${crt%.crt}_key.pem" "${crt%.pem}_key.pem"; do
+        [[ -f "$k" ]] && { echo "$k"; return 0; }
+    done
+    return 1
+}
+extract_cert_domain() {
+    local f dom
+    if command -v openssl >/dev/null 2>&1 && [[ -f "$1" ]]; then
+        dom=$(openssl x509 -in "$1" -noout -ext subjectAltName 2>/dev/null | grep -oE 'DNS:[^,]+' | head -1 | cut -d: -f2)
+        [[ -z "$dom" ]] && dom=$(openssl x509 -in "$1" -noout -subject 2>/dev/null | grep -oE 'CN *= *[^,]+' | head -1 | sed 's/CN *= *//')
+    fi
+    [[ -z "$dom" ]] && dom=$(basename "$1" | sed -E 's/\.(crt|pem)$//; s/_cert$//; s/^cert-//')
+    echo "$dom"
+}
+sb_ask_cert() {
+    export CERT_FILE KEY_FILE CERT_DOMAIN CERT_TRUSTED
+    local choice f k c pick have=0
+    echo "  证书方案：
+        1) 扫描本机已有证书 (certbot/acme/nginx; CA 可信)
+        2) 手动输入路径
+        3) 生成自签 (200天, 客户端经 SPKI pin)" >&2
+    read -r -p "  选择 (默认1): " c; c=$(clean_input "$c"); [[ -z "$c" ]] && c=1
+    case "$c" in
+        2)
+            read -r -p "  crt 路径: " f; read -r -p "  key 路径: " k
+            f=$(clean_input "$f"); k=$(clean_input "$k")
+            [[ -f "$f" && -f "$k" ]] || { print_error "路径无效, 改用自签"; sb_selfgen_cert; return $?; }
+            CERT_FILE=$f; KEY_FILE=$k; CERT_DOMAIN=$(extract_cert_domain "$f")
+            cert_not_expired "$f" || { print_warn "证书已过期! 退回自签"; sb_selfgen_cert; return $?; }
+            CERT_TRUSTED=true; return 0 ;;
+        3) sb_selfgen_cert; return $? ;;
+    esac
+    sb_scan_certs || { print_warn "未发现可用证书, 改用自签"; sb_selfgen_cert; return $?; }
+    local i=1 pair usable
+    for pair in "${sb_FOUND_CERTS[@]}"; do
+        f="${pair%%|*}"; k="${pair#*|}"; k="${k%%|*}"
+        echo -e "    ${GREEN}$i${RESET}) ${YELLOW}$(extract_cert_domain "$f")${RESET} (${CYAN}${pair##*|}${RESET})" >&2
+        have=1; ((i++))
+    done
+    echo -e "    ${CYAN}$i${RESET}) 手动输入路径" >&2
+    echo -e "    ${CYAN}$((i+1))${RESET}) 生成自签" >&2
+    read -r -p "  选择 (默认1): " pick; pick=$(clean_input "$pick"); [[ -z "$pick" ]] && pick=1
+    if [[ $pick == "$i" ]]; then
+        read -r -p "  crt: " f; read -r -p "  key: " k
+        f=$(clean_input "$f"); k=$(clean_input "$k")
+        [[ -f "$f" && -f "$k" ]] || { print_error "路径无效"; sb_selfgen_cert; return $?; }
+        CERT_FILE=$f; KEY_FILE=$k; CERT_DOMAIN=$(extract_cert_domain "$f"); CERT_TRUSTED=true; return 0
+    elif [[ $pick == $((i+1)) ]]; then sb_selfgen_cert; return $?
+    else
+        pair="${sb_FOUND_CERTS[$((pick-1))]:-}"
+        [[ -z "$pair" ]] && { sb_selfgen_cert; return $?; }
+        CERT_FILE="${pair%%|*}"; CERT_FILE="${CERT_FILE%%|*}"
+        KEY_FILE="${pair#*|}"; KEY_FILE="${KEY_FILE%%|*}"
+        CERT_DOMAIN=$(extract_cert_domain "$CERT_FILE"); CERT_TRUSTED=true
+        return 0
+    fi
+}
+sb_selfgen_cert() {
+    export CERT_FILE KEY_FILE CERT_DOMAIN CERT_TRUSTED
+    mkdir -p "$CERT_DIR"
+    # 统一伪装域名: 优先 domains.sh 拉取, 失败才本地随机
+    local d
+    command -v reality_random_domain >/dev/null 2>&1 && d=$(reality_random_domain) || d=$(tr -dc a-z0-9 </dev/urandom | head -c 8).example.com
+    CERT_FILE="$CERT_DIR/cert-$d.crt"; KEY_FILE="$CERT_DIR/key-$d.key"
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes         -keyout "$KEY_FILE" -out "$CERT_FILE" -days 200 -subj "/CN=$d" -addext "subjectAltName=DNS:$d" >/dev/null 2>&1
+    [[ -f "$CERT_FILE" ]] || { print_error "自签证书生成失败"; return 1; }
+    CERT_DOMAIN="$d"; CERT_TRUSTED=false
+    print_ok "自签证书 (pin 认证): $d (crt/key 已生成)"
+}

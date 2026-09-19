@@ -106,6 +106,7 @@ core_menu() {
             4) version_menu ;;
             5) run_module core.sh uninstall ;;
             6) update_scripts ;;
+            7) run_module uninstall.sh ;;
             0) return ;;
             *) echo -e "${RED}无效选项 $c${RESET}" ;;
         esac
