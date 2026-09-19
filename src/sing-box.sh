@@ -161,29 +161,27 @@ ${GREEN}SB-Panel — Sing-box 管理脚本${RESET}   ${GREEN}[ 服务端 · SERV
 ${GREEN}1.${RESET} 安装 / 内核 (初始化/安装/更新/版本/卸载/脚本更新)
 ${GREEN}2.${RESET} 节点管理
 ${GREEN}3.${RESET} 分享链接管理
-${GREEN}4.${RESET} 客户端地址 / Web UI 信息
-${GREEN}5.${RESET} 网络 (端口转发/DNS/规则集/出站)
-${GREEN}6.${RESET} 服务管理 (启动/停止/重启/软重载)
-${GREEN}7.${RESET} 校验配置 + 重载
-${GREEN}8.${RESET} 查看日志
-${GREEN}9.${RESET} 列出全部配置文件
+${GREEN}4.${RESET} 网络 (端口转发/DNS/规则集/出站)
+${GREEN}5.${RESET} 服务管理 (启动/停止/重启/软重载)
+${GREEN}6.${RESET} 校验配置 + 重载
+${GREEN}7.${RESET} 查看日志
+${GREEN}8.${RESET} 列出全部配置文件
 ${GREEN}0.${RESET} 退出
 ----------------------
 sing-box 服务状态: $([[ "$status_text" == "active" ]] && echo -e "${GREEN}运行中${RESET}" || echo -e "${RED}未运行${RESET}")
 内核版本: ${GREEN}$version_line${RESET}
 节点数:   ${GREEN}$(ls "$SB_CONFIG_DIR"/*.json 2>/dev/null | grep -cv '^-')${RESET}
 ----------------------"
-    read -r -p "请输入选项 [0-9]: " choice || { clear; exit 0; }
+    read -r -p "请输入选项 [0-8]: " choice || { clear; exit 0; }
     case "$choice" in
         1)  core_menu ;;
         2)  add_node_menu ;;
         3)  run_module share.sh ;;
-        4)  client_info_menu ;;
-        5)  net_menu ;;
-        6)  service_menu ;;
-        7)  check_all ;;
-        8)  sb_journal 100; read -r -p "按回车键返回主菜单..." ;;
-        9)  list_configs ;;
+        4)  net_menu ;;
+        5)  service_menu ;;
+        6)  check_all ;;
+        7)  sb_journal 100; read -r -p "按回车键返回主菜单..." ;;
+        8)  list_configs ;;
         0)  clear; exit 0 ;;
         *)  echo -e "${RED}无效选项 $choice${RESET}" ;;
     esac
