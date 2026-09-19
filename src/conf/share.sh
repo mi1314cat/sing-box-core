@@ -55,7 +55,42 @@ PY
     printf "%s" "$out"
 }
 
-create_share() {
+# ---- 面板辅助: 节点列表 (供分享链接选择) ----
+node_tags(){ ls "$SB_OUT_DIR"/sb_client-*.json 2>/dev/null | sed "s|.*/sb_client-||;s|\.json$||" | grep -v "^all$" | sort -u; }
+
+pick_node_tag() {
+    local i=1 t f proto port
+    echo >&2
+    echo -e "${CYAN}可选节点 (0 = 全部节点一条链接):${RESET}" >&2
+    echo "--------------------------------------------------------" >&2
+    for t in $(node_tags); do
+        f="$SB_OUT_DIR/sb_client-$t.json"
+        proto=$(jq -r '.outbounds[0].type // "?"' "$f" 2>/dev/null)
+        port=$(jq -r '.outbounds[0].server_port // "-"' "$f" 2>/dev/null)
+        echo -e "${GREEN}$i${RESET}) ${YELLOW}$t${RESET} | 协议: ${CYAN}$proto${RESET} | 端口: ${BLUE}$port${RESET}" >&2
+        i=$((i+1))
+    done
+    echo "--------------------------------------------------------" >&2
+    read -r -p "选择编号 / 直接输入 tag (默认 0=全部): " n
+    n=$(clean_input "$n"); [[ -z "$n" ]] && n="0"
+    if [[ "$n" == "0" || "$n" == "all" ]]; then echo "all"; return; fi
+    if [[ "$n" =~ ^[0-9]+$ ]]; then
+        local idx=1
+        for t in $(node_tags); do
+            [[ "$idx" == "$n" ]] && { echo "$t"; return; }
+            idx=$((idx+1))
+        done
+        echo ""
+        return
+    fi
+    echo "$n"
+}
+
+node_list_banner(){
+    print_title "按编号选择要分享的节点"
+}
+
+create_share() { 
     local tag="$1" max_uses="${2:-1}" ttl="${3:-24}"
     [[ -n "$tag" ]] || { print_error "用法: share.sh create <tag> [max_uses] [ttl_hours]"; return 1; }
     local client_file="$SB_OUT_DIR/sb_client-$tag.json"
@@ -135,7 +170,6 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
         create-all)
             # share.sh create-all <max_uses> <ttl_hours>: 一个链接承载全部节点
             gen_full_profile >/dev/null 2>&1 || { print_error "聚合生成失败 (out/sb_client-*.json 为空?)"; exit 1; }
-            allf="$(gen_full_profile)" || { print_error "聚合生成失败 (out/sb_client-*.json 为空?)"; exit 1; }
             shift; create_share "all" "$@"
             ;;
         list) list_shares ;;
@@ -143,16 +177,34 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
         toggle) toggle_share "$2" ;;
         regen) regen_share "$2" ;;
         *) while true; do
-            print_title "分享链接管理"
-            echo -e "${CYAN}1)${RESET} 生成   bash share.sh create <tag> [max_uses=1] [ttl_hours=24]"
-            echo -e "${CYAN}2)${RESET} 列表\n${CYAN}3)${RESET} 删除\n${CYAN}0)${RESET} 返回"
-            read -r -p "选项: " c
+            print_title "分享链接管理 (share)"
+            echo -e "${CYAN}1)${RESET} 生成链接 (选节点)"
+            echo -e "${CYAN}2)${RESET} 生成全部节点链接 (一个链接带全部)"
+            echo -e "${CYAN}3)${RESET} 列出全部链接"
+            echo -e "${CYAN}4)${RESET} 删除链接"
+            echo -e "${CYAN}5)${RESET} 禁用/启用 (toggle)"
+            echo -e "${CYAN}6)${RESET} 重新生成 token (regen)"
+            echo -e "${CYAN}0)${RESET} 返回"
+            read -r -p "选择: " c
             case "$(clean_input "$c")" in
-                1) t=$(safe_read "节点 tag [default reality01]" "reality01"); \
-                   m=$(safe_read "max_uses (0=不限)" 1); h=$(safe_read "ttl_hours" 24); create_share "$t" "$m" "$h" ;;
-                2) list_shares ;;
-                3) t=$(safe_read "token|tag"); del_share "$t" ;;
+                1)
+                    node_list_banner
+                    tag=$(pick_node_tag)
+                    [[ -n "$tag" ]] || { print_error "无节点可选 / 无效选择"; continue; }
+                    m=$(safe_read "max_uses (0=不限)" "1")
+                    h=$(safe_read "ttl_hours" "24")
+                    create_share "$tag" "$m" "$h" ;;
+                2)
+                    gen_full_profile >/dev/null 2>&1 || { print_error "聚合生成失败 (没有 sb_client-*.json?)"; continue; }
+                    m=$(safe_read "max_uses (0=不限)" "2")
+                    h=$(safe_read "ttl_hours" "24")
+                    create_share "all" "$m" "$h" ;;
+                3) list_shares ;;
+                4) read -r -p "token 或 tag (回车取消): " t; [[ -n "$t" ]] && del_share "$t" ;;
+                5) read -r -p "token 或 tag: " t; toggle_share "$t" ;;
+                6) read -r -p "token 或 tag: " t; regen_share "$t" ;;
                 0) break ;;
+                *) print_error "无效选项 $c" ;;
             esac
             read -r -p "回车继续..." _
         done ;;
