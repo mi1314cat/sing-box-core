@@ -94,6 +94,143 @@ delete_config() {
     print_ok "已删除出站 $tag 及其路由规则"
 }
 
+
+# ==============================================================
+# 域名分流 + 入站绑定出站  (参考 xary-core outbound.sh 交互语义)
+# 路由统一写 $SB_CONFIG_DIR/03-route.json 的 route.rules
+# ==============================================================
+ROUTE_FILE="$SB_CONFIG_DIR/03-route.json"
+all_outbound_tags() { # 可选出站/tag 列表 (含各协议节点 tag + 自定义 outbound + direct)
+    local tags
+    jq -r '.outbounds[]?.tag' "$SB_CONFIG_DIR"/*.json 2>/dev/null |
+        grep -vE "^(00-(direct|dns))" | sort -u
+}
+
+outbound_pick() {
+    local i=1 t choices=()
+    echo -e "${CYAN}可选出站/节点 tag:${RESET}" >&2
+    echo "--------------------------------------------------------" >&2
+    for t in $(all_outbound_tags); do
+        echo -e "  ${GREEN}$i${RESET}) ${YELLOW}$t${RESET}" >&2
+        choices+=("$t"); i=$((i+1))
+    done
+    echo -e "    ${CYAN}$i${RESET}) direct (默认)" >&2
+    echo "--------------------------------------------------------" >&2
+    read -r -p "选择编号 / 直接输入 tag (默认 direct): " n
+    n=$(clean_input "$n"); [[ -z "$n" ]] && { echo "direct"; return; }
+    if [[ "$n" =~ ^[0-9]+$ ]]; then
+        (( n <= ${#choices[@]} )) && { echo "${choices[$((n-1))]}"; return; }
+        echo "" ; return
+    fi
+    echo "$n"
+}
+
+split_add() {
+    local dom out
+    dom=$(safe_read "要分流的域名 (支持子域 suffix 匹配, 如 example.com)" "")
+    [[ -z "$dom" ]] && { print_error "未输入域名"; return 1; }
+    out=$(outbound_pick); [[ -z "$out" ]] && { print_error "未选择出站/编号无效"; return 1; }
+    python3 - "$ROUTE_FILE" "$dom" "$out" <<'PYS'
+import json,sys
+rf,dom,out=sys.argv[1:]
+try:
+    d=json.load(open(rf))
+except Exception:
+    d={}
+d.setdefault("route",{}).setdefault("rules",[])
+d["route"]["rules"].append({"domain_suffix":[dom],"outbound":out})
+json.dump(d,open(rf,"w"),indent=2)
+PYS
+    sb_check && sb_reload && print_ok "域名分流已生效: *$dom -> $out"
+}
+
+split_list() {
+    jq -r '.route.rules[]? | select(.domain_suffix != null) | "\(.domain_suffix|join(","))  ->  \(.outbound)"' "$ROUTE_FILE" 2>/dev/null | nl -ba
+}
+
+split_del() {
+    local n; n=$(safe_read "要删除第几条分流 (0=全部)" "0")
+    [[ "$n" =~ ^[0-9]+$ ]] || { print_error "请输入编号"; return 1; }
+    python3 - "$ROUTE_FILE" "$n" <<'PYS'
+import json,sys
+rf,n=sys.argv[1:3]
+d=json.load(open(rf))
+rules=d.get("route",{}).get("rules",[])
+keep=[]
+i=0
+for r in rules:
+    if "domain_suffix" in r:
+        i+=1
+        if n!="0" and str(i)!=n: keep.append(r)
+        continue
+    keep.append(r)
+d["route"]["rules"]=keep
+json.dump(d,open(rf,"w"),indent=2)
+PYS
+    sb_check && sb_reload && print_ok "分流规则已更新"
+}
+
+all_inbound_tags(){  # 所有可绑定的入站 tag (各节点 inbound+端口转发)
+    jq -r '.inbounds[]?.tag' "$SB_CONFIG_DIR"/*.json 2>/dev/null | sort -u
+}
+
+bind_add() {
+    local i=1 in_ choices=()
+    echo -e "${CYAN}可选入站 (节点/端口转发):${RESET}" >&2
+    echo "--------------------------------------------------------" >&2
+    for in_ in $(all_inbound_tags); do
+        echo -e "${GREEN}$i${RESET}) ${YELLOW}$in_${RESET}" >&2
+        choices+=("$in_"); i=$((i+1))
+    done
+    [[ ${#choices[@]} -eq 0 ]] && { print_warn "当前没有入站"; return 1; }
+    echo "--------------------------------------------------------" >&2
+    read -r -p "选择入站编号: " c
+    c=$(clean_input "$c")
+    if [[ "$c" =~ ^[0-9]+$ ]]; then
+        (( c >= 1 && c <= ${#choices[@]} )) || { print_error "无效编号"; return 1; }
+        in_="${choices[$((c-1))]}"
+    else in_="$c"; fi
+    out=$(outbound_pick); [[ -z "$out" ]] && { print_error "未选择出站"; return 1; }
+    python3 - "$ROUTE_FILE" "$in_" "$out" <<'PYS'
+import json,sys
+rf,ib,out=sys.argv[1:]
+try:
+    d=json.load(open(rf))
+except Exception:
+    d={}
+rules=d.setdefault("route",{}).get("rules",[])
+# 同一入站已绑定的先移除
+rules=[r for r in rules if not ("inbound" in r and r["inbound"]==[ib])]
+rules.append({"inbound":[ib],"outbound":out})
+d["route"]["rules"]=rules
+json.dump(d,open(rf,"w"),indent=2)
+PYS
+    sb_check && sb_reload && print_ok "入站绑定已生效: $in_ -> $out"
+}
+
+bind_del() {
+    local n; n=$(safe_read "要删除第几条绑定 (0=全部)" "0")
+    [[ "$n" =~ ^[0-9]+$ ]] || { print_error "请输入编号"; return 1; }
+    python3 - "$ROUTE_FILE" "$n" <<'PYS'
+import json,sys
+rf,n=sys.argv[1:3]
+d=json.load(open(rf))
+rules=d.get("route",{}).get("rules",[])
+keep=[]; i=0
+for r in rules:
+    if "inbound" in r and "outbound" in r:
+        i+=1
+        if n!="0" and str(i)!=n: keep.append(r)
+        continue
+    keep.append(r)
+d.setdefault("route",{})["rules"]=keep
+json.dump(d,open(rf,"w"),indent=2)
+print("{} deleted".format(i-len(keep)))
+PYS
+    sb_check && sb_reload && print_ok "绑定规则已更新"
+}
+bind_list(){ jq -r '.route.rules[]? | select(.inbound != null) | "\(.inbound|join(","))  ->  \(.outbound)"' "$ROUTE_FILE" 2>/dev/null | nl -ba; }
+
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     case "${1:-}" in
         add)  add_config ;;
@@ -106,12 +243,22 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
                 echo -e "${CYAN}1)${RESET} 添加出站"
                 echo -e "${CYAN}2)${RESET} 列出出站"
                 echo -e "${CYAN}3)${RESET} 删除出站"
+                echo -e "${CYAN}4)${RESET} 域名分流 (添加规则: 指定域名 → 指定出站)"
+                echo -e "${CYAN}5)${RESET} 域名分流 (列出规则)"
+                echo -e "${CYAN}6)${RESET} 域名分流 (删除规则)"
+                echo -e "${CYAN}7)${RESET} 入站绑定出站 (添加: 节点/端口 → 出站)"
+                echo -e "${CYAN}8)${RESET} 入站绑定出站 (删除)"
                 echo -e "${CYAN}0)${RESET} 返回"
                 read -r -p "请选择: " c
                 case "$(clean_input "$c")" in
                     1) add_config ;;
                     2) list_configs ;;
                     3) delete_config ;;
+                    4) split_add ;;
+                    5) split_list ;;
+                    6) split_del ;;
+                    7) bind_add ;;
+                    8) bind_del ;;
                     0) break ;;
                     *) ;;
                 esac
