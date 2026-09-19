@@ -1,5 +1,5 @@
 [36mINFO[0m[0000] network: updated default interface eth0, index 4
-[36mINFO[0m[0000] network: updated network environment: gateway [192.168.1.1 fe80::1], gateway_mac [d8:59:82:86:3a:a1 d8:59:82:86:3a:a1]
+[36mINFO[0m[0000] network: updated network environment: gateway [192.0.2.1 fe80::1], gateway_mac [xx:xx:xx:xx:xx:xx xx:xx:xx:xx:xx:xx]
 [36mINFO[0m[0000] inbound/mixed[m]: tcp server started at 127.0.0.1:21011
 [36mINFO[0m[0000] sing-box started (0.01s)
 [36mINFO[0m[0001] [[38;5;102m1642976086[0m 0ms] inbound/mixed[m]: inbound connection from 127.0.0.1:5974

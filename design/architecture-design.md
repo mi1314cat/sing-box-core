@@ -3,10 +3,10 @@
 > 一个内核 + 一个统一 service + 一个配置目录 + 多个独立协议配置文件 + 多个独立协议生成脚本。
 > 技术基线：sing-box **v1.14.1**（stable）。所有 CLI 参数顺序：`sing-box -D ... -C ... run`。
 
-## 1. 目录结构（服务器侧，对齐 xary-core 习惯：根在 /root/catmi）
+## 1. 目录结构（服务器侧，对齐 xary-core 习惯：根在 /opt/sb-panel）
 
 ```
-/root/catmi/sing-box/
+/opt/sb-panel/sing-box/
 ├── sing-box                  # 内核二进制（锁定版本）
 ├── bin/
 │   └── version               # 记录当前安装版本（单一 state 锚点）
@@ -45,7 +45,7 @@
 Description=sing-box unified service (sb-panel)
 After=network.target
 [Service]
-ExecStart=/root/catmi/sing-box/sing-box -D /root/catmi/sing-box -C /root/catmi/sing-box/config run
+ExecStart=/opt/sb-panel/sing-box/sing-box -D /opt/sb-panel/sing-box -C /opt/sb-panel/sing-box/config run
 ExecReload=/bin/kill -HUP $MAINPID          # SIGHUP 软重载：check 失败自动保留旧实例
 Restart=on-failure
 RestartSec=3
@@ -72,7 +72,7 @@ WantedBy=multi-user.target
 
 ## 4. 内核与版本管理（core.sh + 主入口）
 
-- 安装：GitHub release tar.gz（amd64/arm64 自检 `-m`），校验 sha256 → `/root/catmi/sing-box/sing-box`；默认锁定写死的安全 stable 版本（脚本内 `DEFAULT_VERSION=v1.14.1`，新 stable 出现需用户手动追）。
+- 安装：GitHub release tar.gz（amd64/arm64 自检 `-m`），校验 sha256 → `/opt/sb-panel/sing-box/sing-box`；默认锁定写死的安全 stable 版本（脚本内 `DEFAULT_VERSION=v1.14.1`，新 stable 出现需用户手动追）。
 - 版本：`current`（sing-box version）/ `latest`（GitHub API 查最新 stable）/ `install <version>` 指定版本（可 numeric-less alpha？默认拒绝 pre-release，可选 `--pre` 覆盖）。
 - 更新流程（事务化）：
   1. 备份 config/ + out/ + 二进制 → backup/<ts>/
