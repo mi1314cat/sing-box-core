@@ -1,0 +1,15 @@
+[36mINFO[0m[0000] network: updated default interface eth0, index 4
+[36mINFO[0m[0000] inbound/mixed[m]: tcp server started at 127.0.0.1:21001
+[36mINFO[0m[0000] network: updated network environment: gateway [192.168.1.1 fe80::1], gateway_mac [d8:59:82:86:3a:a1 d8:59:82:86:3a:a1]
+[36mINFO[0m[0000] sing-box started (0.01s)
+[36mINFO[0m[0001] [[38;5;209m4230259905[0m 0ms] inbound/mixed[m]: inbound connection from 127.0.0.1:29562
+[36mINFO[0m[0001] [[38;5;209m4230259905[0m 1ms] inbound/mixed[m]: inbound connection to ip.sb:80
+[36mINFO[0m[0001] [[38;5;209m4230259905[0m 1ms] outbound/vless[reality03]: outbound connection to ip.sb:80
+[36mINFO[0m[0002] [[38;5;209m4230259905[0m 960ms] outbound/vless[reality03]: outbound connection to ip.sb:80
+[37mTRACE[0m[0002] outbound/vless[reality03]: XtlsPadding 0 10 0
+[37mTRACE[0m[0002] outbound/vless[reality03]: XtlsPadding 68 253 0
+[37mTRACE[0m[0002] outbound/vless[reality03]: Xtls Unpadding new block 21 637 padding 218 0
+[37mDEBUG[0m[0002] [[38;5;209m4230259905[0m 1.38s] connection: connection upload finished
+[37mTRACE[0m[0002] [[38;5;209m4230259905[0m 1.38s] connection: connection download closed
+[37mTRACE[0m[0002] close http-client
+[37mTRACE[0m[0002] close http-client completed (0.00s)

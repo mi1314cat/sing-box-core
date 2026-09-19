@@ -1,0 +1,11 @@
+[36mINFO[0m[0000] network: updated default interface eth0, index 4
+[36mINFO[0m[0000] inbound/mixed[m]: tcp server started at 127.0.0.1:21005
+[36mINFO[0m[0000] network: updated network environment: gateway [192.168.1.1 fe80::1], gateway_mac [d8:59:82:86:3a:a1 d8:59:82:86:3a:a1]
+[36mINFO[0m[0000] sing-box started (0.02s)
+[36mINFO[0m[0001] [[38;5;39m3192309998[0m 0ms] inbound/mixed[m]: inbound connection from 127.0.0.1:45822
+[36mINFO[0m[0001] [[38;5;39m3192309998[0m 1ms] inbound/mixed[m]: inbound connection to ip.sb:80
+[36mINFO[0m[0001] [[38;5;39m3192309998[0m 1ms] outbound/shadowsocks[shadowsocks01]: outbound connection to ip.sb:80
+[37mDEBUG[0m[0002] [[38;5;39m3192309998[0m 431ms] connection: connection upload finished
+[37mTRACE[0m[0002] [[38;5;39m3192309998[0m 432ms] connection: connection download closed
+[37mTRACE[0m[0002] close http-client
+[37mTRACE[0m[0002] close http-client completed (0.00s)

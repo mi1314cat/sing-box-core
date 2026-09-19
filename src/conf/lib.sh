@@ -1,0 +1,268 @@
+#!/bin/bash
+# ==============================================================
+# lib.sh — SB-Panel 公共库
+# 设计给 sing-box.sh 主入口与 conf/*.sh 模块 source 复用：
+#   source "$(dirname "$0")/lib.sh"
+# 与 xray-core 面板 (xary-core/conf/verify.sh) 的习惯一致：
+#   - UI 打印全部输出到 stderr
+#   - 路径可被上层环境变量覆盖
+# ==============================================================
+
+# ---- 路径（可覆盖）----
+SB_ROOT="${SB_ROOT:-/root/catmi/sing-box}"
+SB_CONFIG_DIR="${SB_CONFIG_DIR:-$SB_ROOT/config}"
+SB_OUT_DIR="${SB_OUT_DIR:-$SB_ROOT/out}"
+SB_BACKUP_DIR="${SB_BACKUP_DIR:-$SB_ROOT/backup}"
+SB_BIN="${SB_BIN:-$SB_ROOT/sing-box}"
+SB_SERVICE="${SB_SERVICE:-sing-box}"
+SB_REPO_API="https://api.github.com/repos/SagerNet/sing-box"
+
+export SB_ROOT SB_CONFIG_DIR SB_OUT_DIR SB_BACKUP_DIR SB_BIN SB_SERVICE
+
+# ---- 颜色 ----
+RED="\e[31m"
+GREEN="\e[32m"
+YELLOW="\e[33m"
+MAGENTA="\e[95m"
+CYAN="\e[96m"
+BOLD="\e[1m"
+RESET="\e[0m"
+
+print_info()  { printf "${CYAN}[Info]${RESET} %s\n" "$1" >&2; }
+print_ok()    { printf "${GREEN}[OK]${RESET} %s\n" "$1" >&2; }
+print_warn()  { printf "${YELLOW}[Warn]${RESET} %s\n" "$1" >&2; }
+print_error() { printf "${RED}[Error]${RESET} %s\n" "$1" >&2; }
+
+print_title() {
+    printf "${MAGENTA}${BOLD}" >&2
+    printf "╔══════════════════════════════════════════════╗\n" >&2
+    printf "║ %-44s ║\n" "$1" >&2
+    printf "╚══════════════════════════════════════════════╝\n" >&2
+    printf "${RESET}" >&2
+}
+
+# ---- 输入工具 ----
+clean_input() { echo "$1" | tr -d '\000-\037' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'; }
+
+safe_read() { # safe_read <prompt> <default> -> stdout
+    local input
+    printf '%s (默认: %s): ' "$1" "$2" >&2
+    read -r input
+    input=$(clean_input "$input")
+    echo "${input:-$2}"
+}
+
+# ---- 端口工具 ----
+port_in_use() {
+    ss -tuln 2>/dev/null | awk '{print $5}' | grep -E -q "(:|])${1}$"
+}
+
+random_free_port() {
+    local port
+    while true; do
+        port=$(shuf -i 10000-60000 -n 1)
+        if ! port_in_use "$port"; then
+            echo "$port"
+            return
+        fi
+    done
+}
+
+safe_read_port() { # 默认值 = 随机空闲端口
+    local default="${1:-}" input port
+    [[ -z "$default" ]] && default=$(random_free_port)
+    while true; do
+        printf '请输入监听端口 (默认: %s): ' "$default" >&2
+        read -r input
+        input=$(clean_input "$input")
+        port="${input:-$default}"
+        if ! [[ "$port" =~ ^[0-9]+$ ]]; then print_error "端口必须是数字"; continue; fi
+        if (( port < 1 || port > 65535 )); then print_error "端口范围 1-65535"; continue; fi
+        if port_in_use "$port"; then print_error "端口 $port 已被占用"; continue; fi
+        echo "$port"
+        return
+    done
+}
+
+# ---- 监听 IP 检测 ----
+detect_listen_ip() {
+    local has_v4=false has_v6=false
+    ip -4 addr show scope global 2>/dev/null | grep -q "inet " && has_v4=true
+    ip -6 addr show scope global 2>/dev/null | grep -q "inet6 [2-9a-fA-F]" && has_v6=true
+    if $has_v4 && ! $has_v6; then echo "ipv4"
+    elif ! $has_v4 && $has_v6; then echo "ipv6"
+    elif $has_v4 && $has_v6; then echo "dual"
+    else echo "none"; fi
+}
+
+default_server_ip() { # 优先公网网卡 IPv4
+    local local_ip public_ip
+    local_ip=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 |
+        grep -vE '^(127\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)' | head -1)
+    [[ -n "$local_ip" ]] && { echo "$local_ip"; return; }
+    public_ip=$(curl -4 -s --max-time 8 ip.sb 2>/dev/null | tr -d '[:space:]')
+    [[ -n "$public_ip" ]] && { echo "$public_ip"; return; }
+    echo ""
+}
+
+# ---- 协议文件编号: <proto>-NN.json ----
+get_next_index() {
+    local proto="$1" used=() i=1 base
+    shopt -s nullglob
+    for f in "$SB_CONFIG_DIR"/${proto}-*.json; do
+        base=$(basename "$f")
+        [[ "$base" =~ ^${proto}-([0-9]+)\.json$ ]] && used+=("${BASH_REMATCH[1]}")
+    done
+    shopt -u nullglob
+    if ((${#used[@]} == 0)); then printf "01\n"; return; fi
+    IFS=$'\n' used=($(printf "%s\n" "${used[@]}" | sort -n))
+    for n in "${used[@]}"; do
+        [[ "$n" -ne "$i" ]] && break
+        ((i++))
+    done
+    printf "%02d\n" "$i"
+}
+
+# 写 config JSON + jq 校验，失败不落盘
+write_config() { # write_config <path> <json-string>
+    local path="$1" json="$2"
+    if ! echo "$json" | jq -e . >/dev/null 2>&1; then
+        print_error "JSON 语法校验失败，未写入 $path"
+        echo "$json" | head -20 >&2
+        return 1
+    fi
+    echo "$json" | jq . > "$path"
+    return 0
+}
+
+# ---- 校验工具 ----
+sb_check() { # 整目录校验，exit 0/1；错误输出到 stderr
+    local out
+    if [[ ! -x "$SB_BIN" ]]; then print_error "未找到 sing-box 二进制: $SB_BIN (先安装内核)"; return 1; fi
+    if ! ls "$SB_CONFIG_DIR"/*.json >/dev/null 2>&1; then print_warn "配置目录为空: $SB_CONFIG_DIR"; return 1; fi
+    out=$("$SB_BIN" check -D "$SB_ROOT" -C "$SB_CONFIG_DIR" 2>&1) || {
+        print_error "sing-box check 失败:"
+        echo "$out" | tail -15 >&2
+        return 1
+    }
+    print_ok "sing-box check 通过 (全部配置合并合法)"
+    return 0
+}
+
+sb_check_newbin() { # 用候选二进制校验当前配置（更新前测试）
+    local newbin="$1" out
+    [[ -x "$newbin" ]] || return 1
+    out=$("$newbin" check -D "$SB_ROOT" -C "$SB_CONFIG_DIR" 2>&1) || {
+        print_error "新内核无法加载当前配置:"
+        echo "$out" | tail -15 >&2
+        return 1
+    }
+    return 0
+}
+
+# ---- 备份（保留最近 5 份）----
+backup_config() { # backup_config config|kernel|all
+    local dir="$SB_BACKUP_DIR/$(date +%Y%m%d-%H%M%S)"
+    case "$1" in
+        config|all)  [[ -d "$SB_CONFIG_DIR" ]] && { mkdir -p "$dir/config"; cp -a "$SB_CONFIG_DIR"/. "$dir/config/"; } ;;
+    esac
+    case "$1" in
+        kernel|all)  [[ -f "$SB_BIN" ]] && cp -a "$SB_BIN" "$dir/" ;;
+    esac
+    [[ -d "$dir" && -n "$dir" ]] && print_ok "已备份到 $dir"
+    ls -dt "$SB_BACKUP_DIR"/*/ 2>/dev/null | tail -n +6 | xargs -r rm -rf
+    return 0
+}
+
+# ---- 防火墙放行（ufw/firewall-cmd/iptables 三级回退）----
+open_port() {
+    local port="$1"
+    if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+        ufw allow "$port/tcp" >/dev/null 2>&1
+        ufw allow "$port/udp" >/dev/null 2>&1
+        print_ok "ufw 已放行 $port (tcp+udp)"
+    elif command -v firewall-cmd >/dev/null && firewall-cmd --state 2>/dev/null | grep -q running; then
+        firewall-cmd --zone=public --add-port="$port/tcp" --permanent >/dev/null 2>&1
+        firewall-cmd --zone=public --add-port="$port/udp" --permanent >/dev/null 2>&1
+        firewall-cmd --reload >/dev/null 2>&1
+        print_ok "firewalld 已放行 $port (tcp+udp)"
+    elif command -v iptables >/dev/null; then
+        iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$port" -j ACCEPT
+        iptables -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport "$port" -j ACCEPT
+        print_ok "iptables 已放行 $port (tcp+udp)"
+    else
+        print_warn "未检测到防火墙工具，请手动放行 $port"
+    fi
+}
+
+# ---- 服务 ----
+sb_service_active() { systemctl is-active "$SB_SERVICE" >/dev/null 2>&1; }
+
+sb_reload() { # HUP 软重载：check 通过才发；SIGHUP 失败时 sing-box 自动保留旧实例
+    if ! sb_check; then
+        print_error "校验失败，已放弃重载（当前运行实例未受影响）"
+        return 1
+    fi
+    if ! sb_service_active; then
+        print_warn "服务未运行，改为启动"
+        systemctl start "$SB_SERVICE" && sleep 1
+        if sb_service_active; then print_ok "服务已启动"; return 0; fi
+        print_error "服务启动失败"; return 1
+    fi
+    if ! systemctl reload "$SB_SERVICE" 2>/dev/null; then
+        print_warn "systemctl reload 失败，尝试 restart"
+    elif sleep 1 && sb_service_active; then
+        print_ok "已通过 SIGHUP 软重载（不重启进程，零断流）"
+        return 0
+    fi
+    systemctl restart "$SB_SERVICE"
+    sleep 1
+    if sb_service_active; then
+        print_ok "SIGHUP 软重载失败，已改用 restart 兜底恢复"
+        return 0
+    fi
+    print_error "服务异常，请查看 journalctl -u $SB_SERVICE"
+    journalctl -u "$SB_SERVICE" -n 10 --no-pager 2>/dev/null | tail -10 >&2
+    return 1
+}
+
+sb_restart() {
+    systemctl restart "$SB_SERVICE"
+    sleep 1
+    if sb_service_active; then print_ok "$SB_SERVICE 已重启 (active)"; return 0; fi
+    print_error "$SB_SERVICE 重启失败"
+    journalctl -u "$SB_SERVICE" -n 10 --no-pager 2>/dev/null | tail -10 >&2
+    return 1
+}
+
+sb_journal() { journalctl -u "$SB_SERVICE" -n "${1:-50}" --no-pager; }
+
+sb_current_version() { "$SB_BIN" version 2>/dev/null | head -1 | awk '{print $3}'; }
+
+sb_latest_version() {
+    curl -s --max-time 10 "$SB_REPO_API/releases/latest" | jq -r '.tag_name // empty' | sed 's/^v//'
+}
+
+# ---- 统一 Reality 域名来源（mi1314cat/One-click-script domains.sh）----
+# 运行时拉取并抽取 domains 数组 + random_website()，不本地复制数据
+SB_DOMAINS_SH_URL="${SB_DOMAINS_SH_URL:-https://raw.githubusercontent.com/mi1314cat/One-click-script/main/domains.sh}"
+
+reality_random_domain() {
+    local tmp
+    tmp=$(curl -fsSL --max-time 15 "$SB_DOMAINS_SH_URL" 2>/dev/null) || true
+    [[ -z "$tmp" ]] && { print_warn "拉取 domains.sh 失败，回退 oracle.com"; echo "www.oracle.com"; return; }
+    # 在受控子 shell 中抽取 random_website()（跳过文件尾部的交互 read/update_env 尾巴）
+    local fn
+    fn=$(printf '%s\n' "$tmp" | awk '/^random_website\(\) \{/{f=1} f{print; if (/^\}/) exit}')
+    bash -c "$fn; random_website" 2>/dev/null
+}
+
+# ---- 自签证书 SPKI pin (兼容 fscarmen 的 sha256(SPKI) 分享习惯) ----
+cert_pin_sha256() { openssl x509 -in "$1" -outform der 2>/dev/null | sha256sum | awk '{print tolower($1)}'; }
+
+# sing-box 客户端 tls.certificate_public_key_sha256 期望: base64(sha256(SPKI DER))
+cert_spki_pin_base64() {
+    openssl x509 -in "$1" -pubkey -noout 2>/dev/null \
+        | openssl pkey -pubin -outform der 2>/dev/null \
+        | openssl dgst -sha256 -binary 2>/dev/null | base64 -w0
+}
