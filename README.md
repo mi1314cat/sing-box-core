@@ -9,24 +9,11 @@
 
 ## 一键安装（从 GitHub 拉取）
 ```bash
-# 服务端 (面板 + sing-box 内核 + share 服务)
-bash <(curl -Ls https://github.com/mi1314cat/sing-box-core/raw/refs/heads/main/install.sh) server
-# 客户端 (sing-box 内核 + LAN HTTP/SOCKS:2080 + Web UI)
-bash <(curl -Ls https://github.com/mi1314cat/sing-box-core/raw/refs/heads/main/install.sh) client
-# 升级已装机器
-bash <(curl -Ls https://github.com/mi1314cat/sing-box-core/raw/refs/heads/main/install.sh) update
+bash <(curl -Ls https://github.com/mi1314cat/sing-box-core/raw/refs/heads/main/install.sh)
 ```
+执行后: 获取项目 → 初始化 → 自动进入中文管理面板。面板首页显示服务状态/版本/节点数; 按编号菜单操作。已装机器先显示状态再进面板 (输入 u 可热更新)。也可显式: `install.sh server|client` 或 `install.sh update`。
 
 
-## 一键安装（从 GitHub 拉取）
-```bash
-# 服务端
-bash <(curl -Ls https://github.com/mi1314cat/sing-box-core/raw/refs/heads/main/install.sh) server
-# 客户端
-bash <(curl -Ls https://github.com/mi1314cat/sing-box-core/raw/refs/heads/main/install.sh) client
-# 升级
-bash <(curl -Ls https://github.com/mi1314cat/sing-box-core/raw/refs/heads/main/install.sh) update
-```
 
 ## Server
 
