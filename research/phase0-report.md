@@ -25,8 +25,8 @@ xray-panel.sh
 ```
 
 ### 关键架构事实（RN 实机验证）
-- **单 service**：`/etc/systemd/system/xrayls.service` → `ExecStart=/opt/sb-panel/xray/xrayls -confdir /opt/sb-panel/xray/conf`
-- **配置目录**：`/opt/sb-panel/xray/conf/*.json`（hysteria-01.json、vless-xhttp-01.json、out-01.json、socks-01.json、nginx.json…）——与 SB 目标架构同构：**一个内核 + 单 service + confdir 级联加载**。
+- **单 service**：`/etc/systemd/system/xrayls.service` → `ExecStart=/root/catmi/xray/xrayls -confdir /root/catmi/xray/conf`
+- **配置目录**：`/root/catmi/xray/conf/*.json`（hysteria-01.json、vless-xhttp-01.json、out-01.json、socks-01.json、nginx.json…）——与 SB 目标架构同构：**一个内核 + 单 service + confdir 级联加载**。
 - **协议模块模式**（以 hysteria2.sh 为模板）：
   - 顶部重复实现 UI 工具（printInfo/Ok/Error、safe_read、端口随机/占用检测、IPv4/IPv6 检测、get_next_index `PROTO-NN.json` 编号）
   - 证书扫描（catmi/cloudflare/certs、acme.sh、nginx 容器挂载等 8 处目录）→ 真证书/自签双方案（ECDSA P-256 10年）
@@ -35,14 +35,14 @@ xray-panel.sh
   - 端口跳跃（iptables REDIRECT，默认不开，防呆 6 层）
   - 防火墙放行（ufw/firewall-cmd/iptables 三级回退）
 - **存量节点类型**：tunnel、socks5、vless-ecn、http、vless-xhttp、hy2、argo（fixed/ephemeral）。
-- **服务器基线**：RN = amd64，公网 IP 203.0.113.10，占用 TCP/UDP 端口：53,80,443,6541,7890,8074,8787,8899,9997,9998,9999,10011,12588,19188,19595,22108,28021,31722,33934,41721,45630,45900,49184,52341。已装 jq。CC = Armbian **aarch64**（客户端机），mihomo/hysteria-client/argo 在跑——**SB 客户端需 arm64 构建**。
+- **服务器基线**：RN = amd64，公网 IP 107.173.154.178，占用 TCP/UDP 端口：53,80,443,6541,7890,8074,8787,8899,9997,9998,9999,10011,12588,19188,19595,22108,28021,31722,33934,41721,45630,45900,49184,52341。已装 jq。CC = Armbian **aarch64**（客户端机），mihomo/hysteria-client/argo 在跑——**SB 客户端需 arm64 构建**。
 
 ### 五类文件归档
 | 类别 | 文件 |
 |---|---|
 | 当前有效 | xray-panel.sh、VEVLRE.sh、conf/{tunnel,hysteria2,sock5,vlessecn,http,vlessxhttpecn,GDargo,lsargo,XRevise,nconf,cconf,verify,outbound,split}.sh、conf/fd/*、uninstall_xray.sh |
 | 协议模块 | conf/*.sh（每协议一文件：生成/列出/删除/改） |
-| 配置文件 | /opt/sb-panel/xray/conf/*.json（xrayls 内部才是真 runtime config 拼装处） |
+| 配置文件 | /root/catmi/xray/conf/*.json（xrayls 内部才是真 runtime config 拼装处） |
 | 服务管理 | xray-panel.sh 主循环 + verify.sh |
 | 历史遗留/废弃 | unused/*（xray_install.sh 等）、根目录 vlessxhttpecn.sh 副本、conf.bak-*、.quarantine |
 | 不能迁移到 SB | Argo 模块（SB 无 argo 传输）、xhttp/spider 传输（SB 不支持 xHTTP）、nginx.json（属 nginx 体系）、Xray 专属流控 vision |

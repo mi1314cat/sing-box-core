@@ -5,13 +5,13 @@
 
 ## 使用
 ```bash
-bash /opt/sb-panel/sing-box/sing-box.sh          # 菜单
+bash /root/catmi/sing-box/sing-box.sh          # 菜单
 bash sing-box.sh {init|check|reload|restart|status|list|node}   # CLI
 ```
 
 ## 结构
 ```
-/opt/sb-panel/sing-box/
+/root/catmi/sing-box/
 ├── sing-box            内核 (core.sh 锁定版本安装, latest stable 默认)
 ├── config/*.json       运行配置（sing-box -C 合并, API: check/reload/format/merge）
 ├── conf/*.sh           协议与功能模块（每协议一文件, 生成 <proto>-NN.json）
@@ -53,8 +53,8 @@ bash sing-box.sh {init|check|reload|restart|status|list|node}   # CLI
 - 1.14 起 outbound 请求域名需 `route.default_domain_resolver`
 
 ## 实测记录 (2026-09)
-- Server-A (x86_64): 1.14.1 安装 / 服务 check / 软重载 / 更新(最新即跳过) / 多协议节点 / 端口转发 / DNS / rule-set ✅
-- Client-B (arm64): sing-box client mixed → 联动 Server 节点 → 出站 ✅ (真实 curl 验证)
+- RN (amd64): 1.14.1 安装 服务 check / 软重载 / 更新跳过 / 5 协议节点 / 端口转发 / DNS / rule-set ✅
+- CC (arm64): 1.14.1 arm64 客户端 mixed:2090 → RN reality01 → 出站 ✅ (104.28.201.80 与 RN 一致)
 - reality: java.com 作 dest 会因 301 导致 `REALITY: processed invalid connection` — 用 www.oracle.com ✅
 
 ## 维护原则

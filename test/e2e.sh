@@ -3,13 +3,13 @@
 # e2e-tests.sh — SB-Panel 真实连通性三级测试 (CC 端运行)
 # Level1: config check / Level2: service+listen / Level3: 真实客户端连接→公网
 # 使用服务端 sb_client-<tag>.json (真实产物) 组装本地 mixed 客户端,
-# curl -x 通过节点请求 http://ip.sb, 结果必须 == 203.0.113.10
+# curl -x 通过节点请求 http://ip.sb, 结果必须 == 107.173.154.178
 # ==============================================================
-SB_BASE="${SB_BASE:-/opt/sb-panel/sing-box}"
+SB_BASE="${SB_BASE:-/root/catmi/sing-box}"
 BIN="$SB_BASE/sing-box"
 CLIENT_OUT="$SB_BASE/test-configs"          # 客户端 out 片目录 (从 RN 同步)
-RESULTS_DIR="${TEST_RESULTS:-/opt/sb-panel/sb-test-results}"
-RN_IP="203.0.113.10"
+RESULTS_DIR="${TEST_RESULTS:-/root/catmi/sb-test-results}"
+RN_IP="107.173.154.178"
 BASE_PORT=21000
 mkdir -p "$RESULTS_DIR" "$CLIENT_OUT"
 
@@ -47,7 +47,7 @@ echo "protocol,status,ip" > "$RESULTS_DIR/e2e-results.csv"
 i=0
 for f in "${FILES[@]}"; do
     # 从 RN 拉取
-    scp -q "rn:/opt/sb-panel/sing-box/out/$f" "$CLIENT_OUT/" 2>/dev/null || { echo "?,$f,scp-fail" >> "$RESULTS_DIR/summary.log"; continue; }
+    scp -q "rn:/root/catmi/sing-box/out/$f" "$CLIENT_OUT/" 2>/dev/null || { echo "?,$f,scp-fail" >> "$RESULTS_DIR/summary.log"; continue; }
     name=$(basename "$f" | sed 's/sb_client-//;s/\.json//')
     ((i++)); port=$((BASE_PORT+i))
     run_test "$name" "$CLIENT_OUT/$f" "$port" | tee -a "$RESULTS_DIR/e2e-results.csv"

@@ -38,7 +38,7 @@ find_key_for_cert() {
 scan_certs() {
     FOUND_CERTS=()
     local d f k lbl dir dirs=() labels=()
-    dirs=(/opt/sb-panel/cloudflare/certs /opt/sb-panel /etc/v2ray-agent/tls /root/.acme.sh /etc/nginx/certs /etc/nginx/ssl /home/web/certs)
+    dirs=(/root/catmi/cloudflare/certs /root/catmi /etc/v2ray-agent/tls /root/.acme.sh /etc/nginx/certs /etc/nginx/ssl /home/web/certs)
     labels=(catmi-cloudflare catmi-root v2ray-agent acme nginx-certs nginx-ssl web-certs)
     local i
     for ((i=0; i<${#dirs[@]}; i++)); do

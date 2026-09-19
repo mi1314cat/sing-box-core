@@ -42,4 +42,4 @@ TLS/Reality: reality 可叠 vless(tcp+vision)/grpc/http(H2) 及 anytls/trojan; �
 - vision 仅 TCP/非 transport; gRPC/H2 组合 users 不得带 flow。
 - anytls reality 在 1.12+;**`block`/`bridge`/`tailcat` 等非协议 outbound 不进入节点注册**。
 - naive 客户端生态: sing-box 官方 build 无 cronet → 推荐用户使用官方 naiveproxy 客户端; 脚本端 tunneling shadowtls 双 inbound 已带 inner mux/padding。
-- 引用: Github wiki 事实链 github.com/mi1314cat/sb-panel (this) `/opt/sb-panel/sing-box/conf/*.sh`。
+- 引用: Github wiki 事实链 github.com/mi1314cat/sb-panel (this) `/root/catmi/sing-box/conf/*.sh`。

@@ -11,7 +11,7 @@
 # ==============================================================
 set -o pipefail
 
-SB_ROOT="${SB_ROOT:-/opt/sb-panel/sing-box}"
+SB_ROOT="${SB_ROOT:-/root/catmi/sing-box}"
 SB_CONFIG_DIR="${SB_CONFIG_DIR:-$SB_ROOT/config}"
 SB_BIN="${SB_BIN:-$SB_ROOT/sing-box}"
 SB_SERVICE="${SB_SERVICE:-sing-box}"

@@ -9,7 +9,7 @@
 # ==============================================================
 
 # ---- 路径（可覆盖）----
-SB_ROOT="${SB_ROOT:-/opt/sb-panel/sing-box}"
+SB_ROOT="${SB_ROOT:-/root/catmi/sing-box}"
 SB_CONFIG_DIR="${SB_CONFIG_DIR:-$SB_ROOT/config}"
 SB_OUT_DIR="${SB_OUT_DIR:-$SB_ROOT/out}"
 SB_BACKUP_DIR="${SB_BACKUP_DIR:-$SB_ROOT/backup}"
