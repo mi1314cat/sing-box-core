@@ -1,0 +1,11 @@
+pass anyreality01
+pass hysteria201
+pass naive01
+pass reality01
+pass shadowsocks01
+pass shadowtls01
+pass trojan01
+pass tuic01
+pass vless01
+=== 9/9 REAL-PASSED via sing-box-client (egress must == 107.173.154.178)
+zsh:1: == not found

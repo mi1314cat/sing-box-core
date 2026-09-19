@@ -1,13 +1,13 @@
 # SB-Panel 真实连通性测试矩阵（协议覆盖审计轮，2026-09）
 
-测试执行位置：CC（aarch64 Armbian 客户端，真实家庭网络）→ RN（203.0.113.10，amd64 sing-box 服务端，v1.14.1）
+测试执行位置：CC（aarch64 Armbian 客户端，真实家庭网络）→ RN（107.173.154.178，amd64 sing-box 服务端，v1.14.1）
 全部节点由 RN 上 sb-panel 协议模块真实生成（`bash conf/<proto>.sh add`），产物 `out/sb_client-<tag>.json` 直接组装为客户端配置浮层，客户端服务端均为 **项目脚本产物，不是手工 JSON**。
-验证口径：`curl -x <节点代理> http://ip.sb` 结果必须 == `203.0.113.10`（RN 主机 eth0 实 IP；已将 RN direct outbound `bind_interface=eth0`，规避测试机上的 WARP 干扰出站 IP 判定）。
+验证口径：`curl -x <节点代理> http://ip.sb` 结果必须 == `107.173.154.178`（RN 主机 eth0 实 IP；已将 RN direct outbound `bind_interface=eth0`，规避测试机上的 WARP 干扰出站 IP 判定）。
 > ⚠️ 重要教训：`curl --noproxy "*" -x ...` 会禁用 `-x` 泊位连空网桥（把本机直连当"通过"，出现 CC 出口 IP 假阳性）— 已修正测试方法。早前"验证失败"的客诉实为该命令错误+老节点 uuid 残留，非协议问题。
 
 | 协议/组合 | L1 sing-box check | L2 服务+端口监听 | L3 客户端真实连接 | L4 实际公网请求 | 证据 |
 |---|---|---|---|---|---|
-| VLESS+Reality+Vision | PASS | PASS (52270) | PASS | PASS (203.0.113.10) | connectivity log + RN journal `inbound connection from 198.51.100.17` |
+| VLESS+Reality+Vision | PASS | PASS (52270) | PASS | PASS (107.173.154.178) | connectivity log + RN journal `inbound connection from 183.210.247.173` |
 | VLESS+Reality+Vision (节点2) | PASS | PASS | PASS | PASS | e2e CSV reality02 |
 | VLESS+Reality+Vision (domains.sh 随机 sni) | PASS | PASS (24665) | PASS（修复服务端 flow 缺失后） | PASS | e2e CSV reality03 + journal "flow mismatch"修复 |
 | VLESS+Reality+gRPC | 已并入 reality.sh transport 选项 | 生成已验证 | （组合层更新，客户端末段） | — | reality.sh 第四步选择 2)gRPC 生成 grpc+reality |

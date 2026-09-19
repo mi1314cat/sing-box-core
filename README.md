@@ -1,62 +1,59 @@
-# SB-Panel — 我自己的 sing-box 管理脚本
+# SB-Panel — sing-box Server / Client 面板
 
-> 一个内核 + 一个统一 systemd service + 一个配置目录多个 JSON + 每协议一个独立 conf/*.sh
-> 架构对齐 xary-core (xray-panel.sh) 的使用习惯，配置生成以 sing-box v1.14.x 官方为唯一事实源。
+个人 sing-box 核心管理面板：**服务端节点管理 + 客户端配置生成 + 分享链接（限次/一次性授权）**，
+两端内核均为 [SagerNet/sing-box](https://github.com/SagerNet/sing-box)（URL 全部示例用于 v1.14.x 字段）。
 
-## 使用
+- **一个统一 systemd 服务**，绝不为协议开独立服务；多协议节点通过 sing-box `-C` 多文件合并加载。
+- 协议模块独立 `src/conf/*.sh`，Reality 伪装域名运行时拉取
+  https://raw.githubusercontent.com/mi1314cat/One-click-script/main/domains.sh 统一源 `random_website()`（本地不复制），失败才回退 `www.oracle.com`。
+
+## Server
+
 ```bash
-bash /root/catmi/sing-box/sing-box.sh          # 菜单
-bash sing-box.sh {init|check|reload|restart|status|list|node}   # CLI
+bash src/sing-box.sh                       # 菜单
+bash src/sing-box.sh init|check|reload|restart|status|list
+# 添加协议节点 (菜单或直接调模块):
+bash src/conf/reality.sh add      # VLESS+Reality (可选 transport: vision / grpc / http-H2)
+bash src/conf/vmess.sh add        # VMess + ws/grpc/h2/tcp + TLS/自签/Reality
+bash src/conf/trojan.sh add       # Trojan + TLS
+bash src/conf/naive.sh add        # Naive (HTTP/2 CONNECT; 需真证书)
+bash src/conf/shadowtls.sh add    # ShadowTLS v3 + 内层 SS-2022 (双 inbound)
+bash src/conf/hysteria2.sh add    # Hysteria2 (UDP + 可选端口跳跃/obfs)
+bash src/conf/tuic.sh add         # TUIC v5
+bash src/conf/shadowsocks.sh add  # SS-2022 blake3
+bash src/conf/anyreality.sh add   # AnyTLS + Reality (sing-box >=1.12)
 ```
 
-## 结构
-```
-/root/catmi/sing-box/
-├── sing-box            内核 (core.sh 锁定版本安装, latest stable 默认)
-├── config/*.json       运行配置（sing-box -C 合并, API: check/reload/format/merge）
-├── conf/*.sh           协议与功能模块（每协议一文件, 生成 <proto>-NN.json）
-├── out/                客户端产物: sb_share-*.txt / sb_client-*.json|yaml / sb_meta-*.json
-└── backup/             自动备份（写 CONFIG 前自动, 保留 5 份）
-```
+### Share URL（限次/一次性分发）
 
-## 模块
-| 模块 | 职责 |
-|---|---|
-| core.sh | 安装/卸载/指定版本/更新事务（备份→下载→新内核预检→原子替换→失败回滚） |
-| reality.sh | VLESS-REALITY/Vision; keypair 共享 out/reality-keys.json; dest 统一来源于 mi1314cat/One-click-script 的 domains.sh (random_website)，运行时拉取，本地不复制 |
-| hysteria2.sh | hysteria2; 证书扫描（xary-core 清单）+自签 ECDSA+pin 分享; 端口跳跃 DNAT |
-| anyreality.sh | AnyTLS+REALITY(1.12+); 复用 REALITY keypair; mihomo 不兼容提示 |
-| vless.sh | VLESS WS+TLS |
-| vmess.sh | VMess (ws/grpc/h2/tcp + TLS/自签/Reality) |
-| trojan.sh | Trojan TCP+TLS (真证书/自签 SPKI pin) |
-| naive.sh | Naive HTTP/2 (真证书必须; 自签仅半客户端) |
-| shadowtls.sh | ShadowTLS v3 + 内层 SS-2022 (双 inbound detour) |
-| shadowsocks.sh | 2022-blake3 |
-| tuic.sh | TUIC v5 (1.14: 无 authentication_timeout) |
-| dns.sh | 01-dns.json: 服务器/分流/去广告/FakeIP; 1.14 对象格式 (永不生成 legacy 字段) |
-| ruleset.sh | 02-rule-set.json 远程 .srs + 03-route.json 路由规则 |
-| portforward.sh | direct inbound + override_* 原生 TCP/UDP 转发 (无端口范围, 官方知情决定) |
-| outbound.sh | 出站管理 (direct/socks/http), 删除联动 route 清理 |
-| lib.sh | 公共: UI/端口/编号/证书/防火墙/check/SIGHUP 软重载/备份 |
-
-## 安全流程（所有写路径）
-```
-备份 → jq 语法 → sing-box check 整目录 (check 不过自动撤文件)
-     → systemctl reload (SIGHUP 软重载, 零断流; 失败自动 restart 兜底)
-     → 运行期失败 (如 rule-set 下载) → dns_edit 自动回滚 + restart 恢复
+```bash
+bash src/conf/share.sh create reality01 1 24
+bash src/conf/share.sh create hysteria01 10 168
+bash src/conf/share.sh list
+bash src/conf/share.sh toggle <token|tag>     # 立即禁用
+bash src/conf/share.sh del|regen <token|tag>
+# 服务: systemd (`sing-box-share`, 默认 :9292, SHARE_DIR/PORT 可覆盖)
 ```
 
-## sing-box 1.14 技术红线（生成配置永不包含）
-- 老式 DNS `address"/"tls://`、`dns.fakeip` 顶层、geosite/geoip 字段、block/dns outbound、
-  DNS rule inline `server`、`authentication_timeout`(TUIC)、`download_detour`(rule-set)
-- `http_clients[0].outbound` → 必须用 Dial Fields `detour`；且 detour 到空 direct outbound 会被运行期 FATAL
-- 1.14 起 outbound 请求域名需 `route.default_domain_resolver`
+- URL 仅含 128-bit 随机 token，**不**包含任何节点信息；返回完整客户端 outbound JSON；
+- `max_uses` / `expires_at` / `enabled` 三类独立失效，均可显式 DENY(410)；
+- 并发安全：flock 串行 read-modify-write，10 并发抢 1 次授权仍只放行 1 个（已实测）；
+- 客户端只有**收到完整 200 响应**才计数；服务端配置异常一律 `503` 且不消耗次数。
 
-## 实测记录 (2026-09)
-- RN (amd64): 1.14.1 安装 服务 check / 软重载 / 更新跳过 / 5 协议节点 / 端口转发 / DNS / rule-set ✅
-- CC (arm64): 1.14.1 arm64 客户端 mixed:2090 → RN reality01 → 出站 ✅ (104.28.201.80 与 RN 一致)
-- reality: java.com 作 dest 会因 301 导致 `REALITY: processed invalid connection` — 用 www.oracle.com ✅
+## Client (`src/client/client.sh`)
 
-## 维护原则
-- 协议字段变化 → 只改对应 conf/<proto>.sh
-- 新 stable 发布 → 用户主动 `core.sh update`（已最新则跳过；预检失败不改动现网）
+```bash
+bash src/client/client.sh install           # 内核 (arm64/amd64, glibc/musl 回退)
+bash src/client/client.sh init             # mixed 0.0.0.0:2080 + clash API 0.0.0.0:19090 (secret 自动)
+bash src/client/client.sh add https://<server>:9292/share/<token>
+bash src/client/client.sh list|del|update  # 多节点池 (share 来源都记录)
+bash src/client/client.sh start|stop|restart|status|check
+bash src/client/client.sh install-ui       # metacubexd (Clash API UI)
+```
+
+- 端点：HTTP+SOCKS5 同口 **`:2080`，LAN 设备直接填这个地址即可**；
+- Clash API: `:19090`（secret 保护，官方要求非 loopback 监听必须设置 secret）；
+- metacubexd Web UI: `http://<client-ip>:19090/ui/` — 节点切换/延迟测试/连接查看；
+- 多节点 = selector `PROXY` + urltest `AUTO`（`final=PROXY`），detour 辅助出站（如 shadowtls-out）自动排除；
+- **不实现 TUN/透明代理/FakeIP**（有意避免）；
+- 端口避让已有服务（metacubexd 默认不再占 9090：默认 **19090**）；面板设计一个"端口占用清单"页展示 server 端口全量。

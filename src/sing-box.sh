@@ -93,12 +93,14 @@ ${GREEN}11.${RESET} 服务管理 (启动/停止/重启/软重载)
 ${GREEN}12.${RESET} 校验配置 + 重载
 ${GREEN}13.${RESET} 查看日志
 ${GREEN}14.${RESET} 列出全部配置文件
+${GREEN}15.${RESET} 分享链接管理 (share.sh)
+${GREEN}16.${RESET} 客户端地址 / Web UI 信息
 ${GREEN}0.${RESET} 退出
 ----------------------
 sing-box 状态: $([[ "$status_text" == "active" ]] && echo -e "${GREEN}运行中${RESET}" || echo -e "${RED}未运行${RESET}")
 内核版本:      ${GREEN}$version_line${RESET}
 ----------------------"
-    read -r -p "请输入选项 [0-14]: " choice
+    read -r -p "请输入选项 [0-16]: " choice
     case "$choice" in
         1)  init_base ;;
         2)  run_module core.sh install ;;
@@ -113,6 +115,8 @@ sing-box 状态: $([[ "$status_text" == "active" ]] && echo -e "${GREEN}运行�
         11) service_menu ;;
         12) check_all ;;
         13) sb_journal 100; read -r -p "按回车返回..." ;;
+        15) run_module share.sh ;;
+        16) client_info_menu ;;
         14) list_configs ;;
         0)  clear; exit 0 ;;
         *)  echo -e "${RED}无效选项 $choice${RESET}" ;;
@@ -163,6 +167,20 @@ version_menu() {
 list_configs() {
     print_title "config/ 配置文件"
     ls -1 "$SB_CONFIG_DIR"/*.json 2>/dev/null || print_warn "目录为空"
+}
+
+client_info_menu() {
+    print_title "客户端地址 / Web UI 信息"
+    local ip; ip=$(default_server_ip)
+    local share_base="$(grep -h 'share_tag-' "$SB_OUT_DIR"/share_tag-*.txt 2>/dev/null | head -1)"
+    echo -e "${CYAN}HTTP / SOCKS (mixed):${RESET}   http://<LAN-IP>:2080  ·  socks5://<LAN-IP>:2080  (客户端 machine 上)"
+    echo -e "${CYAN}Clash API:${RESET}            http://<LAN-IP>:19090  (secret 调用必经)"
+    echo -e "${CYAN}Web UI (metacubexd):${RESET}  http://<LAN-IP>:19090/ui/"
+    echo -e "${CYAN}分享链接样例:${RESET}        $(ls "$SB_OUT_DIR"/share_tag-*.txt 2>/dev/null | head -1 >/dev/null && cat "$SB_OUT_DIR/share_tag-*.txt" | head -1 || echo '尚未生成')"
+    echo
+    echo "—— 本机端口占用 (避让参考) ——"
+    ss -tlnp 2>/dev/null | awk 'NR>1 {print $4}' | grep -oE "[0-9]+$" | sort -un | tr '\n' ' '
+    echo
 }
 
 add_node_menu() {
