@@ -1,0 +1,14 @@
+pass anyreality01
+pass hysteria201
+pass naive01
+pass reality01
+pass reality02
+pass reality03
+pass shadowsocks01
+pass shadowtls01
+pass trojan01
+pass tuic01
+pass vless01
+pass vmess01
+pass vmess02
+=== 13/13 REAL-PASSED via sing-box-client (egress must == 107.173.154.178)
