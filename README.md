@@ -24,3 +24,9 @@
 | 密钥格式 | SS-2022: `base64` 每字节 16字符 (aes-128) 或 32字节 (aes-256), 严格校验, 不接受弱 key |
 
 ="
+## Shadowsocks + Reality? — 不支持/等效替代
+| 问题 | 结论 |
+|---|---|
+| sing-box 1.14 能给 SS 加 Reality 吗？ | **不可以**。`Reality` 只在基于 **TCP-TLS** 的协议 (vless/vmess/trojan/anytls) 上有实现, SS 是无 TLS 层的轻量流协议 (无 TLS handshake), 无法把 `tls.reality` 挂上去 — 这不是我们的限制而是协议本身的结构差异 |
+| Reality 的“SS 等效方案” | **ShadowTLS v3 内层 SS-2022**（我们在菜单 10 添加）— ShadowTLS 用真实 TLS 伪装层包住 SS, 起到 Reality 类似"以真站点握手"效果 |
+| 其他等效 | hysteria2 自带的 obfs (`salamander`) 混淆 / tuic（原生 QUIC UDP） |
