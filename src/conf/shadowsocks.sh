@@ -50,7 +50,7 @@ EOF
 {
   "outbounds": [
     { "type": "shadowsocks", "tag": "$tag", "server": "$server_ip", "server_port": $listen_port,
-      "method": "$method", "password": "$key" }
+      "method": "$method", "password": "$key", "udp_over_tcp": true }
   ]
 }
 EOF
