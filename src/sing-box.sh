@@ -253,14 +253,14 @@ add_node_menu() {
     echo -e "
 ${GREEN}添加节点${RESET}
 ----------------------
-${GREEN}1.${RESET} 添加 Reality 节点 (VLESS-REALITY/Vision)
+${GREEN}1.${RESET} 添加 Reality 节点 (VLESS-REALITY/Vision | 可选 gtLts)
 ${GREEN}2.${RESET} 添加 Hysteria2 节点
-${GREEN}3.${RESET} 添加 AnyReality 节点 (AnyTLS+REALITY)
+${GREEN}3.${RESET} 添加 AnyReality 节点 (AnyTLS+REALITY, 选配)
 ${GREEN}4.${RESET} 添加 VLESS 节点 (WS+TLS)
 ${GREEN}5.${RESET} 添加 Shadowsocks 节点 (2022)
-${GREEN}6.${RESET} 添加 TUIC 节点 (v5)
+${GREEN}6.${RESET} 添加 TUIC 节点 (v5, 仅 TLS 不支持 Reality)
 ${GREEN}7.${RESET} 添加 VMess 节点 (ws/grpc/h2/tcp + TLS/Reality)
-${GREEN}8.${RESET} 添加 Trojan 节点 (TCP+TLS)
+${GREEN}8.${RESET} 添加 Trojan 节点 (TCP+TLS 或 TLS+Reality)
 ${GREEN}9.${RESET} 添加 NaiveProxy 节点 (HTTP/2)
 ${GREEN}10.${RESET} 添加 ShadowTLS+v3 节点 (内层 SS-2022)
 ${GREEN}0.${RESET} 返回主菜单
