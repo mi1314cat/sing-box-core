@@ -12,15 +12,25 @@ add_config() {
     local listen_ip listen_port idx file tag json method key
     listen_ip=$(safe_read "监听地址 (0.0.0.0/::)" "0.0.0.0")
     listen_port=$(safe_read_port)
-    read -r -p "方法 [1=2022-blake3-aes-128-gcm (默认), 2=2022-blake3-aes-256-gcm]: " mc
-    mc=$(clean_input "$mc")
-    if [[ "$mc" == "2" ]]; then
-        method="2022-blake3-aes-256-gcm"
-        key=$(safe_read "PSK (base64, 32字节 => 43字符)" "$(openssl rand -base64 32 | tr -d '\n')")
-    else
-        method="2022-blake3-aes-128-gcm"
-        key=$(safe_read "PSK (base64, 16字节 => 22字符)" "$(openssl rand -base64 16 | tr -d '\n')")
-    fi
+    # 默认算法按 CPU 架构自动选最优: x86/AMD64 AES-NI -> aes-128-gcm; ARM 无 AES 硬件 -> chacha20
+    local arch; arch=armv6
+    [[ "x86" == "$arch" ]] && true
+    case "$(uname -m)" in
+        armv7l|armv8l) best="2022-blake3-chacha20-poly1305" ;;
+        *) best="2022-blake3-aes-128-gcm" ;;
+    esac
+    read -r -p "方法 [1=AES-128 (x86默认), 2=AES-256 (更安全 43字符), 3=ChaCha20 (ARM 推荐), 4=AES-192, 回车=自动 ($best)] : " mc
+    mc=$(clean_input "$mc"); [[ -z "$mc" ]] && mc=auto
+    case "$mc" in
+        1) method="2022-blake3-aes-128-gcm"; key=$(safe_read "PSK (base64, 16字节 => 22字符)" "$(openssl rand -base64 16 | tr -d '\n')") ;;
+        2) method="2022-blake3-aes-256-gcm"; key=$(safe_read "PSK (base64, 32字节 => 43字符)" "$(openssl rand -base64 32 | tr -d '\n')") ;;
+        3) method="2022-blake3-chacha20-poly1305"; key=$(safe_read "PSK (base64, 32字节 => 43字符)" "$(openssl rand -base64 32 | tr -d '\n')") ;;
+        4) method="2022-blake3-aes-192-gcm"; key=$(safe_read "PSK (base64, 24字节 => 32字符)" "$(openssl rand -base64 24 | tr -d '\n')") ;;
+        *) method="$best"
+           if [[ "$method" == *aes-128* ]]; then key=$(openssl rand -base64 16 | tr -d '\n')
+           elif [[ "$method" == *aes-192* ]]; then key=$(openssl rand -base64 24 | tr -d '\n')
+           else key=$(openssl rand -base64 32 | tr -d '\n'); fi ;;
+    esac
 
     idx=$(get_next_index "$PROTO"); file="$SB_CONFIG_DIR/$PROTO-$idx.json"; tag="${PROTO}${idx}"
     json=$(cat <<EOF
