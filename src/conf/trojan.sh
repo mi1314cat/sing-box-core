@@ -17,9 +17,31 @@ extract_cert_domain() {
     echo "$dom"
 }
 
-ask_cert() {
-    echo "TLS 证书: 1) 真证书 2) 自签(pin) [默认 2]" >&2
+ask_cert() {  # 输出三种: CERT_FILE+KEY_FILE (TLS) / REALITY_ENV (Reality = TLS enabled false)
+    echo "TLS 证书: 1) 真证书 2) 自签(pin) 3) Reality (AnyReality 同款) [默认 2]" >&2
     read -r -p "选择: " c; c=$(clean_input "$c"); [[ -z "$c" ]] && c=2
+    if [[ "$c" == "3" ]]; then
+        local dom sni
+        dom=$(safe_read "Reality 握手目标 (统一 domains.sh)" "$(random_domain)")
+        mkdir -p "$CERT_DIR"
+        if [[ ! -f "$SB_OUT_DIR/reality-keys.json" ]]; then
+            local kp=("$("$SB_BIN" generate reality-keypair 2>/dev/null | awk -F': ' "/PrivateKey|PublicKey/{print \$NF}")")
+            [[ ${#kp} -lt 0 ]] || :           # awk not needed here, direct friendlier below
+        fi
+        if [[ ! -s "$SB_OUT_DIR/reality-keys.json" ]]; then
+            local priv pub
+            mapfile -t kp < <("$SB_BIN" generate reality-keypair 2>/dev/null | awk -F': ' 'NF>1 {print $NF}')
+            priv="${kp[0]:-}"; pub="${kp[1]:-}"
+            [[ -z "$priv" || -z "$pub" ]] && { print_error "REALITY 密钥生成失败"; return 1; }
+            jq -n --arg p "$priv" --arg u "$pub" '{private_key:$p,public_key:$u}' > "$SB_OUT_DIR/reality-keys.json"
+        fi
+        priv=$(jq -r .private_key "$SB_OUT_DIR/reality-keys.json")
+        pub=$(jq -r .public_key "$SB_OUT_DIR/reality-keys.json")
+        sid=$(openssl rand -hex 8)
+        CERT_DOMAIN="$dom"; TLS_TYPE="reality"
+        export T_RE_PRIV="$priv" T_RE_PUB="$pub" T_RE_SID="$sid"
+        return 0
+    fi
     if [[ "$c" == "2" ]]; then
         local d; d=$(safe_read "自签伪装域名 (统一 domains.sh)" "$(random_domain)")
         mkdir -p "$CERT_DIR"
@@ -44,6 +66,32 @@ add_config() {
 
     idx=$(get_next_index "$PROTO"); file="$SB_CONFIG_DIR/$PROTO-$idx.json"; tag="${PROTO}${idx}"
     local json
+    if [[ "${TLS_TYPE:-}" == "reality" ]]; then
+        json=$(cat <<EOF
+{
+  "inbounds": [
+    {
+      "type": "trojan",
+      "tag": "$tag",
+      "listen": "$listen_ip",
+      "listen_port": $listen_port,
+      "users": [ { "password": "$password" } ],
+      "tls": {
+        "enabled": true,
+        "server_name": "$CERT_DOMAIN",
+        "reality": {
+          "enabled": true,
+          "handshake": { "server": "$CERT_DOMAIN", "server_port": 443 },
+          "private_key": "$T_RE_PRIV",
+          "short_id": [ "$T_RE_SID" ]
+        }
+      }
+    }
+  ]
+}
+EOF
+)
+    else
     json=$(cat <<EOF
 {
   "inbounds": [
@@ -59,22 +107,34 @@ add_config() {
 }
 EOF
 )
+    fi
     backup_config config
     write_config "$file" "$json" || return 1
     if ! sb_check; then rm -f "$file"; print_error "已删除非法配置（现网未受影响）"; return 1; fi
     cleanup_node_shares "$tag"
     sb_reload || true
 
-    local server_ip pin=""
+    local server_ip pin="" mode_tls="tls"
+    [[ "${TLS_TYPE:-}" == "reality" ]] && mode_tls="reality"
     server_ip=$(safe_read "服务器对外 IP" "$(default_server_ip)")
     if [[ "$CERT_TRUSTED" == "false" ]]; then pin=$(cert_spki_pin_base64 "$CERT_FILE"); fi
-    local link="trojan://$password@$server_ip:$listen_port?sni=$CERT_DOMAIN&alpn=http/1.1${pin:+&pinSHA256=$pin}#$tag"
-    python3 - "$SB_OUT_DIR/sb_client-$tag.json" "$tag" "$server_ip" "$listen_port" "$password" "$CERT_DOMAIN" "$pin" <<'PYGEN'
+    local link
+    if [[ "$mode_tls" == "reality" ]]; then
+        link="trojan://$password@$server_ip:$listen_port?sni=$CERT_DOMAIN&security=reality&pbk=$T_RE_PUB&sid=$T_RE_SID&type=tcp#$tag"
+    else
+        link="trojan://$password@$server_ip:$listen_port?sni=$CERT_DOMAIN&alpn=http/1.1${pin:+&pinSHA256=$pin}#$tag"
+    fi
+    python3 - "$SB_OUT_DIR/sb_client-$tag.json" "$tag" "$server_ip" "$listen_port" "$password" "$CERT_DOMAIN" "$pin" "$mode_tls" "${T_RE_PUB-}" "${T_RE_SID-}" <<'PYGEN'
 import json,sys
-_,ofile,tag,srv,port,pw,sni,pin=sys.argv
+_,ofile,tag,srv,port,pw,sni,pin,mtype,pub,sid=sys.argv
 tls={"enabled":True,"server_name":sni}
 if pin: tls["certificate_public_key_sha256"]=pin
-json.dump({"outbounds":[{"type":"trojan","tag":tag,"server":srv,"server_port":int(port),"password":pw,"tls":tls}]},open(ofile,"w"),indent=2)
+out={"type":"trojan","tag":tag,"server":srv,"server_port":int(port),"password":pw,"tls":tls}
+if pub and sid:
+    # reality: 不需要 certificate, 信任来自 REALITY 密钥对 (sing-box 1.14 OutboundRealityOptions)
+    out["tls"]["utls"]={"enabled":True,"fingerprint":"chrome"}
+    out["tls"]["reality"]={"enabled":True,"public_key":pub,"short_id":sid}
+json.dump({"outbounds":[out]},open(ofile,"w"),indent=2)
 PYGEN
     cat > "$SB_OUT_DIR/sb_client-$tag.yaml" <<EOF
 proxies:
