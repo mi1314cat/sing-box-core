@@ -18,12 +18,10 @@ extract_cert_domain() {
 }
 
 ask_cert() {
-    local c f k
     echo "TLS 证书：" >&2
     echo "  1) 手动输入 crt/key 路径" >&2
-    echo "  2) 生成自签证书 (回车=2)" >&2
-    c="" ; read -r -p "  选择 (默认 2=自签): " c
-    c=$(clean_input "$c"); [[ -z "$c" ]] && c=2
+    echo "  2) 生成自签证书" >&2
+    [[ "$c" == "" ]] && c=2
     if [[ "$c" == "2" ]]; then
         local dom
         dom=$(safe_read "自签域名" "$(random_domain)")
@@ -50,7 +48,9 @@ add_config() {
     uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen)
     password=$(openssl rand -hex 16)
     ask_cert || return 1
-    local congestion; congestion=$(safe_read "拥塞控制 (bbr/cubic/new-reno)" "bbr")
+    local congestion
+    congestion=$(safe_read "拥塞控制 (bbr/cubic/new-reno)" "bbr")
+    case "$congestion" in bbr|cubic|new-reno) ;; *) congestion="bbr"; print_warn "未知算法, 已回落 bbr" ;; esac
 
     idx=$(get_next_index "$PROTO"); file="$SB_CONFIG_DIR/$PROTO-$idx.json"; tag="${PROTO}${idx}"
     json=$(cat <<EOF
