@@ -68,10 +68,11 @@ EOF
     local pin=""
     [[ "$CERT_TRUSTED" == "false" ]] && pin=$(cert_spki_pin_base64 "$CERT_FILE")
     local link="naive+https://$user:$pass@$server_ip:$listen_port?sni=$CERT_DOMAIN${pin:+&pinSHA256=$pin}#$tag"
-    local pin_json="" pin_val=""
+    local pin_json="" cert_json_jq=""
     if [[ "$CERT_TRUSTED" == "false" ]]; then
-        pin_val=$(cert_spki_pin_base64 "$CERT_FILE")
-        pin_json=",\"certificate_public_key_sha256\": \"$pin_val\""
+        # sing-box naive 出站走 Chrome cronet, 不接受 SPKI pin; 自签证书通过 tls.certificate (PEM) 信任
+        cert_json_jq=$(jq -Rs . < "$CERT_FILE")  # 产出合法 JSON 字符串(含转义)
+        pin_json=",\"certificate\": $cert_json_jq"
     fi
     cat > "$SB_OUT_DIR/sb_client-$tag.json" <<EOF
 {
