@@ -21,7 +21,8 @@ ask_cert() {
     echo "TLS 证书：" >&2
     echo "  1) 手动输入 crt/key 路径" >&2
     echo "  2) 生成自签证书" >&2
-    [[ "$c" == "" ]] && c=2
+    local c=""; read -r -p "  选择 (默认 2=自签): " c; c=$(clean_input "$c")
+    [[ -z "$c" ]] && c=2
     if [[ "$c" == "2" ]]; then
         local dom
         dom=$(safe_read "自签域名" "$(random_domain)")
