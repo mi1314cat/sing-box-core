@@ -263,9 +263,10 @@ ${GREEN}7.${RESET} 添加 VMess 节点 (ws/grpc/h2/tcp + TLS/Reality)
 ${GREEN}8.${RESET} 添加 Trojan 节点 (TCP+TLS 或 TLS+Reality)
 ${GREEN}9.${RESET} 添加 NaiveProxy 节点 (HTTP/2)
 ${GREEN}10.${RESET} 添加 ShadowTLS+v3 节点 (内层 SS-2022)
+${GREEN}11.${RESET} 全协议一键生成 (batch · 单端口范围 → 零交互)
 ${GREEN}0.${RESET} 返回主菜单
 ----------------------"
-    read -r -p "请输入选项 [0-10]: " nchoice
+    read -r -p "请输入选项 [0-11]: " nchoice
     local module
     case "$nchoice" in
         1) module=reality.sh ;;
@@ -278,6 +279,7 @@ ${GREEN}0.${RESET} 返回主菜单
         8) module=trojan.sh ;;
         9) module=naive.sh ;;
         10) module=shadowtls.sh ;;
+        11) module=batch.sh ;;
         0) return ;;
         *) print_error "无效选项"; return ;;
     esac
@@ -299,6 +301,7 @@ if [[ -n "${1:-}" ]]; then
         status)  sys_status ;;
         list)    list_configs ;;
         node)    add_node_menu ;;
+        batch)   run_module batch.sh ;;
         menu)    while true; do show_menu; done ;;
         *) echo "用法: sing-box.sh [init|check|reload|restart|status|list|node|menu]" >&2 ;;
     esac

@@ -46,6 +46,10 @@ clean_input() { echo "$1" | tr -d '\000-\037' | sed 's/^[[:space:]]*//;s/[[:spac
 
 safe_read() { # safe_read <prompt> <default> -> stdout
     local input
+    if [[ -n "${SB_BATCH:-}" ]]; then
+        printf '%s (batch→默认: %s)\n' "$1" "$2" >&2
+        echo "$2"; return
+    fi
     printf '%s (默认: %s): ' "$1" "$2" >&2
     read -r input
     input=$(clean_input "$input")
@@ -68,8 +72,39 @@ random_free_port() {
     done
 }
 
+# ---- 批量端口分配器 (全协议一键生成用) ----
+batch_ports_used() { # 输出本机监听端口 + 已有 config 内 listen_port
+    ss -tuln 2>/dev/null | awk '{print $5}' | sed 's/.*[:]]*//' | grep -E '^[0-9]+$'
+    shopt -s nullglob
+    local f
+    for f in "$SB_CONFIG_DIR"/*.json; do
+        jq -r '.inbounds[]?.listen_port // empty' "$f" 2>/dev/null
+    done
+    shopt -u nullglob
+}
+
+batch_next_port() { # 从 SB_BATCH_PORT_START-END 内顺序取未占用端口(跳过已领的), 领完区间回落随机
+    local s="${SB_BATCH_PORT_START:-20000}" e="${SB_BATCH_PORT_END:-50000}"
+    local used="$SB_OUT_DIR/.batch-used"
+    local prev="$SB_OUT_DIR/.batch-port"
+    local n p
+    n=$s; [[ -s "$prev" ]] && n=$(( $(cat "$prev") + 1 ))
+    while (( n <= e )); do
+        if ! port_in_use "$n" && ! grep -qx "$n" <(batch_ports_used) && ! grep -qx "$n" "$used" 2>/dev/null; then
+            echo "$n" > "$prev"; echo "$n" >> "$used"
+            echo "$n"; return
+        fi
+        ((n++))
+    done
+    echo "range exhausted" >&2
+    random_free_port
+}
+
 safe_read_port() { # 默认值 = 随机空闲端口
     local default="${1:-}" input port
+    if [[ -n "${SB_BATCH:-}" ]]; then
+        batch_next_port; return
+    fi
     [[ -z "$default" ]] && default=$(random_free_port)
     while true; do
         printf '请输入监听端口 (默认: %s): ' "$default" >&2
@@ -199,6 +234,10 @@ open_port() {
 sb_service_active() { systemctl is-active "$SB_SERVICE" >/dev/null 2>&1; }
 
 sb_reload() { # HUP 软重载：check 通过才发；SIGHUP 失败时 sing-box 自动保留旧实例
+    if [[ -n "${SB_NO_RELOAD:-}" ]]; then
+        print_ok "批量模式: 跳过本次 reload (由全协议生成收尾统一执行)"
+        return 0
+    fi
     if ! sb_check; then
         print_error "校验失败，已放弃重载（当前运行实例未受影响）"
         return 1
@@ -417,3 +456,38 @@ cleanup_node_shares() { # cleanup_node_shares <tag>
     done
     return 0
 }
+
+# ---- 批量模式: 覆盖 bash 内置 read ----
+# 所有 add_config 内的编号/选择 read 返回空串 → 各协议自身已有的 [[ -z ]]&&默认 逻辑接管
+# 分号外的部分 safe_read 和 safe_read_port 已单独 branch (见上)
+if [[ "${SB_BATCH:-}" == "1" ]]; then
+    read() {
+        # 兼容 read -r -p prompt var / read -r var 等; batch 期间不占 stdin
+        local arg p="" var
+        while (( $# )); do
+            case "$1" in
+                -r) shift ;;
+                -p) p="$2"; shift 2 ;;
+                -*) shift ;;
+                *) break ;;
+            esac
+        done
+        var="$1"
+        printf '%s (batch→默认)\n' "${p:-读取}" >&2
+        if [[ -n "${SB_BATCH_ANSWERS:-}" ]]; then
+            # 未用完的队列: 分号分隔
+            local first="${SB_BATCH_ANSWERS%%;*}"
+            printf -v "$var" '%s' "$first"
+            if [[ "$SB_BATCH_ANSWERS" == *";"* ]]; then
+                SB_BATCH_ANSWERS="${SB_BATCH_ANSWERS#*;}"
+            else
+                unset SB_BATCH_ANSWERS
+            fi
+            export SB_BATCH_ANSWERS
+        else
+            printf -v "$var" '%s' ""
+        fi
+        return 0
+    }
+    export -f read >/dev/null 2>&1 || true
+fi
