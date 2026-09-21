@@ -81,10 +81,10 @@ batch_main() {
 
     # --- Reality 变体补齐 (vmess/trojan 双形态: run2 以 SB_BATCH_ANSWERS 选择 4/3 Reality) ---
     local -a variant_list=(vmess trojan)
-    local -a variant_answers=(";4" "3")
+    local -a variant_answers=(";4" "2")
     for i in "${!variant_list[@]}"; do
         local vp="${variant_list[$i]}"
-        printf "%b• %s+Reality%b ... " "$CYAN" "$vp" "$RESET" >&2
+        printf "%b• %s 变体%b ... " "$CYAN" "$vp" "$RESET" >&2
         local second=""; 
         ls "$SB_CONFIG_DIR"/${vp}-02.json >/dev/null 2>&1 && {
             printf "%b[已存在]%b Reality 变体已生成\n" "$YELLOW" "$RESET" >&2
