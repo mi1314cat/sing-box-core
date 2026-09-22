@@ -35,7 +35,7 @@ service_menu() {
         echo -e "${CYAN}4)${RESET} 软重载配置 (SIGHUP, 零断流)"
         echo -e "${CYAN}5)${RESET} 状态查看"
         echo -e "${CYAN}0)${RESET} 返回"
-        read -r -p "请选择: " c
+        read -r -p "请选择: " c || { echo; exit 0; }
         case "$c" in
             1) systemctl start "$SB_SERVICE" && sleep 1 && sys_status ;;
             2) systemctl stop "$SB_SERVICE";  sys_status ;;
@@ -260,13 +260,13 @@ ${GREEN}4.${RESET} 添加 VLESS 节点 (WS+TLS)
 ${GREEN}5.${RESET} 添加 Shadowsocks 节点 (2022)
 ${GREEN}6.${RESET} 添加 TUIC 节点 (v5 · 仅 TLS, 不支持 Reality)
 ${GREEN}7.${RESET} 添加 VMess 节点 (ws/grpc/h2/tcp + TLS/Reality)
-${GREEN}8.${RESET} 添加 Trojan 节点 (TCP+TLS 或 TLS+Reality)
+${GREEN}8.${RESET} 添加 Trojan 节点 (TCP+Reality [默认])
 ${GREEN}9.${RESET} 添加 NaiveProxy 节点 (HTTP/2)
 ${GREEN}10.${RESET} 添加 ShadowTLS+v3 节点 (内层 SS-2022)
 ${GREEN}11.${RESET} 全协议一键生成 (batch · 单端口范围 → 零交互)
 ${GREEN}0.${RESET} 返回主菜单
 ----------------------"
-    read -r -p "请输入选项 [0-11]: " nchoice
+    read -r -p "请输入选项 [0-11]: " nchoice || { echo; exit 0; }
     local module
     case "$nchoice" in
         1) module=reality.sh ;;
