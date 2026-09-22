@@ -68,7 +68,7 @@ batch_main() {
         fi
         SB_BATCH=1 SB_NO_RELOAD=1 \
         SB_BATCH_PORT_START="$SB_BATCH_PORT_START" SB_BATCH_PORT_END="$SB_BATCH_PORT_END" \
-        bash "$SELF_DIR/conf/${proto}.sh" add </dev/null >/tmp/batch-$proto.log 2>&1
+        timeout 240 bash "$SELF_DIR/conf/${proto}.sh" add </dev/null >/tmp/batch-$proto.log 2>&1
         local mod_rc=$?
         if [[ $mod_rc -eq 0 ]]; then
             printf "%b[OK]%b 生成\n" "$GREEN" "$RESET" >&2
@@ -92,7 +92,7 @@ batch_main() {
         }
         SB_BATCH=1 SB_NO_RELOAD=1 SB_BATCH_ANSWERS="${variant_answers[$i]}" \
         SB_BATCH_PORT_START="$SB_BATCH_PORT_START" SB_BATCH_PORT_END="$SB_BATCH_PORT_END" \
-        bash "$SELF_DIR/conf/${vp}.sh" add </dev/null >/tmp/batch-$vp-v.log 2>&1
+        timeout 240 bash "$SELF_DIR/conf/${vp}.sh" add </dev/null >/tmp/batch-$vp-v.log 2>&1
         if [[ $? -eq 0 ]]; then
             printf "%b[生成]%b Reality 变体\n" "$GREEN" "$RESET" >&2
         else
@@ -170,7 +170,7 @@ main() {
         echo -e "${CYAN}1)${RESET} 全协议生成 (默认形态; 唯一交互: 端口范围)"
         echo -e "${CYAN}2)${RESET} 全协议生成 (自动端口, 完全无交互)"
         echo -e "${CYAN}0)${RESET} 返回"
-        read -r -p "请输入选项 [0-2]: " c
+        read -r -p "请输入选项 [0-2]: " c || { echo; exit 0; }
         case "$(clean_input "$c")" in
             1) batch_main ;;
             2) SB_BATCH_AUTO=1 batch_main ;;

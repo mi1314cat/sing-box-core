@@ -458,12 +458,12 @@ cleanup_node_shares() { # cleanup_node_shares <tag>
 }
 
 # ---- 批量模式: 覆盖 bash 内置 read ----
-# 所有 add_config 内的编号/选择 read 返回空串 → 各协议自身已有的 [[ -z ]]&&默认 逻辑接管
-# 分号外的部分 safe_read 和 safe_read_port 已单独 branch (见上)
+# add_config 内编号/选择 read 返回空串 → 各协议自身的 [[ -z ]]&&默认 逻辑接管
+# 防空转 (事故复盘 2026-09-21 RN): 连续 N 次(默认 32)注入"空答案"仍未正常推进 → 认定是菜单循环误入, 强制 exit.
 if [[ "${SB_BATCH:-}" == "1" ]]; then
+    _SB_BARE_READ_SEQ=0
     read() {
-        # 兼容 read -r -p prompt var / read -r var 等; batch 期间不占 stdin
-        local arg p="" var
+        local p="" var
         while (( $# )); do
             case "$1" in
                 -r) shift ;;
@@ -475,7 +475,6 @@ if [[ "${SB_BATCH:-}" == "1" ]]; then
         var="$1"
         printf '%s (batch→默认)\n' "${p:-读取}" >&2
         if [[ -n "${SB_BATCH_ANSWERS:-}" ]]; then
-            # 未用完的队列: 分号分隔
             local first="${SB_BATCH_ANSWERS%%;*}"
             printf -v "$var" '%s' "$first"
             if [[ "$SB_BATCH_ANSWERS" == *";"* ]]; then
@@ -484,10 +483,15 @@ if [[ "${SB_BATCH:-}" == "1" ]]; then
                 unset SB_BATCH_ANSWERS
             fi
             export SB_BATCH_ANSWERS
-        else
-            printf -v "$var" '%s' ""
+            _SB_BARE_READ_SEQ=0
+            return 0
+        fi
+        printf -v "$var" '%s' ""
+        _SB_BARE_READ_SEQ=$(( _SB_BARE_READ_SEQ + 1 ))
+        if (( _SB_BARE_READ_SEQ > ${SB_BATCH_READ_LIMIT:-32} )); then
+            print_error "batch 模式连续 ${SB_BATCH_READ_LIMIT:-32} 次空读取 (疑似交互菜单循环). 防止 CPU/磁盘空转 > 事故复盘处置, 强制退出."
+            exit 0
         fi
         return 0
     }
-    export -f read >/dev/null 2>&1 || true
 fi
