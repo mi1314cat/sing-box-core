@@ -167,13 +167,14 @@ ${GREEN}5.${RESET} 服务管理 (启动/停止/重启/软重载)
 ${GREEN}6.${RESET} 校验配置 + 重载
 ${GREEN}7.${RESET} 查看日志
 ${GREEN}8.${RESET} 列出全部配置文件
+${GREEN}9.${RESET} 客户端产物 / JSON·YAML·分享链接 (查看/复制)
 ${GREEN}0.${RESET} 退出
 ----------------------
 sing-box 服务状态: $([[ "$status_text" == "active" ]] && echo -e "${GREEN}运行中${RESET}" || echo -e "${RED}未运行${RESET}")
 内核版本: ${GREEN}$version_line${RESET}
 节点数:   ${GREEN}$(ls "$SB_CONFIG_DIR"/*.json 2>/dev/null | grep -v 'config/00-' | grep -cv '^-')${RESET}
 ----------------------"
-    read -r -p "请输入选项 [0-8]: " choice || { clear; exit 0; }
+    read -r -p "请输入选项 [0-9]: " choice || { clear; exit 0; }
     case "$choice" in
         1)  core_menu ;;
         2)  add_node_menu ;;
@@ -183,6 +184,7 @@ sing-box 服务状态: $([[ "$status_text" == "active" ]] && echo -e "${GREEN}�
         6)  check_all ;;
         7)  sb_journal 100; read -r -p "按回车键返回主菜单..." ;;
         8)  list_configs ;;
+        9)  run_module artifacts.sh ;;
         0)  clear; exit 0 ;;
         *)  echo -e "${RED}无效选项 $choice${RESET}" ;;
     esac
@@ -302,8 +304,9 @@ if [[ -n "${1:-}" ]]; then
         list)    list_configs ;;
         node)    add_node_menu ;;
         batch)   run_module batch.sh ;;
+        artifacts|cl)  run_module artifacts.sh "$@" ;;
         menu)    while true; do show_menu; done ;;
-        *) echo "用法: sing-box.sh [init|check|reload|restart|status|list|node|menu]" >&2 ;;
+        *) echo "用法: sing-box.sh [init|check|reload|restart|status|list|node|batch|artifacts|menu]" >&2 ;;
     esac
     exit $?
 fi
