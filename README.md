@@ -1,182 +1,116 @@
-# SB-Panel — Sing-box 服务器/客户端管理面板
+# SB-Panel — sing-box Server / Client 面板
 
-> **catmi.singbox** (ラ · Sing - Box)
-> 一个开箱即用的 **个人 Sing - box 服务端 + 客户端** 面板，
-> 通过一个统一的中文菜单界面，不需要学习任何内部协议或文件结构。
-> 支持多协议节点管理、分享链接、网络分流、节点生成、一键部署。
+个人 sing-box 核心管理面板：**服务端节点管理 + 客户端配置生成 + 分享链接（限次/一次性授权）**，
+两端内核均为 [SagerNet/sing-box](https://github.com/SagerNet/sing-box)（URL 全部示例用于 v1.14.x 字段）。
 
----
+- **一个统一 systemd 服务**，绝不为协议开独立服务；多协议节点通过 sing-box `-C` 多文件合并加载。
+- 协议模块独立 `src/conf/*.sh`，Reality 伪装域名运行时拉取
+  https://raw.githubusercontent.com/mi1314cat/One-click-script/main/domains.sh 统一源 `random_website()`（本地不复制），失败才回退 `www.oracle.com`。
 
-## 一键安装
-
-### 直接一键安装
+## 一键安装（从 GitHub 拉取）
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/mi1314cat/sing-box-core/refs/heads/main/install.sh)
-```
-```bash
-# 备用源（若 raw.githubusercontent.com 不可直连）
 bash <(curl -Ls https://github.com/mi1314cat/sing-box-core/raw/refs/heads/main/install.sh)
 ```
+执行后: 获取项目 → 初始化 → 自动进入中文管理面板。面板首页显示服务状态/版本/节点数; 按编号菜单操作。已装机器先显示状态再进面板 (输入 u 可热更新)。也可显式: `install.sh server|client` 或 `install.sh update`。
 
-执行后自动列出菜单：**1) 服务端 (Sing-box 面板 + 内核 + 分享服务)** / **2) 客户端 (LAN HTTP/SOCKS + Web UI)** / **0) 退出**，按提示选即可。
-已有安装时输入 `u` 可热更新管理脚本，不会动其他部署。
 
----
 
-## 项目结构（脚本家族风格 = xray-panel.sh / conf/http.sh）
-### 1 服务端面板 (`bash sb-panel.sh` 或 `bash src/sing-box.sh`)
-- **1** 安装/内核  
-- **2** 节点管理 / 每协议子菜单  
-- **3** 分享链接管理  
-- **4** 网络（端口转发 / DNS / 规则集 / **出站管理 & 域名分流 & 入站绑定出站**）
-- **5** 服务管理（启动/停止/重启/软重载）
-- **6** 校验配置 + 重载
-- **7** 查看日志
-- **8** 列出全部配置文件
-- **0** 退出
+## Server
 
-### 2 客户端面板（CC, `bash sb-client`，无参进入）
-- **1** 安装内核 · **2** 初始化基础配置 · **3** 添加节点 (share-url)  
-- **4** 删除节点 · **5** 列出节点 · **6** 更新节点 (重拉 share)  
-- **7** 启动 · **8** 停止 · **9** 重启服务 · **10** 查看状态  
-- **11** Web UI / Clash API 信息 · **12** 配置检查 · **0** 退出
-
----
-
-## 协议说明（sing-box v1.14.1 核心支持的、SB-Panel 都提供）
-
-| # | 协议 | 伪装 / TLS / Reality | 传输 | 备注 |
-|---|---|---|---|---|
-| 1 | **VLESS-Reality** (Vision / gRPC / HTTP2) | Reality 必选, 或 TLS / XTLS-Vision · 或 自签+SPKI-pin | TCP / gRPC / HTTP2 | flow `xtls-rprx-vision`, 客户端用 `flow` 字段一致 |
-| 2 | **Hysteria2** (UDP/QUIC) | 自带 TLS (真证书 / 自签+SPKI pin), 支持 **obfs=salamander** | UDP+QUIC | sing-box 1.14 原生带 `quic` 传输；可随意混立于同一面板 |
-| 3 | **AnyReality** (AnyTLS + Reality) — 选配 | AnyTLS 单独可用 / 可叠加 REALITY | TCP | 本身一种 `tls.reality` 增强型 anytls，与 VisionVLESS 共用同一密钥对 |
-| 4 | **VLESS (WS + TLS)** | 真证书或自签 SPKI pin | WS (http/1.1) 可叠加 Cloudflare CDN | |
-| 5 | **Shadowsocks - 2022**（推荐） | AEAD-2022 系最新 | TCP + **UDP over TCP (UoT)** | `2022-blake3-aes-128-gcm` (x86 默认) / `2022-blake3-chacha20-poly1305` (ARM 默认) / `2022-blake3-aes-256-gcm` (可选) |
-| 6 | **TUIC v5** (UDP/QUIC) | QUIC TLS (真/自签+pin) — 不支持 Reality | UDP | 与 Hysteria2 共存 |
-| 7 | **VMess** | ws+TLS / ws+Reality / 裸 ws | ws/grpc/h2/tcp | |
-| 8 | **Trojan** | TCP+TLS / TCP+Reality | TCP | Reality 同样支持 (基于 sing-box for Reality 方式), 服务端不需要证书 |
-| 9 | **NaiveProxy** (HTTP/2) | 真证书 / 自签+SPKI pin | HTTP/2 | 与 Chrome cronet 高兼容 |
-| 10 | **ShadowTLS v3** (内层 SS-2022) | 真站 TLS 伪装层 + AEAD | TCP | “SS-2022 + 现代混淆” 方案 |
-| — | **Shadowsocks Reality** | — | — | **不支持**（SS 无 TLS 层, 不适用 Reality; sing-box 的 Reality 只在 TCP+TLS 协议上工作）|
-
-**协议选择推荐**
-- 高隐蔽 + 高兼容：`VLESSREALITY (vision)` 
-- 传输速度最高：`Hysteria2` + `obfs=salamander`
-- 要 UDP 游戏/通话：Hysteria2 / TUIC / `Shadowsocks`+UoT
-- 全淡肤 / 复用 Cloudflare CDN：VLESS+ws+TLS / VMess+ws+TLS
-- 无证书配置：`ShadowTLS v3+SS-2022` / `Reality` 系所有协议
-- 极简单文件 / 携带 payload：`Shadowsocks-2022`
-
----
-
-## 分享链接服务（面板菜单 3）
-管理界面：
-```text
- 1) 生成链接 (选节点)
- 2) 生成全部节点链接 (一个链接带全部)
- 3) 列出全部链接
- 4) 删除链接
- 5) 禁用/启用 (toggle)
- 6) 重新生成 token (regen)
- 0) 在全量 panel 内做一体; CLI: bash conf/share.sh [create|regen-aggregate|list|del|toggle|regen]
-```
-
-参数：
-- `max_uses`: `0=不限` / `N=次数`（大于 0 按次消耗）
-- `ttl_hours`: 有效期 (`0=永久`, 或选择菜单 1h/24h/7d/30d/自定义)
-
-生成的 all-share URL (例如) :
-```
-http://<server-ip>:9292/share/<token>
-```
-内容（outbounds 全量合集）:
-- **outbounds** (所有节点 tag 名称 + 客户端 outbounds + `PROXY` 选择器 + `AUTO` urltest)
-- `route.final=PROXY`, `PROXY.all = [all-节点 tag]`
-
-**服务端停机时：share 服务返回 503 且不消耗额度**（`do_HEAD` 支持, 订阅客户端健康探测正常）。
-**删除节点时：引用该节点的分流/绑定规则自动切回 `direct`**（默认出站保护/失败回退）。
-
----
-
-## 默认出站保护 + 失败自动回退 (类似于 xary-core 的 selftest)
-删除或自检任一自定义出站前会尝试 2-3 次 HTTP 204 请求：
-- **通过** → 按可用处理
-- **失败** → 自动将**所有**引用此 tag 的分流/绑定规则切回 `direct`；文件移到 `.quarantine/`。信到规则永远有出口，不让某个转发节点挂掉影响全量流量。
-
-涉及菜单：`4. 网络 → 4) 出站管理 → 9) 全量自检`
-
-## 域名分流 & 入站绑定出站
-```text
- 主面板 → 4. 网络 → 4. 出站管理 →
- 4) 域名分流 (添加规则: 指定域名 → 指定出站)
- 5) 域名分流 (列出规则)
- 6) 域名分流 (删除规则)
- 7) 入站绑定出站 (添加)
- 8) 入站绑定出站 (删除)
- 9) 出站自检+失败自动回退 direct (全量自检)
-```
-示例:
-```json
-// config/03-route.json
-{ "route": { "rules": [
-    { "domain_suffix": ["ipinfo.io"], "outbound": "custom" },
-    { "inbound": ["reality01"], "outbound": "direct" }
-  ],
-  "default_mark": 4
-}}
-```
-
----
-
-## 安装
-
-### 一键 (最常见)
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/mi1314cat/sing-box-core/refs/heads/main/install.sh)
-```
-或克隆仓后任意使用:
-```bash
-git clone https://github.com/mi1314cat/sing-box-core
-cd sing-box-core
-bash install.sh              # 交互式添加 server / client
+bash src/sing-box.sh                       # 菜单
+bash src/sing-box.sh init|check|reload|restart|status|list
+# 添加协议节点 (菜单或直接调模块):
+bash src/conf/reality.sh add      # VLESS+Reality (可选 transport: vision / grpc / http-H2)
+bash src/conf/vmess.sh add        # VMess + ws/grpc/h2/tcp + TLS/自签/Reality
+bash src/conf/trojan.sh add       # Trojan + TLS
+bash src/conf/naive.sh add        # Naive (HTTP/2 CONNECT; 需真证书)
+bash src/conf/shadowtls.sh add    # ShadowTLS v3 + 内层 SS-2022 (双 inbound)
+bash src/conf/hysteria2.sh add    # Hysteria2 (UDP + 可选端口跳跃/obfs)
+bash src/conf/tuic.sh add         # TUIC v5
+bash src/conf/shadowsocks.sh add  # SS-2022 blake3
+bash src/conf/anyreality.sh add   # AnyTLS + Reality (sing-box >=1.12)
 ```
 
-### 手动 (server)
-```bash
-bash src/sing-box.sh init
-bash src/sing-box.sh status
-```
-默认路径：
-- Server:  `/root/catmi/sing-box`
-- Client:  `/opt/sb-client`  
-- 分享服务端口：`9292` (`/etc/systemd/system/sing-box-share.service`)
+### Share URL（限次/一次性分发）
 
-客户端 (Client):
 ```bash
+bash src/conf/share.sh create reality01 1 24
+bash src/conf/share.sh create hysteria01 10 168
+bash src/conf/share.sh list
+bash src/conf/share.sh toggle <token|tag>     # 立即禁用
+bash src/conf/share.sh del|regen <token|tag>
+# 服务: systemd (`sing-box-share`, 默认 :9292, SHARE_DIR/PORT 可覆盖)
+```
+
+- URL 仅含 128-bit 随机 token，**不**包含任何节点信息；返回完整客户端 outbound JSON；
+- `max_uses` / `expires_at` / `enabled` 三类独立失效，均可显式 DENY(410)；
+- 并发安全：flock 串行 read-modify-write，10 并发抢 1 次授权仍只放行 1 个（已实测）；
+- 客户端只有**收到完整 200 响应**才计数；服务端配置异常一律 `503` 且不消耗次数。
+
+## Client (`src/client/client.sh`)
+
+```bash
+bash src/client/client.sh install           # 内核 (arm64/amd64, glibc/musl 回退)
+bash src/client/client.sh init             # 建配置 + 装 sb-client.service + 自动启动
+bash src/client/client.sh add https://<server>:9292/share/<token>
+bash src/client/client.sh list|del|update  # 多节点池 (share 来源去重, 同源只拉一次)
+bash src/client/client.sh start|stop|restart|reload|status|check
+bash src/client/client.sh service          # 只安装/更新 systemd unit
+bash src/client/client.sh install-ui       # metacubexd (Clash API UI)
+```
+
+- 端点：HTTP+SOCKS5 同口 **`:2080`，LAN 设备直接填这个地址即可**；
+- Clash API: `:19090`（secret 保护，官方要求非 loopback 监听必须设置 secret）；
+- metacubexd Web UI: `http://<client-ip>:19090/ui/` — 节点切换/延迟测试/连接查看；
+- 多节点 = selector `PROXY` + urltest `AUTO`（`final=PROXY`），detour 辅助出站（如 shadowtls-out）自动排除；
+- **不实现 TUN/透明代理/FakeIP**（有意避免）；
+- 端口避让已有服务（metacubexd 默认不再占 9090：默认 **19090**）。
+
+### 服务与状态（客户端）
+
+- 客户端同样**一个内核 + 一个 systemd 服务**（`sb-client.service`，`init`/`service` 时自动安装并 `enable`），
+  `ExecReload` 为 `kill -HUP $MAINPID`，故 `reload` 为零断流软重载；节点增删改与端口变更**自动应用**（优先软重载）。
+- 面板状态**不以 `systemctl is-active` 单一字符串为准**，而是分层判定：
+  systemd 单元 → 本客户端 sing-box 进程（按 `/proc/<pid>/exe` + 配置目录精确匹配）→ 端口监听 → 配置检查 → 真实连通性。
+  因此可以区分「未运行 / 启动失败 / 未初始化 / 进程在但没监听 / 配置异常」，不再出现“其实在跑却显示未运行”。
+- 节点数量取自 `conf/90-outbounds.json` 里**实际被加载的出站**（排除 selector/urltest/direct），不是文件个数。
+
+### 端口（客户端）
+
+- 两个端口**都必须独立存在**：sing-box **不支持** mixed 入站与 clash API 共用同一端口
+  （`sing-box check` 会通过，但运行时报 `bind: address already in use` 直接 FATAL）。
+  面板在改端口时会拒绝与另一端口相同的取值。
+- `sing-box check` **只校验配置语法，不检测端口占用**，所以冲突只在启动时暴露。
+  面板「客户端设置 → 端口占用检测」用 `ss` 预检，列出占用进程与 PID，并在写入前拦截。
+- 端口/监听地址的真实来源是 `conf/00-mixed.json` 与 `conf/01-clash.json`，面板读 JSON 而不是读脚本变量，
+  手改 JSON 后显示不会失真。
+- 监听地址切 `127.0.0.1` 属于启动期参数，面板会自动重启使新 bind 生效。
+
+
+## 分享链接管理（服务端菜单 3）
+- **1) 生成链接**：先列本机可分享节点（编号+协议+端口），回车=全部节点一条链接。
+- **2) 全部节点一条链接**：列出“共 N 个可分享节点”，标准创建流程 (`max_uses` + 有效期菜单)。
+- **3) 列表/4) 删除/5) 禁用/6) regen**：带编号列表，输入编号或 token 前缀均可定位。
+- `max_uses`：`0=不限` / N=次数；`有效期` 菜单：1h / 24h / 7d / 30d / 永久 / 自定义。
+- 已修复：`max_uses=abc`/负数不再误删旧链接；`ttl=0` 语义统一为"永久"；410/404/503 错误分支明确文案；sing-box 停机时分发 503 且不消耗额度（HEAD 预检支持）。
+
+## 客户端
+```bash
+bash client.sh                     # 交互面板 [ 客户端 · CLIENT ] 无参进入
 sb-client add <share-url>
-sb-client     # 进入交互面板 [客户端·CLIENT]
+sb-client del <tag>                # 支持 tag 编号
+sb-client update                   # 重新拉取其 share 源并重载
 ```
+- 链接导入支持**同一 URL 三连导入零副本**（`source` meta 记录唯一身份）。
+- 错误文案区分 `410 已用尽/404 不存在/503 服务未运行`，curl -f 陷阱已移除。
 
----
+## Reality flow 与节点删除级联
+- 服务端 Reality `users` 内建 `flow = xtls-rprx-vision`，与客户端一致（修复 QA 发现的全 flow mismatch 不可连）。
+- 任何节点删除动作:**自动清理其 share token** 并刷新 all 聚合（token 不变内容即时更新），不会再把已删节点悄悄分发出去。
 
-## 面板图标 & 角色
-```text
-                       |\__/,|   (\
-                     _.|o o  |_   ) )
-   -------------(((---(((-------------------
-                   catmi.singbox
-   -----------------------------------------
-
-SB-Panel — Sing-box 管理脚本   [ 服务端 · SERVER ]     ← 角色徽标, 一眼分辨服务端/客户端
-```
-
-## 卸载 (不影响 other 服务)
+## 卸载 (不影响 Other 服务)
 ```bash
-bash conf/uninstall.sh       # 停 sing-box.service / sing-box-share.service, 不碰 other 服务
+bash conf/uninstall.sh       # CLI 菜单: 1) 卸载 SB 整套  2) 仅停服务
 ```
-
-## ⚠ 版本与 Connections
-- **sing-box 内核版本**: v1.14.1
-- **SSH Connect**：`bash <(curl -Ls .../install.sh)` 亦可静态下载安装脚本 
-- **sing-box 内核**：`src/conf/*.sql` 各协议生成模块独立、模块解耦
-- **分享服务器**: 基于 python3 + flock( file-lock 共享只读对话框，Quqeue 与 concurrent consumed)
+停止并移除仅 SB 自家的 systemd 单元 (`sing-box.service` / `sing-box-share.service`), 可选删数据目录 / `/root/catmi/sing-box`。绝不触碰其它 systemd 服务、证书 (`/etc/letsencrypt` 等)、客户端侧 `sb-client`。删除前会显示确切影响范围, 必须 yes 确认。
