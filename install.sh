@@ -172,7 +172,9 @@ do_client() {
     ok "配置检查"
     CLIENT_ROOT="$CLI_ROOT" bash /usr/local/bin/sb-client install-ui >/dev/null 2>&1 && ok "Web UI (metacubexd)" || warn "UI 下载失败, 可稍后 bash sb-client install-ui"
     echo
-    printf "  HTTP/SOCKS: %s:2080   Clash API: %s:19090\n" "$CLI_ROOT" "$CLI_ROOT"
+    local lanip; lanip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
+    printf "  HTTP/SOCKS: http://%s:2080   Clash API: http://%s:19090\n" "${lanip:-127.0.0.1}" "${lanip:-127.0.0.1}"
+    printf "  Web UI:     http://%s:19090/ui/  (密钥见面板 11 项)\n" "${lanip:-127.0.0.1}"
     echo "--------------------------------"
     ok "客户端安装完成"
     read -r -p "按回车进入管理面板..." _
