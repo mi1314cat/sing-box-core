@@ -158,7 +158,10 @@ EOF
 }
 
 do_client() {
-    info "正在初始化 Sing-box 客户端..."
+    # 已装机器: 只更新脚本, 绝不碰用户配置 (端口/监听/节点都是用户自己设的)
+    local already=0
+    [[ -f "$CLI_ROOT/conf/00-mixed.json" ]] && already=1
+    if (( already )); then info "更新客户端脚本"; else info "正在初始化 Sing-box 客户端..."; fi
     mkdir -p "$CLI_ROOT"/{conf,core,nodes,share-state,ui} /usr/local/bin || die "目录创建失败"
     cp -f "$SRC_DIR/src/client/client.sh" /usr/local/bin/sb-client || die "复制失败"
     chmod +x /usr/local/bin/sb-client
@@ -168,13 +171,37 @@ do_client() {
         CLIENT_ROOT="$CLI_ROOT" bash /usr/local/bin/sb-client install >/dev/null 2>&1 || die "Sing-box 内核下载失败"
         ok "Sing-box 核心 ($("$CLI_ROOT/core/sing-box" version 2>/dev/null | head -1))"
     fi
-    CLIENT_ROOT="$CLI_ROOT" bash /usr/local/bin/sb-client init >/dev/null 2>&1 || die "客户端初始化失败"
-    ok "配置检查"
-    CLIENT_ROOT="$CLI_ROOT" bash /usr/local/bin/sb-client install-ui >/dev/null 2>&1 && ok "Web UI (metacubexd)" || warn "UI 下载失败, 可稍后 bash sb-client install-ui"
+    if (( already )); then
+        # 已有配置: 只做 systemd 服务补齐 + 配置校验, 不重新生成 00-mixed/01-clash
+        CLIENT_ROOT="$CLI_ROOT" bash /usr/local/bin/sb-client service >/dev/null 2>&1 || true
+        if CLIENT_ROOT="$CLI_ROOT" bash /usr/local/bin/sb-client check >/dev/null 2>&1; then
+            ok "配置检查"
+        else
+            warn "配置检查未通过 (未做任何修改), 请运行客户端面板 12 查看详情"
+        fi
+    else
+        CLIENT_ROOT="$CLI_ROOT" bash /usr/local/bin/sb-client init >/dev/null 2>&1 || die "客户端初始化失败"
+        ok "基础配置 + 服务已就绪"
+    fi
+    if [[ -f "$CLI_ROOT/ui/index.html" ]]; then
+        ok "Web UI 已存在 (如需更新请用面板: 客户端设置 → Web UI → 重新下载)"
+    else
+        CLIENT_ROOT="$CLI_ROOT" bash /usr/local/bin/sb-client install-ui >/dev/null 2>&1 && ok "Web UI (metacubexd)" || warn "UI 下载失败, 可稍后 bash sb-client install-ui"
+    fi
     echo
-    local lanip; lanip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
-    printf "  HTTP/SOCKS: http://%s:2080   Clash API: http://%s:19090\n" "${lanip:-127.0.0.1}" "${lanip:-127.0.0.1}"
-    printf "  Web UI:     http://%s:19090/ui/  (密钥见面板 11 项)\n" "${lanip:-127.0.0.1}"
+    # 端口从实际配置读取, 不用硬编码 —— 用户可能已经改过端口/监听地址
+    local mport mlisten cctrl cport chost mhost lanip
+    mport=$(jq -r '.inbounds[]?|select(.type=="mixed")|.listen_port // 2080' "$CLI_ROOT/conf/00-mixed.json" 2>/dev/null); mport="${mport:-2080}"
+    mlisten=$(jq -r '.inbounds[]?|select(.type=="mixed")|.listen // "0.0.0.0"' "$CLI_ROOT/conf/00-mixed.json" 2>/dev/null); mlisten="${mlisten:-0.0.0.0}"
+    cctrl=$(jq -r '.experimental.clash_api.external_controller // "0.0.0.0:19090"' "$CLI_ROOT/conf/01-clash.json" 2>/dev/null); cctrl="${cctrl:-0.0.0.0:19090}"
+    cport="${cctrl##*:}"; chost="${cctrl%:*}"
+    lanip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
+    # 监听 0.0.0.0 时局域网可达, 显示真实 LAN IP; 监听 127.0.0.1 时只有本机可用
+    case "$mlisten" in 0.0.0.0|"::"|"") mhost="${lanip:-127.0.0.1}" ;; *) mhost="127.0.0.1" ;; esac
+    case "$chost"  in 0.0.0.0|"::"|"") chost="${lanip:-127.0.0.1}" ;; *) chost="127.0.0.1" ;; esac
+    printf "  HTTP/SOCKS: http://%s:%s\n" "$mhost" "$mport"
+    printf "  Clash API:  http://%s:%s\n" "$chost" "$cport"
+    [[ -f "$CLI_ROOT/ui/index.html" ]] && printf "  Web UI:     http://%s:%s/ui/  (密钥见面板 11 项)\n" "$chost" "$cport"
     echo "--------------------------------"
     ok "客户端安装完成"
     read -r -p "按回车进入管理面板..." _
