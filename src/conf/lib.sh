@@ -112,7 +112,7 @@ safe_read_port() { # 默认值 = 随机空闲端口
         input=$(clean_input "$input")
         port="${input:-$default}"
         if ! [[ "$port" =~ ^[0-9]+$ ]]; then print_error "端口必须是数字"; continue; fi
-        if (( port < 1 || port > 65535 )); then print_error "端口范围 1-65535"; continue; fi
+        if (( 10#$port < 1 || 10#$port > 65535 )); then print_error "端口范围 1-65535"; continue; fi
         if port_in_use "$port"; then print_error "端口 $port 已被占用"; continue; fi
         echo "$port"
         return
@@ -152,10 +152,19 @@ get_next_index() {
     if ((${#used[@]} == 0)); then printf "01\n"; return; fi
     IFS=$'\n' used=($(printf "%s\n" "${used[@]}" | sort -n))
     for n in "${used[@]}"; do
-        [[ "$n" -ne "$i" ]] && break
+        # 必须 10# 转十进制: 文件名捕获到的 "08"/"09" 前导零会被 bash 当八进制,
+        # 直接比较会报 "value too great for base" 并让比较结果不可信
+        (( 10#$n != 10#$i )) && break
         ((i++))
     done
     printf "%02d\n" "$i"
+}
+
+# 静默版 sing-box check: 只返回状态, 不打印。
+# 用于"我先 check 一次 -> 回滚 -> 再 check 确认剩余配置是否干净"这类场景,
+# 否则会出现 [Error] check 失败 紧跟 [OK] check 通过 的自相矛盾输出。
+sb_check_quiet() {
+    "$SB_BIN" check -D "$SB_ROOT" -C "$SB_CONFIG_DIR" >/dev/null 2>&1
 }
 
 # 写 config JSON + jq 校验，失败不落盘
@@ -457,6 +466,7 @@ cleanup_node_shares() { # cleanup_node_shares <tag>
     return 0
 }
 
+
 # ---- 批量模式: 覆盖 bash 内置 read ----
 # add_config 内编号/选择 read 返回空串 → 各协议自身的 [[ -z ]]&&默认 逻辑接管
 # 防空转 (事故复盘 2026-09-21 RN): 连续 N 次(默认 32)注入"空答案"仍未正常推进 → 认定是菜单循环误入, 强制 exit.
@@ -495,3 +505,158 @@ if [[ "${SB_BATCH:-}" == "1" ]]; then
         return 0
     }
 fi
+
+# ==============================================================
+# 提示输入 —— bash 的 `read -p` 只在 stdin 是终端时才显示提示,
+# 一旦被管道/自动化驱动就完全不可见, 用户(或测试者)会"输入了却不知道在输什么"。
+# 面板统一改为显式写 stderr, 保证任何环境下都有指引。
+# ==============================================================
+sb_ask() { # sb_ask <提示> -> 结果写入全局 REPLY
+    printf "%s" "$1" >&2
+    read -r REPLY
+    REPLY=$(clean_input "$REPLY")
+}
+
+# ==============================================================
+# rule-set 公共设施 —— dns.sh 与 ruleset.sh 共用
+#
+# 根因: 02-rule-set.json 可能由任一模块先创建 (ruleset.sh 只建空数组),
+#       dns.sh 却只判断"文件是否存在"就认为规则集已就绪。于是
+#       01-dns.json 引用 geosite-category-ads-all / geosite-cn,
+#       而 02-rule-set.json 里一个 tag 都没定义 ->
+#       FATAL initialize dns router: rule-set not found: geosite-category-ads-all
+#       而面板每次写盘都要先过 sing-box check, 于是所有写操作全部回滚,
+#       一次只能加一个规则集也永远修不好 (鸡生蛋死锁)。
+# 修法: 一律按 tag 幂等自愈, 且一次把缺失的 tag 全部补齐。
+# ==============================================================
+SB_RS_FILE="${SB_RS_FILE:-$SB_CONFIG_DIR/02-rule-set.json}"
+SB_HTTP_FILE="${SB_HTTP_FILE:-$SB_CONFIG_DIR/00-http.json}"
+SB_HTTP_CLIENT_TAG="${SB_HTTP_CLIENT_TAG:-http-direct}"
+SB_GEOSITE_BASE="${SB_GEOSITE_BASE:-https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set}"
+
+sb_geosite_url() { echo "$SB_GEOSITE_BASE/$1.srs"; }
+
+sb_ruleset_defined() { # <tag> -> 0 已定义 / 1 未定义
+    local t="$1"
+    [[ -f "$SB_RS_FILE" ]] || return 1
+    jq -e --arg t "$t" 'any(.route.rule_set[]?; .tag==$t)' "$SB_RS_FILE" >/dev/null 2>&1
+}
+
+sb_ensure_http_client() { # remote rule-set 在 1.14 走 http_client (download_detour 已废弃)
+    if [[ ! -f "$SB_HTTP_FILE" ]]; then
+        write_config "$SB_HTTP_FILE" '{"http_clients":[{"tag":"'"$SB_HTTP_CLIENT_TAG"'"}]}' || return 1
+        print_ok "已创建 http_client 定义: $SB_HTTP_FILE"
+        return 0
+    fi
+    if jq -e --arg t "$SB_HTTP_CLIENT_TAG" 'any(.http_clients[]?; .tag==$t)' "$SB_HTTP_FILE" >/dev/null 2>&1; then
+        return 0
+    fi
+    if write_config "$SB_HTTP_FILE" "$(jq --arg t "$SB_HTTP_CLIENT_TAG" '.http_clients = ((.http_clients // []) + [{"tag":$t}])' "$SB_HTTP_FILE")"; then
+        print_ok "已补齐 http_client: $SB_HTTP_CLIENT_TAG ($SB_HTTP_FILE)"
+        return 0
+    fi
+    print_error "无法在 $SB_HTTP_FILE 中写入 http_client"
+    return 1
+}
+
+# 把仍用 download_detour 的条目迁到 http_client (1.14 已废弃前者)
+sb_migrate_ruleset_detour() { # <tag> -> 0 已迁移 / 1 无需迁移
+    local tag="$1"
+    jq -e --arg t "$tag" 'any(.route.rule_set[]?; .tag==$t and (.download_detour? != null) and (.http_client? == null))' \
+        "$SB_RS_FILE" >/dev/null 2>&1 || return 1
+    sb_ensure_http_client || return 1
+    jq --arg t "$tag" --arg hc "$SB_HTTP_CLIENT_TAG" '
+        .route.rule_set |= map(
+            if (.tag==$t and (.download_detour? != null) and (.http_client? == null))
+            then (. + {http_client:$hc} | del(.download_detour)) else . end)' \
+        "$SB_RS_FILE" > "$SB_RS_FILE.tmp" && mv "$SB_RS_FILE.tmp" "$SB_RS_FILE" || return 1
+    print_ok "规则集 $tag: download_detour -> http_client ($SB_HTTP_CLIENT_TAG)"
+    return 0
+}
+
+sb_ensure_ruleset() { # <tag> <url> [format] [interval] —— 幂等, 已存在不动
+    local tag="$1" url="$2" fmt="${3:-binary}" iv="${4:-1d}" entry
+    sb_rs_healthy || sb_repair_rs_file || return 1
+    if sb_ruleset_defined "$tag"; then
+        sb_migrate_ruleset_detour "$tag" || true
+        return 0
+    fi
+    sb_ensure_http_client || return 1
+    entry=$(jq -n --arg tag "$tag" --arg url "$url" --arg fmt "$fmt" --arg iv "$iv" --arg hc "$SB_HTTP_CLIENT_TAG" \
+        '{type:"remote",tag:$tag,format:$fmt,url:$url,http_client:$hc,update_interval:$iv}')
+    if ! write_config "$SB_RS_FILE" "$(jq --argjson e "$entry" '.route.rule_set = ((.route.rule_set // []) + [$e])' "$SB_RS_FILE")"; then
+        print_error "规则集定义写入失败: $tag"
+        return 1
+    fi
+    print_ok "已补齐规则集定义: $tag -> $(basename "$url")"
+    return 0
+}
+
+# 删除 rule-set 前, 报告它还被哪些文件引用 (避免删完留下必然 check 失败的配置)
+# 注意: 02-rule-set.json 里 tag 自身的"定义"不是引用, 统计前先 del 掉 .route.rule_set,
+#       否则每个规则集都会被误报成"被自己引用"。
+sb_ruleset_refs() { # <tag> -> 逐行 "文件 引用 N 处"
+    local tag="$1" f n
+    shopt -s nullglob
+    for f in "$SB_CONFIG_DIR"/*.json; do
+        # 注意别写成 paths(..|select(...)): 那会让 .. 嵌套 .. , 每处引用按祖先层数被重复计数
+        n=$(jq -r --arg t "$tag" 'del(.route.rule_set) | [.. | select(type=="string" and .==$t)] | length' "$f" 2>/dev/null) || n=0
+        [[ "$n" =~ ^[0-9]+$ ]] && (( n > 0 )) && echo "  $(basename "$f")  引用 $n 处"
+    done
+    shopt -u nullglob
+    return 0
+}
+
+# ---- rule-set 文件健康检查 / 自愈 ----
+# 02-rule-set.json 一旦被手工改坏(jq 解析不了), 面板所有 jq 操作都会静默失败,
+# 界面上只剩一句原始的 "jq: parse error"。这里提供统一检测与两条修复路径。
+SB_RS_DEFAULT_TAGS="geosite-category-ads-all geosite-cn"
+
+sb_rs_healthy() { # 0=可解析 / 1=缺失或损坏
+    [[ -f "$SB_RS_FILE" ]] || return 1
+    jq -e . "$SB_RS_FILE" >/dev/null 2>&1
+}
+
+sb_repair_rs_file() { # 尝试修复: 先从最近备份恢复, 失败则重建默认预设
+    local b
+    for b in $(ls -dt "$SB_BACKUP_DIR"/*/config/02-rule-set.json 2>/dev/null | head -5); do
+        if jq -e . "$b" >/dev/null 2>&1; then
+            cp -f "$b" "$SB_RS_FILE" || continue
+            print_ok "已从备份恢复规则集定义: $b"
+            return 0
+        fi
+    done
+    write_config "$SB_RS_FILE" '{"route":{"rule_set":[]}}' || return 1
+    local t
+    for t in $SB_RS_DEFAULT_TAGS; do
+        sb_ensure_ruleset "$t" "$(sb_geosite_url "$t")" binary 1d || return 1
+    done
+    print_ok "已重建规则集定义 (默认预设: $SB_RS_DEFAULT_TAGS)"
+    return 0
+}
+
+sb_guard_rs() { # 菜单入口守门: 损坏时先修复再继续
+    sb_rs_healthy && return 0
+    print_error "规则集定义文件异常: $SB_RS_FILE (不存在或 JSON 损坏)"
+    local a
+    printf "  1) 从最近备份恢复 / 重建默认预设 (推荐)\n  2) 取消\n" >&2
+    sb_ask "  选择 (默认 1): "
+    [[ "$REPLY" =~ ^2 ]] && return 1
+    sb_repair_rs_file || { print_error "自动修复失败, 请人工检查 $SB_RS_FILE"; return 1; }
+    return 0
+}
+
+# rule-set 定义被删掉又重新加回时, 01-dns.json 里引用它的规则不会自动回来
+# (例如删掉 geosite-cn 再加回来, 国内域名会悄悄改走 final 服务器)。
+# 这里在 DNS 配置里缺该规则时补上, 并明确告知。
+sb_ensure_dns_rule() { # <tag> <jq-rule-filter> [说明]
+    local tag="$1" filter="$2" desc="${3:-}" f="$SB_CONFIG_DIR/01-dns.json"
+    [[ -f "$f" ]] || return 0
+    sb_ruleset_defined "$tag" || return 1
+    jq -e --arg t "$tag" 'any(.dns.rules[]?; ((.rule_set? // []) | tostring) == ([$t]|tostring))' "$f" >/dev/null 2>&1 && return 0
+    if write_config "$f" "$(jq --arg t "$tag" "$filter" "$f")"; then
+        print_ok "已补回 DNS 分流规则: $tag${desc:+ ($desc)}"
+        return 0
+    fi
+    return 1
+}

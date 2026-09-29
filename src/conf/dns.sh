@@ -14,39 +14,22 @@ RS_FILE="$SB_CONFIG_DIR/02-rule-set.json"
 ADS_TAG="geosite-category-ads-all"
 CN_TAG="geosite-cn"
 
-# ---------- rule-set 定义（02-rule-set.json; 有则跳过）----------
+# ---------- rule-set 定义 (02-rule-set.json) ----------
+# 注意: 不能只判断文件是否存在。02-rule-set.json 可能已被 ruleset.sh 建成
+#       {"route":{"rule_set":[]}}, 此时"文件存在"但一个 tag 都没定义,
+#       而 01-dns.json 引用了它们 -> sing-box check 必然失败, 且面板所有写操作
+#       都会被这个 check 挡住, 形成死锁。这里按 tag 幂等补齐。
 ensure_rule_sets() {
-    [[ -f "$RS_FILE" ]] && { print_ok "规则集定义已存在: $RS_FILE"; return 0; }
-    write_config "$RS_FILE" '{
-  "route": {
-    "rule_set": [
-      {
-        "type": "remote",
-        "tag": "'"$ADS_TAG"'",
-        "format": "binary",
-        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ads-all.srs",
-        "http_client": "http-direct",
-        "update_interval": "1d"
-      },
-      {
-        "type": "remote",
-        "tag": "'"$CN_TAG"'",
-        "format": "binary",
-        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs",
-        "http_client": "http-direct",
-        "update_interval": "3d"
-      }
-    ]
-  }
-}'
+    local ok=0
+    sb_ensure_ruleset "$ADS_TAG" "$(sb_geosite_url "$ADS_TAG")" binary 1d || ok=1
+    sb_ensure_ruleset "$CN_TAG"  "$(sb_geosite_url "$CN_TAG")"  binary 3d || ok=1
+    (( ok == 0 )) || { print_error "规则集定义未能补齐"; return 1; }
+    print_ok "规则集已就绪: $ADS_TAG / $CN_TAG  ($RS_FILE)"
 }
 
 dns_init() {
-    if [[ -f "$DNS_FILE" ]]; then
-        read -r -p "01-dns.json 已存在，覆盖？[y/N]: " yn
-        [[ "$(clean_input "$yn")" =~ ^[yY] ]] || return 0
-    fi
-    ensure_rule_sets
+    # 先把 DNS 的依赖准备好 (rule-set + http_client), 否则模板写出来必然 check 失败
+    ensure_rule_sets || { print_error "规则集依赖未就绪, 已中止 (未改动 01-dns.json)"; return 1; }
     if [[ ! -f "$SB_CONFIG_DIR/00-log.json" ]]; then
         write_config "$SB_CONFIG_DIR/00-log.json" '{"log":{"level":"info","timestamp":true}}' || return 1
     fi
@@ -56,10 +39,19 @@ dns_init() {
     if [[ ! -f "$SB_CONFIG_DIR/00-route.json" ]]; then
         write_config "$SB_CONFIG_DIR/00-route.json" '{"route":{"default_domain_resolver":"dns-local"}}' || return 1
     fi
-    if [[ ! -f "$SB_CONFIG_DIR/00-http.json" ]]; then
-        # 1.14: http_clients 顶层，替代已 deprecated 的 download_detour
-        write_config "$SB_CONFIG_DIR/00-http.json" '{"http_clients":[{"tag":"http-direct"}]}' || return 1
+    sb_ensure_http_client || { print_error "http_client 未能就绪, 已中止"; return 1; }
+
+    local existed=0 old=""
+    if [[ -f "$DNS_FILE" ]]; then
+        existed=1; old=$(cat "$DNS_FILE")
+        sb_ask "  01-dns.json 已存在, 覆盖? [y/N]: "
+        if [[ ! "$REPLY" =~ ^[yY] ]]; then
+            print_info "已保留现有 01-dns.json (规则集定义已确保就绪)"
+            if sb_check; then print_ok "当前配置校验通过"; else print_error "当前配置校验失败, 问题不在本次操作"; fi
+            return 0
+        fi
     fi
+
     write_config "$DNS_FILE" '{
   "dns": {
     "servers": [
@@ -77,8 +69,21 @@ dns_init() {
     "timeout": "5s"
   }
 }' || return 1
-    print_ok "DNS 模板已生成: 广告=reject, 国内域名=dns-local(223.5.5.5), 其余=dns-remote(8.8.8.8 DoT)"
-    sb_check && sb_reload || true
+
+    # 先校验再报成功: 绝不出现 "[OK] 已生成" 紧跟着 "[Error] check 失败"
+    if ! sb_check; then
+        if (( existed )); then
+            printf '%s\n' "$old" | jq . > "$DNS_FILE"
+            print_error "sing-box check 未通过, 已把 01-dns.json 回滚到修改前"
+        else
+            rm -f "$DNS_FILE"
+            print_error "sing-box check 未通过, 已删除新生成的 01-dns.json (未留下坏配置)"
+        fi
+        return 1
+    fi
+    print_ok "DNS 模板已生成并通过 sing-box check"
+    print_info "广告=reject, 国内域名=dns-local(223.5.5.5), 其余=dns-remote(8.8.8.8 DoT)"
+    sb_reload || true
 }
 
 dns_show() {
@@ -139,23 +144,29 @@ set_final() {
 }
 
 ads_on() {
-    [[ -f "$RS_FILE" ]] || { print_error "未找到规则集定义（先 init 或 ruleset.sh）"; return 1; }
+    ensure_rule_sets || { print_error "规则集未就绪, 去广告未开启"; return 1; }
+    sb_ruleset_defined "$ADS_TAG" || { print_error "规则集 $ADS_TAG 仍未定义, 去广告未开启 (不会写出无效配置)"; return 1; }
     if dns_edit --arg t "$ADS_TAG" '
         .dns.rules = ([{"rule_set": [$t], "action": "reject"}] + [(.dns.rules // [])[] | select((.rule_set? // ["-x-"] | tostring) != ([$t] | tostring))])'; then
-        print_ok "去广告已启用 (DNS reject $ADS_TAG)"
+        print_ok "去广告已启用 (DNS 层 reject $ADS_TAG)"
     fi
 }
 
 ads_off() {
-    if dns_edit --arg t "$ADS_TAG" '
-        .dns.rules |= map(select((.rule_set? // ["-x-"] | tostring) != ([$t] | tostring)))'; then
-        print_ok "去广告已关闭"
+    dns_edit --arg t "$ADS_TAG" '
+        .dns.rules |= map(select((.rule_set? // ["-x-"] | tostring) != ([$t] | tostring)))' || return 1
+    print_ok "去广告已关闭 (01-dns.json 不再引用 $ADS_TAG)"
+    local rf="$SB_CONFIG_DIR/03-route.json"
+    if [[ -f "$rf" ]] && jq -e --arg t "$ADS_TAG" \
+        'any(.route.rules[]?; ((.rule_set? // ["-x-"] | tostring) == ([$t] | tostring)))' "$rf" >/dev/null 2>&1; then
+        print_warn "注意: 03-route.json (路由层) 仍在引用 $ADS_TAG —— 那是流量层拦截, 与 DNS 去广告开关独立"
+        print_warn "      如需一并关闭: 规则集管理 -> 3 路由规则 -> 4 删除规则"
     fi
+    sb_check && print_ok "sing-box check 通过"
 }
 
 fakeip_on() {
     local in4="${1:-198.18.0.0/15}"
-    jq -e '.dns.servers[] | select(.tag=="fakeip")' "$DNS_FILE" >/dev/null 2>&1 && [[ $? -eq 0 || $? -eq 1 ]] || true
     if jq -e 'any(.dns.servers[]; .tag=="fakeip")' "$DNS_FILE" >/dev/null 2>&1; then
         print_warn "fakeip 已存在"; return 0
     fi
