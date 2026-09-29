@@ -522,6 +522,16 @@ sb_ask() { # sb_ask <提示> -> 结果写入全局 REPLY; 返回 read 的状态
     return "$_rc"
 }
 
+sb_ask_loop() { # 在 while 循环里用: 读不到输入(EOF)立即放弃整个操作, 不再空转
+    # sb_ask 在 EOF 时返回非 0, 但循环里若忽略返回值就会以 ~150 行/秒 无限刷屏
+    # (外推 50 万行/小时), 只能靠外部 timeout 杀掉。
+    if ! sb_ask "$1"; then
+        print_warn "输入已结束, 已放弃当前操作"
+        return 1
+    fi
+    return 0
+}
+
 # ==============================================================
 # rule-set 公共设施 —— dns.sh 与 ruleset.sh 共用
 #

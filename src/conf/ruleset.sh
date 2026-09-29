@@ -145,10 +145,14 @@ del_ruleset() {
         printf '%s\n' "$refs" >&2
         echo "    1) 同时清除这些引用后删除 (推荐)" >&2
         echo "    2) 取消" >&2
-        sb_ask "    选择 (默认 1): "
-        # 原来只有精确的 "2" 才取消, 用户习惯性输入 "n" 反而会执行删除 —— 危险
+        # 关键: 这里的"默认 1"是破坏性选项(清除引用并删除)。
+        # EOF/空回车时若一律取 1, 就等于"没人确认也照删"。
+        # 所以 EOF 一律按取消处理, 只有显式输入 1/y 才继续。
+        if ! sb_ask "    选择 (直接回车=取消): "; then
+            print_warn "输入已结束, 已取消"; return 0
+        fi
         case "$REPLY" in
-            1|y|Y|yes|"") : ;;
+            1|y|Y|yes) : ;;
             *) print_warn "已取消"; return 0 ;;
         esac
     else

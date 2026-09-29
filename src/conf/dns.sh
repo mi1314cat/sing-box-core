@@ -115,7 +115,7 @@ dns_edit() { # dns_edit "<jq-filter>" — check+重载，任一失败回滚到�
 add_server() {
     local tag stype server t
     while true; do
-        sb_ask "  server tag (字母数字/.-, 如 dns-ali): "; tag="$REPLY"
+        sb_ask_loop "  server tag (字母数字/.-, 如 dns-ali): " || return 1; tag="$REPLY"
         [[ -z "$tag" ]] && { print_error "tag 不能为空"; continue; }
         # tag 是 final / dns.rules[].server 的引用键, 字符集必须与 sing-box 一致
         [[ "$tag" =~ ^[A-Za-z0-9_.-]{1,32}$ ]] || { print_error "tag 只能含字母数字 _ . - , 最长 32"; continue; }
@@ -127,7 +127,7 @@ add_server() {
         2) stype=tcp ;; 3) stype=tls ;; 4) stype=https ;; 5) stype=h3 ;; *) stype=udp ;;
     esac
     while true; do
-        sb_ask "  server 地址 (域名或 IP, 输入 0 放弃): "; server="$REPLY"
+        sb_ask_loop "  server 地址 (域名或 IP, 输入 0 放弃): " || return 1; server="$REPLY"
         [[ "$server" == "0" ]] && { print_warn "已放弃添加"; return 1; }
         [[ -z "$server" ]] && { print_error "地址不能为空 (输入 0 可放弃)"; continue; }
         # 原来只判空: 整条 URL / "y" / "1080" 都会被静默当成地址写进去

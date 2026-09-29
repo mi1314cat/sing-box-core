@@ -1026,12 +1026,22 @@ bind_add() {
     done
     [[ ${#choices[@]} -eq 0 ]] && { print_warn "当前没有入站"; return 1; }
     echo "--------------------------------------------------------" >&2
-    sb_ask "选择入站编号: "; c="$REPLY"
+    sb_ask_loop "选择入站编号: " || return 1; c="$REPLY"
     c=$(clean_input "$c")
     if [[ "$c" =~ ^[0-9]+$ ]]; then
         (( c >= 1 && c <= ${#choices[@]} )) || { print_error "无效编号"; return 1; }
         in_="${choices[$((c-1))]}"
     else in_="$c"; fi
+    # 面板对 rule_set / dns.final / detour 都做了"引用必须真实存在"的校验
+    # (sing-box check 查不出这些, 只能自己拦); 入站 tag 同理, 写一个不存在的
+    # inbound 会让该规则永远匹配不到, 面板却显示"已生效"。
+    # 必须用 -s 汇总成单个文档: jq -e 在多文件输入时, 退出码只反映**最后一个**文档
+    # 的结果, 最后一个文件没有 inbound 就会把存在的 tag 误判为不存在
+    if ! jq -s -e --arg t "$in_" 'any(.[]?; any(.inbounds[]?; .tag == $t))' "$SB_CONFIG_DIR"/*.json >/dev/null 2>&1; then
+        print_error "入站不存在: $in_"
+        print_info "当前可用入站: $(all_inbound_tags | tr "\n" " ")"
+        return 1
+    fi
     out=$(outbound_pick); [[ -z "$out" ]] && { print_error "未选择出站"; return 1; }
     python3 - "$ROUTE_FILE" "$in_" "$out" <<'PYS'
 import json,sys
@@ -1048,8 +1058,16 @@ PYS
 }
 
 bind_del() {
-    local n; n=$(safe_read "要删除第几条绑定 (0=全部)" "0")
+    local n cnt
+    cnt=$(jq -r '[.route.rules[]? | select(.inbound != null and .outbound != null)] | length' "$ROUTE_FILE" 2>/dev/null || echo 0)
+    n=$(safe_read "要删除第几条绑定 (0=全部)" "")
     [[ "$n" =~ ^[0-9]+$ ]] || { print_error "请输入编号"; return 1; }
+    # 原来的默认值是 0 = 全部: 回车或 stdin EOF 都会静默清空所有入站绑定, 且只提示"已更新"
+    if [[ "$n" == "0" ]] && (( cnt > 0 )); then
+        print_warn "这将删除全部 $cnt 条入站绑定"
+        sb_ask "  确认清空? [y/N]: "
+        [[ "$REPLY" =~ ^[yY] ]] || { print_warn "已取消"; return 0; }
+    fi
     python3 - "$ROUTE_FILE" "$n" <<'PYS'
 import json,sys
 rf,n=sys.argv[1:3]

@@ -114,12 +114,22 @@ create_share() {
     # 参数校验 (在任何旧数据被改动之前)
     [[ "$max_uses" =~ ^[0-9]+$ ]] || { print_error "max_uses 必须是非负整数 (0=不限), 收到: $max_uses"; return 1; }
     [[ "$ttl" =~ ^[0-9]+$ ]] || { print_error "ttl_hours 必须是小时数 (0=永久), 收到: $ttl"; return 1; }
-    # 同 tag 旧 token 全部下架
+    # 同 tag 旧 token 全部下架 —— 设计如此(一个 tag 只保留一个有效链接),
+    # 但原先是静默删除, 用户手上的旧链接会毫无征兆地变成 404。
     local old token now expires f
+    local revoked=0
     for f in "$SHARED"/*.json; do
         [[ -f "$f" ]] || continue
-        [[ "$(jq -r .tag "$f" 2>/dev/null)" == "$tag" ]] && rm -f "$f"
+        if [[ "$(jq -r .tag "$f" 2>/dev/null)" == "$tag" ]]; then
+            # 先留一份列表, 让用户知道哪些链接失效了
+            if (( revoked == 0 )); then
+                echo "  [注意] $tag 已存在旧链接, 重建会让它们立即失效 (404):" >&2
+            fi
+            echo "    - $(basename "$f" .json)" >&2
+            rm -f "$f"; revoked=$((revoked+1))
+        fi
     done
+    (( revoked > 0 )) && print_warn "已作废 $revoked 个旧链接"
     token=$(openssl rand -hex 16)      # 128-bit 密码学随机
     now=$(date +%s)
     # ttl=0 => 永久 (expires_at=0 表示永不过期; 服务端 0 跳过过期检查)
