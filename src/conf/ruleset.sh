@@ -59,7 +59,16 @@ apply_edit() {
         print_error "已回滚（check 未通过）"
         return 1
     fi
-    sb_reload; return 0
+    # 关键: 必须把 reload 的成败如实往上带。
+    # 旧实现 `sb_reload; return 0` 无视结果, 于是 reload 失败时调用方照样打印
+    # "[OK] 规则已添加" —— 同一屏上 "[Error] 服务异常" 与 "[OK]" 自相矛盾,
+    # 而配置其实已经写盘、服务正在崩溃重启循环里。
+    if ! sb_reload; then
+        echo "$old" | jq . > "$file"
+        print_error "服务未能加载新配置, 已回滚 (文件已还原)"
+        return 1
+    fi
+    return 0
 }
 
 # ---------- add ----------
@@ -228,15 +237,27 @@ route_menu() {
     read -r -p "选择: " c; c=$(clean_input "$c")
     case "$c" in
         1) init_route ;;
-        2)
-            read -r -p "rule_set tag: " tag
-            apply_edit "$ROUTE_FILE" --arg t "$tag" '.route.rules += [{ "rule_set": [$t], "outbound": "direct" }]' \
-                && print_ok "规则已添加"
-            ;;
-        3)
-            read -r -p "rule_set tag: " tag
-            apply_edit "$ROUTE_FILE" --arg t "$tag" '.route.rules += [{ "rule_set": [$t], "action": "reject" }]' \
-                && print_ok "规则已添加"
+        2|3)
+            [[ "$c" == 2 ]] && L="添加规则 (rule_set 出站 direct)" || L="添加 reject 规则"
+            read -r -p "rule_set tag: " tag; tag=$(clean_input "$tag")
+            # 关键: sing-box check 查不出 route.rules[].rule_set 引用的 tag 是否存在
+            # (实测 exit=0), 但运行期会 FATAL "rule-set not found" 让服务永久崩溃重启。
+            # 所以必须在写盘前自己拦。
+            if [[ -z "$tag" ]]; then print_error "tag 不能为空"; return 0; fi
+            if ! sb_ruleset_defined "$tag"; then
+                print_error "规则集未定义: $tag"
+                print_error "sing-box check 查不出这类错误, 但服务会崩溃重启, 因此已阻止"
+                print_info "已定义的规则集: $(jq -r '.route.rule_set[]?.tag' "$SB_RS_FILE" 2>/dev/null | tr "\n" " ")"
+                print_info "可先用本菜单「4) 添加规则集」创建它"
+                return 0
+            fi
+            if [[ "$c" == 2 ]]; then
+                apply_edit "$ROUTE_FILE" --arg t "$tag" '.route.rules += [{ "rule_set": [$t], "outbound": "direct" }]' \
+                    && print_ok "规则已添加"
+            else
+                apply_edit "$ROUTE_FILE" --arg t "$tag" '.route.rules += [{ "rule_set": [$t], "action": "reject" }]' \
+                    && print_ok "规则已添加"
+            fi
             ;;
         4)
             read -r -p "rule_set tag: " tag

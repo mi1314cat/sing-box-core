@@ -881,7 +881,15 @@ delete_config() {
     fi
     case "$otype" in
         direct|block) print_info "$otype 为特殊出站, 跳过连通性自检" ;;
-        *) selftest_outbound "$file" "$tag" 2 || print_warn "$tag 自检失败 (下面会把引用它的规则改回 direct)" ;;
+        *) selftest_outbound "$file" "$tag" 2 || {
+                # 不要无条件承诺"会把规则改回 direct": 没有任何规则引用它时这句话
+                # 与结尾的"没有规则引用它, 无需改写路由"同屏自相矛盾
+                if (( refs > 0 )); then
+                    print_warn "$tag 自检失败, 下面会把引用它的 $refs 条规则改回 direct"
+                else
+                    print_warn "$tag 自检失败 (没有规则引用它, 路由无需改写)"
+                fi
+            } ;;
     esac
     rm -f "$file"
     # 关键: 用户同意删除时, 引用保护必须真的执行, 且与自检成败无关。
