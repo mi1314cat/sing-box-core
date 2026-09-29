@@ -105,7 +105,13 @@ ob_ask_optional() { # 可选文本, 回车用默认(可为空)
 
 ob_ask_yesno() { # ob_ask_yesno <提示> <默认 y|n>
     local p="$1" d="$2" a
-    sb_ask "$p"; a="$REPLY"
+    # 必须区分"用户回车用默认"和"stdin 已 EOF"：
+    # 旧实现两者都得到空串 -> 一律取默认, stdin 提前结束时等于未经确认就写盘 (fail-open)。
+    if ! sb_ask "$p"; then
+        print_warn "输入已结束, 按 [N] 处理 (不执行写操作)"
+        return 1
+    fi
+    a="$REPLY"
     a=$(clean_input "$a"); [[ -z "$a" ]] && a="$d"
     [[ "$a" =~ ^[yY] ]]
 }
@@ -479,6 +485,15 @@ ob_uri_parser() {
 OB_REMOTE_PY="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/outbound_remote.py"
 OB_REMOTE_URL="https://raw.githubusercontent.com/mi1314cat/sing-box-core/main/src/conf/outbound_remote.py"
 
+# 面板以 python3 "$py" 方式调用, 可执行位非必需; 但自愈下载/解压出来的文件
+# 可能缺权限, 这里统一补上, 便于直接 ./执行排查问题
+ob_fix_py_perm() {
+    local p
+    for p in "$SB_CONF_DIR"/outbound_remote.py "$SB_CONF_DIR"/outbound_uri.py; do
+        [[ -f "$p" ]] && chmod 755 "$p" 2>/dev/null
+    done
+}
+
 ob_remote_parser() {
     if [[ ! -f "$OB_REMOTE_PY" ]]; then
         print_info "远程配置拉取器缺失, 正在拉取..."
@@ -627,7 +642,7 @@ ob_commit_multi() { # ob_commit_multi <outbounds-json-array> <主tag> [条数]
     fi
     sb_reload || true
     SB_LAST_OUT_FILE="${files[0]}"; SB_LAST_OUT_TAG="$main_tag"
-    print_ok "出站已添加: $main_tag  (${#files[@]} 个文件: $(printf '%s ' "${files[@]##*/}")"
+    print_ok "出站已添加: $main_tag  (${#files[@]} 个文件: $(printf '%s ' "${files[@]##*/}"))"
     [[ "$cnt" -gt 1 ]] && print_info "  其中包含随附的依赖出站 (detour 组合), 已一并写入"
     print_info "接下来: 5) 用于域名分流   8) 绑定到入站   10) 做连通性自检"
 }
@@ -721,18 +736,23 @@ remote_add() {
         [[ -n "$sel" ]] || { print_error "编号超出范围 (可选 1-$total)"; rm -f "$cache"; return 1; }
         if [[ "$(printf '%s' "$sel" | jq -r '.valid')" != "true" ]]; then
             print_error "该出站在本机内核上不可用, 已放弃导入:"
-            print_error "  $(printf '%s' "$sel" | jq -r '.tag') ($(.type)): \($err // .err)'" 2>/dev/null
+            # 原这行第二个括号没闭合, bash 把 $(( ... )) 当成算术展开,
+            # 界面会漏出 "line NNN: .type: command not found"。下面这行才是实际输出。
             printf '%s' "$sel" | jq -r '"  " + .tag + " (" + .type + "): " + (.err // "?")' >&2
             rm -f "$cache"; return 1
         fi
         picks=$(printf '%s' "$sel" | jq -r '.tag')
     else
         # 直接输入 tag: 必须确认它确实存在, 否则后面会一路走到"列表非法"并泄漏内部报错
+        # 输入既不是编号也不是已存在的 tag -> 统一按"编号不合法"提示,
+        # 而不是回一句"没有这个 tag", 会让人以为自己输入的 tag 有拼写问题
         if [[ "$c" =~ ^[0-9]+$ ]]; then
-            print_error "编号必须是非负整数 (可选 1-$total, 或输入 all)"; rm -f "$cache"; return 1
+            print_error "编号超出范围 (可选 1-$total, 或输入 all, 或 0 取消)"
+            rm -f "$cache"; return 1
         fi
         if [[ "$(printf '%s' "$res" | jq -r --arg t "$c" '[.nodes[]|select(.tag==$t)]|length')" == "0" ]]; then
-            print_error "远程配置里没有标识为 $c 的出站; 请从上面清单里选编号"
+            print_error "无效输入: $c"
+            print_error "请输入列表里的编号 (1-$total), 或 all, 或 0 取消; 也可直接输入清单里存在的 tag"
             rm -f "$cache"; return 1
         fi
         picks="$c"

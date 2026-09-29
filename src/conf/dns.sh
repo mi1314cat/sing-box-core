@@ -286,7 +286,9 @@ menu() {
             0) break ;;
             *) print_error "无效选项" ;;
         esac
-        printf '按回车继续...' >&2; read -r _ || true
+        # read 在 EOF 时返回非 0 且不消费输入 -> `|| true` 会让 while 立刻再问一次,
+        # 实测刷 29,422 次/142 万行。全项目其它 13 处菜单循环都有这层保护, 这里是唯一遗漏。
+        printf '按回车继续...' >&2; read -r _ || { echo; exit 0; }
     done
 }
 

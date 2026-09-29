@@ -41,9 +41,19 @@ ensure_files() {
 
 # 通用编辑: rs_edit <file> <filter-file>
 apply_edit() {
-    local file="$1" filter="$2"
+    # 调用处形如 apply_edit <file> --arg t <tag> '<filter>', 因此参数要整体转发给 jq。
+    # 旧实现只接 ($1,$2), --arg 占据了 filter 槽位, 真过滤器被丢弃,
+    # jq 报 "--arg takes two parameters", 路由规则 2/3/4 三个功能全部失效。
+    local file="$1"; shift
+    # 文件不存在时直接报 jq "Could not open file", 用户完全看不懂;
+    # 实际是还没生成骨架, 让他去用「初始化骨架」
+    if [[ ! -f "$file" ]]; then
+        print_error "文件不存在: $file"
+        print_error "请先在本菜单执行「1) 初始化骨架」"
+        return 1
+    fi
     local old; old=$(jq . "$file")
-    if ! write_config "$file" "$(jq "$filter" "$file")"; then print_error "jq 过滤器错误"; return 1; fi
+    if ! write_config "$file" "$(jq "$@" "$file")"; then print_error "jq 过滤器错误"; return 1; fi
     if ! sb_check; then
         echo "$old" | jq . > "$file"
         print_error "已回滚（check 未通过）"
