@@ -66,6 +66,15 @@ def b64d(s):
         raise UriError("base64 解码失败 (%s)" % e)
 
 
+def mask_uuid(u):
+    """UUID 脱敏: 与密码同一口径。保留首尾各 4 位便于人工核对, 中间一律掩码。
+    面板对"列出出站"也只显示"认证=已配置", 这里保持一致。"""
+    u = str(u)
+    if len(u) <= 8:
+        return "******** (已配置)"
+    return "%s****%s (已配置)" % (u[:4], u[-4:])
+
+
 def mask(v):
     """凭据脱敏: 固定长度掩码, 不回显原文也不回显长度
     (回显长度会缩小暴力破解空间, 且与"从远程配置导入"的预览口径不一致)"""
@@ -325,7 +334,7 @@ def parse_vmess(uri, name):
 
     name = (d.get("ps") or "").strip() or name
     preview = [
-        ["UUID", uuid],
+        ["UUID", mask_uuid(uuid)],
         ["加密方式", sec],
         ["alterId", str(aid)],
         ["TLS", "启用 (SNI=%s)" % (sni or "跟随服务器") if tls_on else "未启用"],
@@ -385,7 +394,7 @@ def parse_vless(uri, name):
         ob["transport"] = t
 
     preview = [
-        ["UUID", uuid],
+        ["UUID", mask_uuid(uuid)],
         ["TLS", tls_line],
         ["flow", flow or "无"],
         ["传输", (q1(query, "type") or "tcp")],
@@ -542,7 +551,7 @@ def parse_tuic(uri, name):
         ob["zero_rtt_handshake"] = True
 
     preview = [
-        ["UUID", uuid],
+        ["UUID", mask_uuid(uuid)],
         ["密码", mask(password)],
         ["拥塞控制", ob.get("congestion_control", "内核默认")],
         ["UDP 转发", ob.get("udp_relay_mode", "内核默认")],

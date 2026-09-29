@@ -75,6 +75,13 @@ add_ruleset() {
     esac
     sb_ask "update_interval (默认 1d): "; interval="$REPLY"; interval=${interval:-1d}
 
+    # update_interval 必须是最小单位形式; "0" 会被 sing-box 当成"不再更新"且 check 不报错
+    if [[ ! "$interval" =~ ^[0-9]+(s|m|h|d)$ ]]; then
+        print_error "update_interval 格式应为 30s / 5m / 1h / 1d (收到: $interval)"
+        print_error "填 0 会让该规则集永久不再更新, 因此已拒绝"
+        return 1
+    fi
+
     # 可达性预检: sing-box check 不联网, 坏 URL 只能在运行期暴露, 这里提前告知
     if [[ "$fmt" != "source" || "$url" == *.srs ]]; then
         local code
@@ -120,11 +127,18 @@ del_ruleset() {
         echo "    1) 同时清除这些引用后删除 (推荐)" >&2
         echo "    2) 取消" >&2
         sb_ask "    选择 (默认 1): "
-        [[ "$REPLY" =~ ^2 ]] && { print_warn "已取消"; return 0; }
+        # 原来只有精确的 "2" 才取消, 用户习惯性输入 "n" 反而会执行删除 —— 危险
+        case "$REPLY" in
+            1|y|Y|yes|"") : ;;
+            *) print_warn "已取消"; return 0 ;;
+        esac
     else
         # 无人引用也要确认 —— 规则集删掉后只能重新下载恢复
         sb_ask "  确认删除规则集 $t? [y/N]: "
-        [[ "$REPLY" =~ ^[yY] ]] || { print_warn "已取消"; return 0; }
+        case "$REPLY" in
+            y|Y|yes|YES) : ;;
+            *) print_warn "已取消"; return 0 ;;
+        esac
     fi
     backup_config config
     # 先从 02-rule-set.json 真正移除该定义 (上面的引用扫描只看得到"谁在用", 不含定义本身)
@@ -157,6 +171,11 @@ for f in sorted(os.listdir(cfgdir)):
     try: d=json.load(open(p))
     except Exception: continue
     n=clean(d)
+    # 过滤后数组可能变空; 空数组虽能过 check, 但属于可疑形态, 直接把键删掉更干净
+    if isinstance(n.get("dns"),dict) and n["dns"].get("rules")==[]:
+        n["dns"].pop("rules",None)
+    if isinstance(n.get("route"),dict) and n["route"].get("rules")==[]:
+        n["route"].pop("rules",None)
     if n!=d:
         json.dump(n,open(p,"w"),indent=2); changed.append(f)
 if changed: print("已清理引用: "+", ".join(changed), file=sys.stderr)

@@ -114,15 +114,27 @@ dns_edit() { # dns_edit "<jq-filter>" — check+重载，任一失败回滚到�
 
 add_server() {
     local tag stype server t
-    printf 'server tag (如 dns-ali): ' >&2; read -r tag; tag=$(clean_input "$tag")
-    echo "type: 1)udp 2)tcp 3)tls 4)https 5)h3" >&2
-    printf '选择: ' >&2; read -r t
-    case "$(clean_input "$t")" in tcp=2) ;; esac
+    while true; do
+        sb_ask "  server tag (字母数字/.-, 如 dns-ali): "; tag="$REPLY"
+        [[ -z "$tag" ]] && { print_error "tag 不能为空"; continue; }
+        # tag 是 final / dns.rules[].server 的引用键, 字符集必须与 sing-box 一致
+        [[ "$tag" =~ ^[A-Za-z0-9_.-]{1,32}$ ]] || { print_error "tag 只能含字母数字 _ . - , 最长 32"; continue; }
+        break
+    done
+    echo "  type: 1)udp(默认) 2)tcp 3)tls 4)https 5)h3" >&2
+    sb_ask "  选择 (回车=1): "; t="$REPLY"
     case "$(clean_input "$t")" in
         2) stype=tcp ;; 3) stype=tls ;; 4) stype=https ;; 5) stype=h3 ;; *) stype=udp ;;
     esac
-    printf 'server 地址: ' >&2; read -r server; server=$(clean_input "$server")
-    [[ -z "$server" ]] && { print_error "地址不能为空"; return 1; }
+    while true; do
+        sb_ask "  server 地址 (域名或 IP, 输入 0 放弃): "; server="$REPLY"
+        [[ "$server" == "0" ]] && { print_warn "已放弃添加"; return 1; }
+        [[ -z "$server" ]] && { print_error "地址不能为空 (输入 0 可放弃)"; continue; }
+        # 原来只判空: 整条 URL / "y" / "1080" 都会被静默当成地址写进去
+        [[ "$server" == *://* ]] && { print_error "地址不能带协议前缀 (直接填域名或 IP, 如 223.5.5.5)"; continue; }
+        [[ "$server" =~ ^[A-Za-z0-9._:-]+$ ]] || { print_error "地址含非法字符, 只允许域名 / IPv4 / IPv6[:端口]"; continue; }
+        break
+    done
     jq -r '.dns.servers[].tag // empty' "$DNS_FILE" 2>/dev/null | grep -qx "$tag" && { print_error "tag 已存在: $tag"; return 1; }
     if dns_edit ".dns.servers += [{\"type\":\"$stype\",\"tag\":\"$tag\",\"server\":\"$server\"}]"; then
         print_ok "已添加 $tag ($stype://$server)"
@@ -132,9 +144,36 @@ add_server() {
 del_server() {
     print_title "当前 servers"
     jq -r '.dns.servers[] | "\(.tag)\t\(.type)://\(.server)"' "$DNS_FILE" >&2
-    printf '删除哪个 tag: ' >&2; read -r tag; tag=$(clean_input "$tag")
-    dns_edit --arg t "$tag" '.dns.servers |= map(select(.tag != $t))'
-    print_ok "已删除 $tag"
+    local tag
+    sb_ask "  删除哪个 tag (输入 0 取消): "; tag="$REPLY"
+    tag=$(clean_input "$tag")
+    [[ -z "$tag" || "$tag" == "0" ]] && { print_warn "已取消"; return 0; }
+    jq -e --arg t "$tag" 'any(.dns.servers[]?; .tag == $t)' "$DNS_FILE" >/dev/null 2>&1 \
+        || { print_error "没有这个 DNS 服务器: $tag"; return 1; }
+    # 关键: sing-box check 不校验 final / dns.rules[].server 的 tag 引用是否存在,
+    # 但运行期会 FATAL "default DNS server not found" 导致服务起不来。
+    # 所以必须在写盘前自己拦, 不能指望 check 放行。
+    local fin refs nf
+    fin=$(jq -r '.dns.final // ""' "$DNS_FILE" 2>/dev/null)
+    refs=$(jq -r --arg t "$tag" '[.dns.rules[]? | select(.server? == $t)] | length' "$DNS_FILE" 2>/dev/null || echo 0)
+    if [[ "$fin" == "$tag" ]] || (( refs > 0 )); then
+        print_warn "$tag 仍被引用, 直接删除会让服务启动失败 (sing-box check 查不出来):"
+        [[ "$fin" == "$tag" ]] && print_warn "    dns.final 指向它"
+        (( refs > 0 )) && print_warn "    $refs 条 dns.rules 指向它"
+        echo "    1) 同时改掉这些引用再删除 (推荐)" >&2
+        echo "    2) 取消" >&2
+        sb_ask "    选择 (默认 1): "
+        [[ "$REPLY" =~ ^2 ]] && { print_warn "已取消"; return 0; }
+    fi
+    if dns_edit --arg t "$tag" '
+        .dns.servers |= map(select(.tag != $t))
+        | (if .dns.final == $t then .dns.final = (.dns.servers | map(.tag) | .[0]) else . end)
+        | .dns.rules |= map(select(.server? != $t))'; then
+        nf=$(jq -r '.dns.final // ""' "$DNS_FILE" 2>/dev/null)
+        print_ok "已删除 $tag"
+        [[ "$fin" == "$tag" ]] && print_ok "  dns.final 已改指: $nf"
+        (( refs > 0 )) && print_ok "  $refs 条指向它的 dns.rules 已一并移除"
+    fi
 }
 
 set_final() {
@@ -143,8 +182,34 @@ set_final() {
     dns_edit --arg t "$tag" '.dns.final = $t' && print_ok "final=$tag"
 }
 
+ads_toggle() { # 菜单 5: 依据当前真实状态询问开/关 (原来按 5 直接开, 是单向开关)
+    local cur
+    cur=$(jq -r --arg t "$ADS_TAG" '[.dns.rules[]? | select((.rule_set? // ["-"] | tostring) == ([$t]|tostring))] | length' \
+        "$DNS_FILE" 2>/dev/null || echo 0)
+    if (( cur > 0 )); then
+        echo -e "  ${CYAN}当前状态: 去广告已开启${RESET} (DNS 层 reject $ADS_TAG)" >&2
+    else
+        echo -e "  ${CYAN}当前状态: 去广告已关闭${RESET}" >&2
+    fi
+    echo "    1) 关闭去广告" >&2
+    echo "    2) 开启去广告" >&2
+    sb_ask "    选择 (默认=与当前相反): "
+    local c="$REPLY"
+    if [[ -z "$c" ]]; then
+        if (( cur > 0 )); then c=1; else c=2; fi
+    fi
+    case "$c" in
+        1|off|关) ads_off ;;
+        2|on|开)  ads_on ;;
+        *) print_error "无效选项"; return 1 ;;
+    esac
+}
+
 ads_on() {
     ensure_rule_sets || { print_error "规则集未就绪, 去广告未开启"; return 1; }
+    # 顺带把"规则集定义在、DNS 规则却没了"的孤儿状态补回来
+    # (删掉 geosite-cn 再加回来时, 国内域名会悄悄改走 final 服务器, 而 check 照样通过)
+    sb_ensure_dns_rule "$CN_TAG" '.dns.rules += [{"rule_set":[$t],"server":"dns-local"}]' "-> dns-local" || true
     sb_ruleset_defined "$ADS_TAG" || { print_error "规则集 $ADS_TAG 仍未定义, 去广告未开启 (不会写出无效配置)"; return 1; }
     if dns_edit --arg t "$ADS_TAG" '
         .dns.rules = ([{"rule_set": [$t], "action": "reject"}] + [(.dns.rules // [])[] | select((.rule_set? // ["-x-"] | tostring) != ([$t] | tostring))])'; then
@@ -163,6 +228,18 @@ ads_off() {
         print_warn "      如需一并关闭: 规则集管理 -> 3 路由规则 -> 4 删除规则"
     fi
     sb_check && print_ok "sing-box check 通过"
+}
+
+fakeip_toggle() { # 菜单 6: 依据当前真实状态询问开/关
+    if jq -e 'any(.dns.servers[]?; .tag=="fakeip")' "$DNS_FILE" >/dev/null 2>&1; then
+        echo -e "  ${CYAN}当前状态: FakeIP 已开启${RESET}" >&2
+        echo "    1) 关闭 FakeIP" >&2; echo "    2) 保持开启" >&2
+        sb_ask "    选择 (默认 1): "
+        [[ "$REPLY" == 2 ]] && { print_info "保持开启"; return 0; }
+        fakeip_off; return $?
+    fi
+    echo -e "  ${CYAN}当前状态: FakeIP 未开启${RESET}" >&2
+    fakeip_on
 }
 
 fakeip_on() {
@@ -191,8 +268,8 @@ menu() {
         echo -e "${CYAN}2)${RESET} 添加 DNS 服务器"
         echo -e "${CYAN}3)${RESET} 删除 DNS 服务器"
         echo -e "${CYAN}4)${RESET} 设置 final"
-        echo -e "${CYAN}5)${RESET} 去广告开关 5-on / 5-off"
-        echo -e "${CYAN}6)${RESET} FakeIP 开关 6-on / 6-off"
+        echo -e "${CYAN}5)${RESET} 去广告开关 (会询问开启/关闭)"
+        echo -e "${CYAN}6)${RESET} FakeIP 开关 (会询问开启/关闭)"
         echo -e "${CYAN}0)${RESET} 返回"
         printf '请选择: ' >&2; read -r c
         case "$(clean_input "$c")" in
@@ -200,10 +277,12 @@ menu() {
             2) add_server ;;
             3) del_server ;;
             4) set_final ;;
-            5|5-on) ads_on ;;
-            5-off|5o) ads_off ;;
-            6|6-on) fakeip_on ;;
-            6-off) fakeip_off ;;
+            5-on|on) ads_on ;;
+            5-off|off) ads_off ;;
+            5) ads_toggle ;;
+            6-on|6on) fakeip_on ;;
+            6-off|6off) fakeip_off ;;
+            6) fakeip_toggle ;;
             0) break ;;
             *) print_error "无效选项" ;;
         esac
