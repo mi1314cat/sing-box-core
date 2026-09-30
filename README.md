@@ -41,7 +41,7 @@ bash src/conf/anytls.sh add       # AnyTLS (可选 REALITY; sing-box >=1.12)
 
 ### uTLS 指纹选配
 
-创建 Reality / AnyTLS / VLESS / VMess / Trojan 节点时会询问 uTLS 指纹（ClientHello 伪装），
+创建 Reality / AnyTLS / VLESS / VMess / Trojan / ShadowTLS 节点时会询问 uTLS 指纹（ClientHello 伪装），
 默认 `chrome`，直接回车即用默认值；也支持直接输入英文名，输入非法值自动回落 `chrome`。
 
 可选值（由 sing-box 1.14.2 内核逐个 `sing-box check` **实测**得出，非抄文档）：
@@ -49,6 +49,17 @@ bash src/conf/anytls.sh add       # AnyTLS (可选 REALITY; sing-box >=1.12)
 
 > `randomized-noalpn` / `safari-ios` / `ios_simulator` / `firefox_mozilla` / `opera` / `chrome_v2`
 > 被内核拒绝，故不提供。mihomo 的 `-t` 不校验该字段（乱写也放行），因此以 sing-box 为准。
+
+**不提供指纹选配的协议：**
+
+| 协议 | 原因 |
+|---|---|
+| naive | 内核明确 `uTLS is not supported on naive outbound` |
+| shadowsocks | 无 TLS 层 |
+| hysteria2 / tuic | QUIC 出站，内核运行时返回 `unsupported usage for uTLS`（配置校验阶段放行，实际不可用） |
+
+> hysteria2 / tuic 这一点需要注意：`sing-box check` 对带 utls 的配置**不会报错**，
+> 但实际连接时才失败。因此判断某协议是否支持 uTLS，必须以真实连接为准。
 
 ### 一键生成 / 覆盖重生成 / 清空全部
 
