@@ -257,35 +257,33 @@ ${GREEN}添加节点${RESET}
 ----------------------
 ${GREEN}1.${RESET} 添加 Reality 节点 (VLESS-REALITY/Vision | TLS 或 Reality)
 ${GREEN}2.${RESET} 添加 Hysteria2 节点
-${GREEN}3.${RESET} 添加 AnyReality 节点 (AnyTLS+REALITY · 仅 sing-box 客户端)
-${GREEN}4.${RESET} 添加 AnyTLS 节点 (纯 AnyTLS · mihomo/Clash 也能用)
-${GREEN}5.${RESET} 添加 VLESS 节点 (WS+TLS)
-${GREEN}6.${RESET} 添加 Shadowsocks 节点 (2022)
-${GREEN}7.${RESET} 添加 TUIC 节点 (v5 · 仅 TLS, 不支持 Reality)
-${GREEN}8.${RESET} 添加 VMess 节点 (ws/grpc/h2/tcp + TLS/Reality)
-${GREEN}9.${RESET} 添加 Trojan 节点 (TCP+Reality [默认])
-${GREEN}10.${RESET} 添加 NaiveProxy 节点 (HTTP/2)
-${GREEN}11.${RESET} 添加 ShadowTLS+v3 节点 (内层 SS-2022)
-${GREEN}12.${RESET} 全协议一键生成 (batch · 单端口范围 → 零交互)
-${RED}13.${RESET} 清空全部节点 (批量删除 + 吊销所有分享链接)
+${GREEN}3.${RESET} 添加 AnyTLS 节点 (可选 REALITY · 非 Reality 形态 mihomo 也能用)
+${GREEN}4.${RESET} 添加 VLESS 节点 (WS+TLS)
+${GREEN}5.${RESET} 添加 Shadowsocks 节点 (2022)
+${GREEN}6.${RESET} 添加 TUIC 节点 (v5 · 仅 TLS, 不支持 Reality)
+${GREEN}7.${RESET} 添加 VMess 节点 (ws/grpc/h2/tcp + TLS/Reality)
+${GREEN}8.${RESET} 添加 Trojan 节点 (TCP+Reality [默认])
+${GREEN}9.${RESET} 添加 NaiveProxy 节点 (HTTP/2)
+${GREEN}10.${RESET} 添加 ShadowTLS+v3 节点 (内层 SS-2022)
+${GREEN}11.${RESET} 全协议一键生成 (batch · 单端口范围 → 零交互)
+${RED}12.${RESET} 清空全部节点 (批量删除 + 吊销所有分享链接)
 ${GREEN}0.${RESET} 返回主菜单
 ----------------------"
-    read -r -p "请输入选项 [0-13]: " nchoice || { echo; exit 0; }
+    read -r -p "请输入选项 [0-12]: " nchoice || { echo; exit 0; }
     local module
     case "$nchoice" in
         1) module=reality.sh ;;
         2) module=hysteria2.sh ;;
-        3) module=anyreality.sh ;;
-        4) module=anytls.sh ;;
-        5) module=vless.sh ;;
-        6) module=shadowsocks.sh ;;
-        7) module=tuic.sh ;;
-        8) module=vmess.sh ;;
-        9) module=trojan.sh ;;
-        10) module=naive.sh ;;
-        11) module=shadowtls.sh ;;
-        12) module=batch.sh ;;
-        13) bash "$SELF_DIR/conf/batch.sh" wipe; return ;;
+        3) module=anytls.sh ;;
+        4) module=vless.sh ;;
+        5) module=shadowsocks.sh ;;
+        6) module=tuic.sh ;;
+        7) module=vmess.sh ;;
+        8) module=trojan.sh ;;
+        9) module=naive.sh ;;
+        10) module=shadowtls.sh ;;
+        11) module=batch.sh ;;
+        12) bash "$SELF_DIR/conf/batch.sh" wipe; return ;;
         0) return ;;
         *) print_error "无效选项"; return ;;
     esac

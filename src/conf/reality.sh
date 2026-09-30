@@ -152,12 +152,13 @@ write_out() {
         grpc) transport_block=",\n      \"transport\": { \"type\": \"grpc\", \"service_name\": \"$svc\" }" ;;
         http) transport_block=",\n      \"transport\": { \"type\": \"http\" }" ;;
     esac
-    python3 - "$SB_OUT_DIR/sb_client-$tag.json" "$tag" "$SERVER_IP" "$port" "$uuid" "$sni" "$pbk" "$sid" "$trans" "$svc" <<PYGEN
+    local utls_fp; utls_fp=$(ask_utls_fingerprint)
+    python3 - "$utls_fp" "$SB_OUT_DIR/sb_client-$tag.json" "$tag" "$SERVER_IP" "$port" "$uuid" "$sni" "$pbk" "$sid" "$trans" "$svc" <<PYGEN
 import json,sys
-_,ofile,tag,srv,port,uuid,sni,pbk,sid,trans,svc=sys.argv
+_,fp,ofile,tag,srv,port,uuid,sni,pbk,sid,trans,svc=sys.argv
 ob={"type":"vless","tag":tag,"server":srv,"server_port":int(port),"uuid":uuid,
     "tls":{"enabled":True,"server_name":sni,
-           "utls":{"enabled":True,"fingerprint":"chrome"},
+           "utls":{"enabled":True,"fingerprint":fp},
            "reality":{"enabled":True,"public_key":pbk,"short_id":sid}}}
 if trans=="vision": ob["flow"]="xtls-rprx-vision"
 if trans=="grpc": ob["transport"]={"type":"grpc","service_name":svc}
@@ -177,7 +178,7 @@ proxies:
     reality-opts:
       public-key: $pbk
       short-id: $sid
-    client-fingerprint: chrome
+    client-fingerprint: $utls_fp
 EOF
     echo "$link" | tee "$SB_OUT_DIR/sb_share-$tag.txt" | tail -1
     grep -vF "$link" "$SB_OUT_DIR/sb_links-all.txt" 2>/dev/null > /tmp/l.txt 2>/dev/null && mv /tmp/l.txt "$SB_OUT_DIR/sb_links-all.txt"

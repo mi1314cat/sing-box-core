@@ -14,10 +14,12 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
 SB_LIB="${SB_LIB:-$SELF_DIR/conf/lib.sh}"
 [[ -f "$SB_LIB" ]] && source "$SB_LIB"
 
-# 协议 + Reality 变体说明: reality/anyreality 本身就是 Reality; vmess/trojan 追加 Reality 第二形态
-# anytls = 纯 AnyTLS (不带 REALITY); anyreality = AnyTLS+REALITY (mihomo 不支持, 仅 sing-box 客户端)
-# 两者并存: 保证"一键生成"产出的 anytls 系节点在 mihomo 客户端里也至少有一个能用
-PROTOS=(reality hysteria2 anyreality anytls vless shadowsocks tuic vmess trojan naive shadowtls)
+# 协议 + Reality 变体说明
+#   reality = VLESS+REALITY; vmess/trojan 会追加 Reality 第二形态
+#   anytls  = 同一模块内选配 (默认纯 AnyTLS; 若勾 Reality 则为 AnyTLS+REALITY)
+#   批量里 anytls 走默认形态 (非 Reality), 这样"一键生成"产出的节点
+#   在 mihomo 客户端里也能直接用。
+PROTOS=(reality hysteria2 anytls vless shadowsocks tuic vmess trojan naive shadowtls)
 BATCH_ANSWERS_OVERRIDE=""
 
 latest_file() { ls "$SB_CONFIG_DIR"/${1}-*.json 2>/dev/null | sort | tail -1; }
@@ -35,9 +37,13 @@ wipe_all_nodes() {
     # 早先用黑名单只挡了 00-*, 结果 01-dns.json 被当协议配置删掉,
     # 出站引用的 dns-local 随之消失, sing-box check 直接 FATAL
     # (default domain resolver not found: dns-local)。白名单不会误伤。
+    # 除协议节点外, 端口转发 / 出站也一并清掉:
+    # 它们同样是会对外监听并承载流量的 inbound (portforward 是 type:direct),
+    # 用户"分享的东西暴露了要全部收回"的意图下, 留着它们等于敞着口子。
+    local -a WIPE_EXTRA=(portforward outbound)
     local -a victims=()
     local proto f
-    for proto in "${PROTOS[@]}"; do
+    for proto in "${PROTOS[@]}" "${WIPE_EXTRA[@]}"; do
         for f in "$SB_CONFIG_DIR"/${proto}-*.json; do
             [[ -f "$f" ]] && victims+=("$f")
         done
@@ -49,7 +55,8 @@ wipe_all_nodes() {
     else
         printf "将删除 %d 个协议配置文件:\n" "${#victims[@]}" >&2
         for f in "${victims[@]}"; do printf "  - %s\n" "$(basename "$f")" >&2; done
-        printf "同时删除全部客户端产物 / 分享链接文件, 并吊销所有分享令牌 (旧链接立即 404).\n" >&2
+        printf "同时删除全部客户端产物 / 分享链接文件, 吊销所有分享令牌 (旧链接立即 404),\n" >&2
+        printf "并一并删除端口转发 (portforward) 与出站 (outbound) 配置 —— 它们的端口也会关闭.\n" >&2
         printf "${RED}基础骨架与证书会保留; 之后可重新一键生成.%b\n" "$RESET" >&2
         echo >&2
         read -r -p "确认清空? 输入 yes (其它任何输入=取消): " w
@@ -180,7 +187,10 @@ batch_main() {
         print_title "检测到已存在的协议"
         printf "  %s\n" "${existing[@]}" >&2
         echo >&2
-        printf "覆盖会先删除上述协议的现有节点再重新生成, ${YELLOW}端口/密码/密钥全部更换, 已发出的分享链接会立即失效${RESET}.\n" >&2
+        printf "覆盖会先删除上述协议的现有节点再重新生成。\n" >&2
+        printf "  ${YELLOW}会更换: 监听端口 / password / uuid / 证书 / Reality ShortID${RESET}\n" >&2
+        printf "  ${YELLOW}不会更换: REALITY 长期密钥对 (与 reality.sh 共享, 保持不变)${RESET}\n" >&2
+        printf "  ${YELLOW}结果: 已发出的分享链接会立即失效 (端口/凭据都变了)${RESET}\n" >&2
         # 已显式要求覆盖 (菜单 3 / SB_BATCH_OVERWRITE=1) 就不再问; 否则问一次
         if [[ "${SB_BATCH_OVERWRITE:-0}" == "1" ]]; then
             SB_OVERWRITE=1

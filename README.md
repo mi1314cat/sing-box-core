@@ -29,12 +29,26 @@ bash src/conf/shadowtls.sh add    # ShadowTLS v3 + 内层 SS-2022 (双 inbound)
 bash src/conf/hysteria2.sh add    # Hysteria2 (UDP + 可选端口跳跃/obfs)
 bash src/conf/tuic.sh add         # TUIC v5
 bash src/conf/shadowsocks.sh add  # SS-2022 blake3
-bash src/conf/anyreality.sh add   # AnyTLS + Reality (sing-box >=1.12; 仅 sing-box 客户端)
-bash src/conf/anytls.sh add       # 纯 AnyTLS (无 Reality; sing-box 与 mihomo/Clash 都支持)
+bash src/conf/anytls.sh add       # AnyTLS (可选 REALITY; sing-box >=1.12)
 ```
 
-> `anyreality` = AnyTLS **+REALITY**，mihomo/Clash 官方明确不支持该组合；`anytls` = 纯 AnyTLS，
-> 两端都能用。需要给 mihomo 客户端提供 AnyTLS 节点时用 `anytls`。
+> AnyTLS 早期拆成 `anyreality`(= AnyTLS **+REALITY**) 与 `anytls`(= 纯 AnyTLS) 两个模块，
+> 现已合并为 `anytls`，证书选配方式与 `trojan.sh` 一致：
+> **1) 真证书　2) 自签(pin)　3) Reality**。
+> 选 1/2 的节点两端都能用；**选 3 只能给 sing-box 客户端** ——
+> mihomo/Clash 官方明确不支持 AnyTLS+Reality，该形态不会产出 mihomo YAML。
+> 旧的 `anyreality-NN.json` 在进入菜单时自动改名为 `anytls-NN.json`，端口/证书/密钥/旧链接全部保持有效。
+
+### uTLS 指纹选配
+
+创建 Reality / AnyTLS / VLESS / VMess / Trojan 节点时会询问 uTLS 指纹（ClientHello 伪装），
+默认 `chrome`，直接回车即用默认值；也支持直接输入英文名，输入非法值自动回落 `chrome`。
+
+可选值（由 sing-box 1.14.2 内核逐个 `sing-box check` **实测**得出，非抄文档）：
+`chrome` `firefox` `edge` `safari` `360` `qq` `ios` `android` `random` `randomized`
+
+> `randomized-noalpn` / `safari-ios` / `ios_simulator` / `firefox_mozilla` / `opera` / `chrome_v2`
+> 被内核拒绝，故不提供。mihomo 的 `-t` 不校验该字段（乱写也放行），因此以 sing-box 为准。
 
 ### 一键生成 / 覆盖重生成 / 清空全部
 
@@ -46,8 +60,10 @@ bash src/conf/anytls.sh add       # 纯 AnyTLS (无 Reality; sing-box 与 mihomo
 | batch 菜单 `3)` | 强制覆盖 | 不再询问，直接先删后建。**端口/密码/密钥全部更换，已发出的分享链接立即失效** |
 | `13) 清空全部节点` | 一键删光 | 删掉所有协议配置 + 客户端产物 + 分享令牌（旧链接立即 404），保留基础骨架与证书。需输入 `yes` 确认，失败自动回滚 |
 
-- 一键生成覆盖的协议：`reality` `hysteria2` `anyreality` `anytls` `vless` `shadowsocks` `tuic` `vmess` `trojan` `naive` `shadowtls`（其中 vmess / trojan 还会补 Reality 变体）。
-- 分享链接已发出、怀疑暴露时，用「清空全部节点」一次解决，不必逐个协议手动删。
+- 一键生成覆盖的协议（10 个）：`reality` `hysteria2` `anytls` `vless` `shadowsocks` `tuic` `vmess` `trojan` `naive` `shadowtls`（其中 vmess / trojan 还会补 Reality 变体）。
+- 批量里的 `anytls` 走**默认形态（非 Reality）**，这样一键生成的节点在 mihomo 客户端里也能直接用。
+- 覆盖会更换：监听端口 / password / uuid / 证书 / Reality ShortID。**不会更换** REALITY 长期密钥对（与 `reality.sh` 共享）。旧分享链接因此立即失效。
+- 分享链接已发出、怀疑暴露时，用「清空全部节点」一次解决。它会一并删除**端口转发 `portforward` 与出站 `outbound`** 配置（这两类同样对外监听并承载流量，留在外面等于敞口子），相关端口会真正关闭。
 
 ### Share URL（限次/一次性分发）
 

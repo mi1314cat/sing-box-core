@@ -124,15 +124,16 @@ EOF
     else
         link="trojan://$password@$server_ip:$listen_port?sni=$CERT_DOMAIN&alpn=http/1.1${pin:+&pinSHA256=$pin}#$tag"
     fi
-    python3 - "$SB_OUT_DIR/sb_client-$tag.json" "$tag" "$server_ip" "$listen_port" "$password" "$CERT_DOMAIN" "$pin" "$mode_tls" "${T_RE_PUB-}" "${T_RE_SID-}" <<'PYGEN'
+    local utls_fp; utls_fp=$(ask_utls_fingerprint)
+    python3 - "$utls_fp" "$SB_OUT_DIR/sb_client-$tag.json" "$tag" "$server_ip" "$listen_port" "$password" "$CERT_DOMAIN" "$pin" "$mode_tls" "${T_RE_PUB-}" "${T_RE_SID-}" <<'PYGEN'
 import json,sys
-_,ofile,tag,srv,port,pw,sni,pin,mtype,pub,sid=sys.argv
+_,fp,ofile,tag,srv,port,pw,sni,pin,mtype,pub,sid=sys.argv
 tls={"enabled":True,"server_name":sni}
 if pin: tls["certificate_public_key_sha256"]=pin
 out={"type":"trojan","tag":tag,"server":srv,"server_port":int(port),"password":pw,"tls":tls}
 if pub and sid:
     # reality: 不需要 certificate, 信任来自 REALITY 密钥对 (sing-box 1.14 OutboundRealityOptions)
-    out["tls"]["utls"]={"enabled":True,"fingerprint":"chrome"}
+    out["tls"]["utls"]={"enabled":True,"fingerprint":fp}
     out["tls"]["reality"]={"enabled":True,"public_key":pub,"short_id":sid}
 json.dump({"outbounds":[out]},open(ofile,"w"),indent=2)
 PYGEN

@@ -309,6 +309,45 @@ reality_random_domain() {
 cert_pin_sha256() { openssl x509 -in "$1" -outform der 2>/dev/null | sha256sum | awk '{print tolower($1)}'; }
 
 # sing-box 客户端 tls.certificate_public_key_sha256 期望: base64(sha256(SPKI DER))
+# ---- uTLS 指纹选配 ----
+# 取值不是抄文档: 用 sing-box 1.14.2 内核逐个 `sing-box check` 实测出来的。
+# 实测接受 10 个; randomized-noalpn / safari-ios / ios_simulator /
+# firefox_mozilla / opera / chrome_v2 全部被内核拒绝 (check 退出码非 0)。
+# mihomo 的 -t 不校验这个字段 (连乱写都放行), 所以以 sing-box 为准,
+# 取两者都支持的子集, 保证 sing-box / mihomo 双端产物都合法。
+SB_UTLS_FINGERPRINTS=(chrome firefox edge safari 360 qq ios android random randomized)
+SB_DEFAULT_UTLS_FP="chrome"
+
+ask_utls_fingerprint() { # 输出 uTLS 指纹; 默认 chrome, 非法输入回落 chrome
+    local c
+    if [[ -n "${SB_BATCH:-}" ]]; then
+        echo "$SB_DEFAULT_UTLS_FP"; return
+    fi
+    {
+        echo "uTLS 指纹 (ClientHello 伪装):" >&2
+        local i=1 v
+        for v in "${SB_UTLS_FINGERPRINTS[@]}"; do
+            local mark=" "; [[ "$v" == "$SB_DEFAULT_UTLS_FP" ]] && mark="*"
+            printf "  %s%d) %s\n" "$mark" "$i" "$v" >&2
+            i=$(( i + 1 ))
+        done
+        echo "  * = 默认; 直接回车即选 chrome" >&2
+    }
+    read -r -p "请选择 [1-${#SB_UTLS_FINGERPRINTS[@]}], 回车=chrome]: " c
+    c=$(clean_input "$c")
+    [[ -z "$c" ]] && { echo "$SB_DEFAULT_UTLS_FP"; return; }
+    if [[ "$c" =~ ^[0-9]+$ ]] && (( c >= 1 && c <= ${#SB_UTLS_FINGERPRINTS[@]} )); then
+        echo "${SB_UTLS_FINGERPRINTS[$(( c - 1 ))]}"
+        return
+    fi
+    # 也允许直接输入英文名
+    for v in "${SB_UTLS_FINGERPRINTS[@]}"; do
+        if [[ "${c,,}" == "$v" ]]; then echo "$v"; return; fi
+    done
+    print_warn "无法识别的指纹 '$c', 回落默认: $SB_DEFAULT_UTLS_FP" >&2
+    echo "$SB_DEFAULT_UTLS_FP"
+}
+
 cert_spki_pin_base64() {
     openssl x509 -in "$1" -pubkey -noout 2>/dev/null \
         | openssl pkey -pubin -outform der 2>/dev/null \

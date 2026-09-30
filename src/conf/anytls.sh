@@ -1,22 +1,47 @@
 #!/bin/bash
 # ==============================================================
-# anytls.sh — AnyTLS (纯 AnyTLS, 不带 REALITY) 节点模块
+# anytls.sh — AnyTLS 节点模块 (含 REALITY 选配)
 #
-# 为什么单独建这个模块:
-#   anyreality.sh = AnyTLS + REALITY, 而 mihomo/Clash **明确不支持**
-#   anytls+reality 组合 (官方: "will not support this combination in the
-#   future")。所以此前"一键生成所有协议"产出的 anytls 系节点只有
-#   anyreality 一个, 在 mihomo 客户端里一个都用不了。
-#   本模块生成不带 REALITY 的纯 AnyTLS (自签证书 + SPKI 钉扎),
-#   sing-box 与 mihomo 都能用, 两边都覆盖到。
+# 历史: 本模块原为"纯 AnyTLS"(不含 REALITY), anyreality.sh 单独管
+# AnyTLS+REALITY。现在两者合并 —— 同一个协议, 只是 TLS 模式不同,
+# 拆两个模块/两套编号让用户每次都要先想"我该用哪个"。
+# 现在统一为一个入口, 证书选配方式与 trojan.sh 完全一致:
+#     1) 真证书    2) 自签(pin)    3) Reality
 #
-# 证书: 真证书 / 自签(pin)
+# 关键约束 (决定了为什么要拆出纯 AnyTLS 这一支):
+#   mihomo/Clash **明确不支持 AnyTLS+REALITY**
+#   (官方原文: "Mihomo does not support AnyTLS+Reality, and will not
+#   support this combination in the future")。
+#   所以选 1)/2) 出来的节点两端都能用; 选 3) 只能给 sing-box 客户端,
+#   不会产出 mihomo YAML。
+#
+# 迁移: 旧的 anyreality-NN.json 会在进入菜单时自动改名为 anytls-NN.json
+#       (编号取空位, 端口/证书/密钥全保留, 旧分享链接继续可用)。
 # CLI: bash anytls.sh [add|list|del]
+# 指纹: uTLS 指纹走 lib.sh 的 ask_utls_fingerprint 选配 (默认 chrome)
 # ==============================================================
 source "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/lib.sh"
 
 PROTO="anytls"
 CERT_DIR="$SB_ROOT/cert"
+REALITY_KEYS_FILE="$SB_OUT_DIR/reality-keys.json"
+
+# REALITY 长期密钥对与 reality.sh 共享 (不重复生成)
+ensure_reality_keys() {
+    if [[ -f "$REALITY_KEYS_FILE" ]]; then
+        local p u
+        p=$(jq -r '.private_key // empty' "$REALITY_KEYS_FILE")
+        u=$(jq -r '.public_key  // empty' "$REALITY_KEYS_FILE")
+        [[ -n "$p" && -n "$u" ]] && { REAL_PRIV="$p"; REAL_PUB="$u"; return 0; }
+    fi
+    local kp
+    kp=$("$SB_BIN" generate reality-keypair 2>/dev/null)
+    REAL_PRIV=$(echo "$kp" | grep -oP '^PrivateKey: \K.*')
+    REAL_PUB=$(echo  "$kp" | grep -oP '^PublicKey: \K.*')
+    [[ -n "$REAL_PRIV" && -n "$REAL_PUB" ]] || { print_error "REALITY 密钥生成失败"; return 1; }
+    echo "{\"private_key\":\"$REAL_PRIV\",\"public_key\":\"$REAL_PUB\"}" | jq . > "$REALITY_KEYS_FILE"
+    print_ok "REALITY 密钥已生成: $REALITY_KEYS_FILE"
+}
 
 extract_cert_domain() {
     local crt="$1" dom=""
@@ -25,10 +50,23 @@ extract_cert_domain() {
     echo "$dom"
 }
 
-ask_cert() {  # 输出 CERT_FILE / KEY_FILE / CERT_DOMAIN / CERT_TRUSTED
+ask_cert() {  # 输出 CERT_FILE/KEY_FILE/CERT_DOMAIN/CERT_TRUSTED, 或 TLS_TYPE=reality + T_RE_*
     local c
-    echo "TLS 证书: 1) 真证书 2) 自签(pin) [默认 2]" >&2
-    read -r -p "选择: " c; c=$(clean_input "$c"); [[ -z "$c" ]] && c=2
+    echo "TLS 模式: 1) 真证书  2) 自签(pin)  3) Reality [默认 2]" >&2
+    echo "  (选 3 = AnyTLS+REALITY, 仅 sing-box 客户端可用; mihomo/Clash 不支持该组合)" >&2
+    if [[ -n "${SB_BATCH:-}" ]]; then c=2; else
+        read -r -p "选择: " c; c=$(clean_input "$c"); [[ -z "$c" ]] && c=2
+    fi
+    if [[ "$c" == "3" ]]; then
+        local d sid
+        d=$(safe_read "Reality 握手目标 (统一 domains.sh)" "$(reality_random_domain)")
+        ensure_reality_keys || return 1
+        sid=$(openssl rand -hex 8)
+        CERT_DOMAIN="$d"; CERT_TRUSTED=false; TLS_TYPE="reality"
+        T_RE_PRIV="$REAL_PRIV"; T_RE_PUB="$REAL_PUB"; T_RE_SID="$sid"
+        return 0
+    fi
+    TLS_TYPE="tls"
     if [[ "$c" == "2" ]]; then
         local d; d=$(safe_read "自签伪装域名 (统一 domains.sh)" "$(reality_random_domain)")
         mkdir -p "$CERT_DIR"
@@ -60,6 +98,32 @@ add_config() {
 
     idx=$(get_next_index "$PROTO"); file="$SB_CONFIG_DIR/$PROTO-$idx.json"; tag="${PROTO}${idx}"
     local json
+    if [[ "${TLS_TYPE:-tls}" == "reality" ]]; then
+        json=$(cat <<EOF
+{
+  "inbounds": [
+    {
+      "type": "anytls",
+      "tag": "$tag",
+      "listen": "$listen_ip",
+      "listen_port": $listen_port,
+      "users": [ { "name": "user", "password": "$password" } ],
+      "tls": {
+        "enabled": true,
+        "server_name": "$CERT_DOMAIN",
+        "reality": {
+          "enabled": true,
+          "handshake": { "server": "$CERT_DOMAIN", "server_port": 443 },
+          "private_key": "$T_RE_PRIV",
+          "short_id": [ "$T_RE_SID" ]
+        }
+      }
+    }
+  ]
+}
+EOF
+)
+    else
     json=$(cat <<EOF
 {
   "inbounds": [
@@ -75,6 +139,7 @@ add_config() {
 }
 EOF
 )
+    fi
     backup_config config
     write_config "$file" "$json" || return 1
     if ! sb_check; then
@@ -90,20 +155,36 @@ EOF
     local fp=""; [[ "$CERT_TRUSTED" == "false" ]] && fp=$(cert_fingerprint_hex "$CERT_FILE")
 
     # anytls:// 分享链接 (自签走 pinSHA256, 与 trojan 同一套语义)
-    local link="anytls://$password@$server_ip:$listen_port?sni=$CERT_DOMAIN&insecure=1${pin:+&pinSHA256=$pin}#$tag"
-    [[ "$CERT_TRUSTED" == "true" ]] && link="anytls://$password@$server_ip:$listen_port?sni=$CERT_DOMAIN&insecure=0#$tag"
+    local link
+    if [[ "${TLS_TYPE:-tls}" == "reality" ]]; then
+        link="anytls://$password@$server_ip:$listen_port?sni=$CERT_DOMAIN&insecure=0&pbk=$T_RE_PUB&sid=$T_RE_SID#$tag"
+    elif [[ "$CERT_TRUSTED" == "true" ]]; then
+        link="anytls://$password@$server_ip:$listen_port?sni=$CERT_DOMAIN&insecure=0#$tag"
+    else
+        link="anytls://$password@$server_ip:$listen_port?sni=$CERT_DOMAIN&insecure=1${pin:+&pinSHA256=$pin}#$tag"
+    fi
 
-    python3 - "$SB_OUT_DIR/sb_client-$tag.json" "$tag" "$server_ip" "$listen_port" "$password" "$CERT_DOMAIN" "$pin" <<'PYGEN'
+    local utls_fp; utls_fp=$(ask_utls_fingerprint)
+    python3 - "$utls_fp" "$SB_OUT_DIR/sb_client-$tag.json" "$tag" "$server_ip" "$listen_port" \
+        "$password" "$CERT_DOMAIN" "$pin" "${TLS_TYPE:-tls}" "${T_RE_PUB-}" "${T_RE_SID-}" <<'PYGEN'
 import json,sys
-_,ofile,tag,srv,port,pw,sni,pin=sys.argv
-tls={"enabled":True,"server_name":sni,"alpn":["h2","http/1.1"],
-     "utls":{"enabled":True,"fingerprint":"chrome"}}
-if pin: tls["certificate_public_key_sha256"]=pin
+_,fp,ofile,tag,srv,port,pw,sni,pin,mode,pub,sid=sys.argv
+if mode=="reality":
+    tls={"enabled":True,"server_name":sni,
+         "utls":{"enabled":True,"fingerprint":fp},
+         "reality":{"enabled":True,"public_key":pub,"short_id":sid}}
+else:
+    tls={"enabled":True,"server_name":sni,"alpn":["h2","http/1.1"],
+         "utls":{"enabled":True,"fingerprint":fp}}
+    if pin: tls["certificate_public_key_sha256"]=pin
 out={"type":"anytls","tag":tag,"server":srv,"server_port":int(port),"password":pw,"tls":tls}
 json.dump({"outbounds":[out]},open(ofile,"w"),indent=2)
 PYGEN
 
-    # mihomo 单节点 YAML (纯 AnyTLS 是 mihomo 支持的类型, 走证书钉扎)
+    # mihomo 单节点 YAML —— 仅非 Reality 形态产出。
+    # mihomo/Clash 不支持 AnyTLS+Reality, 生成了也是一份用不了的配置。
+    rm -f "$SB_OUT_DIR/sb_client-$tag.yaml"
+    if [[ "${TLS_TYPE:-tls}" != "reality" ]]; then
     {
         echo "proxies:"
         echo "  - name: $tag"
@@ -119,15 +200,71 @@ PYGEN
         echo "      - h2"
         echo "      - http/1.1"
     } > "$SB_OUT_DIR/sb_client-$tag.yaml"
+    else
+        print_warn "Reality 形态: 已跳过 mihomo YAML (mihomo/Clash 不支持 AnyTLS+Reality)"
+    fi
 
     echo "$link" > "$SB_OUT_DIR/sb_share-$tag.txt"
     grep -vF "$link" "$SB_OUT_DIR/sb_links-all.txt" 2>/dev/null > /tmp/l.$$ && mv /tmp/l.$$ "$SB_OUT_DIR/sb_links-all.txt"
     echo "$link" >> "$SB_OUT_DIR/sb_links-all.txt"
     echo "$link" >&2
-    echo "{\"tag\":\"$tag\",\"port\":$listen_port,\"password\":\"$password\",\"pin\":\"$pin\"}" | jq . > "$SB_OUT_DIR/sb_meta-$tag.json"
+    echo "{\"tag\":\"$tag\",\"port\":$listen_port,\"password\":\"$password\",\"pin\":\"$pin\",\"tls_mode\":\"${TLS_TYPE:-tls}\",\"utls_fingerprint\":\"$utls_fp\"}" | jq . > "$SB_OUT_DIR/sb_meta-$tag.json"
     open_port "$listen_port"
     print_ok "AnyTLS 节点添加完成: $file"
-    print_warn "提示: 纯 AnyTLS (不带 REALITY), sing-box 与 mihomo/Clash 都能用"
+    if [[ "${TLS_TYPE:-tls}" == "reality" ]]; then
+        print_warn "提示: AnyTLS+REALITY 形态, 仅 sing-box 客户端可用 (mihomo/Clash 不支持)"
+    else
+        print_warn "提示: AnyTLS 形态, sing-box 与 mihomo/Clash 都能用 (uTLS 指纹: $utls_fp)"
+    fi
+}
+
+# 旧 anyreality-NN.json → anytls-NN.json 自动改名迁移。
+# 只改名, 不动内容: 端口/证书/REALITY 密钥/分享链接全部保持有效。
+migrate_legacy_anyreality() {
+    local -a olds=( "$SB_CONFIG_DIR"/anyreality-*.json )
+    local f target n
+    for f in "${olds[@]}"; do
+        [[ -f "$f" ]] || continue
+        n=$(basename "$f" .json | cut -d'-' -f2)
+        target="$SB_CONFIG_DIR/anytls-$n.json"
+        if [[ -e "$target" ]]; then
+            # 编号已占用: 往后找一个空位
+            local k
+            for k in $(seq -w 1 99); do
+                [[ -e "$SB_CONFIG_DIR/anytls-$k.json" ]] || { target="$SB_CONFIG_DIR/anytls-$k.json"; break; }
+            done
+        fi
+        if mv "$f" "$target"; then
+            local ot nt
+            ot=$(basename "$f" .json | tr -d '-'); nt=$(basename "$target" .json | tr -d '-')
+            # 文件名改了, 配置内部的 inbound tag 也必须跟着改, 且必须按
+            # **目标文件名**推导 —— 目标编号可能与源编号不同 (源 01 被占用时会挪到 02)。
+            # 早先版本误用源编号 n, 结果两个文件的 tag 都变成 anytls01,
+            # sing-box check 直接因 tag 重复失败。
+            local newtag="$nt" tmpj
+            if [[ -f "$target" ]]; then
+                tmpj=$(mktemp)
+                if jq --arg t "$newtag" '(.inbounds[]? | select(.tag != null) | .tag) = $t' \
+                       "$target" > "$tmpj" 2>/dev/null && [[ -s "$tmpj" ]]; then
+                    mv -f "$tmpj" "$target"
+                else
+                    rm -f "$tmpj"
+                fi
+            fi
+            # 客户端产物跟着改名, 否则旧 tag 的产物会变成孤儿
+            for ext in json yaml; do
+                [[ -f "$SB_OUT_DIR/sb_client-$ot.$ext" ]] && mv -f "$SB_OUT_DIR/sb_client-$ot.$ext" "$SB_OUT_DIR/sb_client-$nt.$ext"
+            done
+            [[ -f "$SB_OUT_DIR/sb_share-$ot.txt" ]] && mv -f "$SB_OUT_DIR/sb_share-$ot.txt" "$SB_OUT_DIR/sb_share-$nt.txt"
+            [[ -f "$SB_OUT_DIR/sb_meta-$ot.json" ]] && mv -f "$SB_OUT_DIR/sb_meta-$ot.json" "$SB_OUT_DIR/sb_meta-$nt.json"
+            # share 元数据里的 tag 也要跟着改
+            [[ -d "$SB_ROOT/share/shares" ]] && grep -l "\"tag\": \"*$ot\"" "$SB_ROOT/share/shares"/*.json 2>/dev/null | \
+                xargs -r sed -i "s/\"tag\": \"$ot\"/\"tag\": \"$nt\"/"
+            print_ok "已迁移: $(basename "$f") → $(basename "$target")  (端口/密钥/链接均不变)"
+        fi
+    done
+    # 旧入口文件不再使用, 留个提示桩避免有人直接调用报错
+    return 0
 }
 
 list_configs() {
@@ -171,7 +308,8 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
         check) sb_check ;;
         *)
             while true; do
-                print_title "AnyTLS 节点管理 (纯 AnyTLS, 不带 REALITY)"
+                migrate_legacy_anyreality
+                print_title "AnyTLS 节点管理 (可选 REALITY)"
                 echo -e "${CYAN}1)${RESET} 添加节点"
                 echo -e "${CYAN}2)${RESET} 列出节点"
                 echo -e "${CYAN}3)${RESET} 删除节点"

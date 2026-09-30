@@ -131,8 +131,10 @@ EOF
         [[ -n "$secpin" ]] && url="$url&pinSHA256=$secpin"
     fi
     url="$url#$tag"
+    local utls_fp; utls_fp=$(ask_utls_fingerprint)
+    export SB_UTLS_FP="$utls_fp"
     python3 - "$SB_OUT_DIR/sb_client-$tag.json" "$tag" "$server_ip" "$listen_port" "$uuid" "$CERT_MODE" "$CERT_DOMAIN" "$ttype" "$tpath" "$svc" "$secpin" "$REAL_PUB" "$sid" "$CERT_FILE" "$DOM" <<'PYGEN'
-import json,sys
+import json,sys,os
 _,ofile,tag,srv,port,uuid,mode,domain,ttype,tpath,svc,pin,pbk,xsid,crt,dom2=sys.argv
 ob={"type":"vmess","tag":tag,"server":srv,"server_port":int(port),"uuid":uuid,"alter_id":0}
 if ttype=="ws": ob["transport"]={"type":"ws","path":tpath}
@@ -144,7 +146,7 @@ if mode=="real":
 elif mode=="selfsign":
     ob["tls"]={"enabled":True,"insecure":True,"server_name":dom2,"certificate_public_key_sha256":pin}
 elif mode=="reality":
-    ob["tls"]={"enabled":True,"server_name":dom2,"utls":{"enabled":True,"fingerprint":"chrome"},
+    ob["tls"]={"enabled":True,"server_name":dom2,"utls":{"enabled":True,"fingerprint":os.environ.get("SB_UTLS_FP","chrome")},
                "reality":{"enabled":True,"public_key":pbk,"short_id":xsid}}
 json.dump({"outbounds":[ob]},open(ofile,"w"),indent=2)
 PYGEN
