@@ -142,9 +142,11 @@ if ttype=="grpc": ob["transport"]={"type":"grpc","service_name":svc}
 if ttype=="http": ob["transport"]={"type":"http"}
 if mode=="real":
     sn = os.popen(f'openssl x509 -in {crt} -noout -ext subjectAltName 2>/dev/null | grep -oE "DNS:[^,]+" | head -1 | cut -d: -f2').read().strip()
-    ob["tls"]={"enabled":True,"insecure":True,"server_name": sn or domain}
+    ob["tls"]={"enabled":True,"insecure":True,"server_name": sn or domain,"utls":{"enabled":True,"fingerprint":os.environ.get("SB_UTLS_FP","chrome")}}
 elif mode=="selfsign":
-    ob["tls"]={"enabled":True,"insecure":True,"server_name":dom2,"certificate_public_key_sha256":pin}
+    ob["tls"]={"enabled":True,"insecure":True,"server_name":dom2,
+               "certificate_public_key_sha256":pin,
+               "utls":{"enabled":True,"fingerprint":os.environ.get("SB_UTLS_FP","chrome")}}
 elif mode=="reality":
     ob["tls"]={"enabled":True,"server_name":dom2,"utls":{"enabled":True,"fingerprint":os.environ.get("SB_UTLS_FP","chrome")},
                "reality":{"enabled":True,"public_key":pbk,"short_id":xsid}}

@@ -55,14 +55,15 @@ EOF
     sb_reload || true
     server_ip=$(safe_read "服务器对外 IP" "$(default_server_ip)")
     local link="shadowtls://$st_password@$server_ip:$listen_port?sni=$rnd&version=3#$tag"
-    python3 - "$SB_OUT_DIR/sb_client-$tag.json" "$tag" "$server_ip" "$listen_port" "$st_password" "$ss_password" "$rnd" <<'PYGEN'
+    local utls_fp; utls_fp=$(ask_utls_fingerprint)
+    python3 - "$utls_fp" "$SB_OUT_DIR/sb_client-$tag.json" "$tag" "$server_ip" "$listen_port" "$st_password" "$ss_password" "$rnd" <<'PYGEN'
 import json,sys
-_,ofile,tag,srv,port,stpw,sspw,sni=sys.argv
+_,fp,ofile,tag,srv,port,stpw,sspw,sni=sys.argv
 # 内层连本机 shadowsocks(127.0.0.1:1080) —— 客户端双 outbound 结构与 fscarmen 一致
 json.dump({"outbounds":[
   {"type":"shadowtls","tag":"shadowtls-out","server":srv,"server_port":int(port),
    "version":3,"password":stpw,
-   "tls":{"enabled":True,"server_name":sni}},
+   "tls":{"enabled":True,"server_name":sni,"utls":{"enabled":True,"fingerprint":fp}}},
   {"type":"shadowsocks","tag":tag,"detour":"shadowtls-out",
    "method":"2022-blake3-aes-128-gcm","password":sspw,
    "multiplex":{"enabled":True,"padding":True}}

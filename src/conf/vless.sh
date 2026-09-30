@@ -81,12 +81,13 @@ EOF
     sb_reload || print_warn "请确认服务状态"
 
     local link="vless://$uuid@$server_ip:$listen_port?encryption=none&security=tls&sni=$CERT_DOMAIN&type=ws&host=$CERT_DOMAIN&path=$path#$tag"
+    local utls_fp; utls_fp=$(ask_utls_fingerprint)
     cat > "$SB_OUT_DIR/sb_client-$tag.json" <<EOF
 {
   "outbounds": [
     { "type": "vless", "tag": "$tag", "server": "$server_ip", "server_port": $listen_port,
       "uuid": "$uuid",
-      "tls": { "enabled": true, "server_name": "$CERT_DOMAIN", "insecure": $( [[ "$CERT_TRUSTED" == "true" ]] && echo false || echo true ) },
+      "tls": { "enabled": true, "server_name": "$CERT_DOMAIN", "insecure": $( [[ "$CERT_TRUSTED" == "true" ]] && echo false || echo true ), "utls": { "enabled": true, "fingerprint": "$utls_fp" } },
       "transport": { "type": "ws", "path": "$path" } }
   ]
 }
@@ -101,6 +102,7 @@ proxies:
     tls: true
     servername: $CERT_DOMAIN
     network: ws
+    client-fingerprint: $utls_fp
     ws-opts:
       path: $path
 EOF
