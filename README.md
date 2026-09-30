@@ -61,6 +61,49 @@ bash src/conf/anytls.sh add       # AnyTLS (可选 REALITY; sing-box >=1.12)
 > hysteria2 / tuic 这一点需要注意：`sing-box check` 对带 utls 的配置**不会报错**，
 > 但实际连接时才失败。因此判断某协议是否支持 uTLS，必须以真实连接为准。
 
+### 客户端产物支持矩阵
+
+产物由 `conf/to_mihomo.py` 生成（菜单 9 → 7 出合并 YAML、→ 8 出全部单节点 YAML）。
+下表是把本项目能产出的全部「协议 × TLS 模式 × 传输」组合喂给各内核实测得出的，
+**不是抄文档**：
+
+| 组合 | sing-box | mihomo | xray |
+|---|:--:|:--:|:--:|
+| Reality（VLESS+REALITY，vision/grpc/http） | ✓ | ✓ | ✓ |
+| VLESS / WS+TLS | ✓ | ✓ | ✓ |
+| Trojan / TLS | ✓ | ✓ | ✓ |
+| AnyTLS / TLS | ✓ | ✓ | ✗ |
+| AnyTLS / Reality | ✓ | ✗ | ✗ |
+| Hysteria2 / TLS | ✓ | ✓ | ✗ |
+| TUIC / TLS | ✓ | ✓ | ✗ |
+| VMess / WS+TLS、VMess / Reality | ✓ | ✓ | ✓ / ✗ |
+| Shadowsocks / SS-2022 | ✓ | ✓ | ✓ |
+| ShadowTLS（内层 SS-2022） | ✓ | ✗ | ✗ |
+| NaiveProxy | ✗ | ✗ | ✗ |
+
+不支持的组合不会产出对应文件，并打印原因：
+
+- **AnyTLS+Reality** — mihomo 官方原文声明不支持且不会支持
+- **ShadowTLS** — mihomo 无此独立出站类型（它只是 ss/vmess 的包装插件）
+- **NaiveProxy** — 见下
+
+### NaiveProxy 在官方 sing-box 上不可用
+
+`sing-box check` 对服务端入站**通过**，节点能建、服务能起，但**客户端产物连不上**：
+
+```
+FATAL initialize outbound[0]: cronet: library not found
+```
+
+原因是构建标签：`sing-box version` 的 Tags 里有 `with_naive_outbound`，
+但**没有 `with_cronet`** —— naive 依赖的 Cronet 库不在官方发布版里。
+这与配置写法无关，换任何 naive 参数都会得到同一句报错。
+
+因此创建 naive 节点后脚本会打印告警。客户端需自行使用带 cronet 的 sing-box 构建。
+
+> 这也是本项目判断协议支持度时坚持「真实连接」而非只看 `check` 的原因：
+> hysteria2/tuic 的 uTLS 和 naive 的 Cronet，都是 `check` 放行、运行时才失败。
+
 ### 一键生成 / 覆盖重生成 / 清空全部
 
 菜单「节点管理」下的入口：
