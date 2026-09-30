@@ -60,11 +60,15 @@ EOF
 import json,sys
 _,fp,ofile,tag,srv,port,stpw,sspw,sni=sys.argv
 # 内层连本机 shadowsocks(127.0.0.1:1080) —— 客户端双 outbound 结构与 fscarmen 一致
+# 外壳 tag 必须带节点 tag (形如 shadowtls01-out): 多个 shadowtls 节点各用
+# 不同端口/密码, 若共用固定 tag, 聚合成一份配置时会互相覆盖, 导致除第一个
+# 以外的节点全部指向错误的外壳而永久连不上。
+SHELL_TAG=tag+"-out"
 json.dump({"outbounds":[
-  {"type":"shadowtls","tag":"shadowtls-out","server":srv,"server_port":int(port),
+  {"type":"shadowtls","tag":SHELL_TAG,"server":srv,"server_port":int(port),
    "version":3,"password":stpw,
    "tls":{"enabled":True,"server_name":sni,"utls":{"enabled":True,"fingerprint":fp}}},
-  {"type":"shadowsocks","tag":tag,"detour":"shadowtls-out",
+  {"type":"shadowsocks","tag":tag,"detour":SHELL_TAG,
    "method":"2022-blake3-aes-128-gcm","password":sspw,
    "multiplex":{"enabled":True,"padding":True}}
 ]},open(ofile,"w"),indent=2)
@@ -74,6 +78,7 @@ PYGEN
     echo "$link" >> "$SB_OUT_DIR/sb_links-all.txt"
     open_port "$listen_port"
     print_ok "ShadowTLS 节点添加完成: $file"
+    gen_mihomo_yaml "$tag"
     print_warn "客户端功能说明: 内层为 2022-blake3-aes-128-gcm(与 sb_client-*.json 一致)"
 }
 

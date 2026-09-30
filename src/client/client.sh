@@ -17,6 +17,103 @@ export TERM="${TERM:-xterm}"
 
 # ---------- 环境 ----------
 if [[ -f /etc/sb-client.env ]]; then source /etc/sb-client.env; fi
+
+# ---------- 下载代理探测 ----------
+# curl 本身支持 http_proxy/https_proxy, 但用户通常只写在 /etc/profile.d/ 下,
+# 而非登录 shell (ssh host 'cmd'、面板内执行、定时任务) 不加载该文件 ——
+# 结果就是本机明明开着代理, 下载却走直连直到超时。
+# 这里主动探测本机常见代理端口, 能用就导出变量, curl 会自动采用。
+# 不覆盖用户显式设置: 已有 http_proxy/https_proxy 时原样交给 curl。
+sb_detect_proxy() {
+    if [[ -n "${https_proxy:-}${http_proxy:-}" ]]; then
+        SB_PROXY_MODE="环境变量 ($(echo "${https_proxy:-$http_proxy}"))"
+        return 0
+    fi
+    local host port code
+    for host in 127.0.0.1 localhost; do
+        for port in 7890 7891 7897 10808 10809 8080 8118 1080 1081 20171 33211; do
+            (exec 3<>"/dev/tcp/$host/$port") 2>/dev/null || continue
+            exec 3<&- 2>/dev/null; exec 3>&- 2>/dev/null
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 \
+                   --proxy "http://$host:$port" https://github.com/ 2>/dev/null)
+            [[ "$code" =~ ^[1-4] ]] || continue
+            export http_proxy="http://$host:$port" https_proxy="http://$host:$port"
+            export all_proxy="http://$host:$port"
+            export no_proxy="127.0.0.1,localhost,::1${no_proxy:+,$no_proxy}"
+            SB_PROXY_MODE="自动探测 $host:$port"
+            return 0
+        done
+    done
+    SB_PROXY_MODE="直连 (未发现本机可用代理)"
+    return 1
+}
+
+# ---------- 客户端下载代理 ----------
+# curl 本身支持 http_proxy/https_proxy, 但很多机器把代理只写在
+# /etc/profile.d/ 下, 而非登录 shell (ssh host 'cmd'、面板内执行、定时任务)
+# 不加载该文件 —— 结果本机明明开着代理, 内核/UI 下载却走直连直到超时。
+#
+# 处理原则:
+#   1. 用户显式设过 http_proxy/https_proxy -> 原样用, 不干预
+#   2. 否则探测本机常见代理端口, 列出可用的让用户选
+#   3. 默认是直连; 没探测到任何代理时不打扰用户
+#   4. 非交互 (无 TTY, 管道/cron) 不提问, 静默直连
+# 只用于客户端安装路径; 服务端不需要, 故不放在 lib.sh。
+SB_PROXY_CANDS=()
+
+sb_proxy_scan() { # 探测本机可用 HTTP 代理, 结果放进 SB_PROXY_CANDS
+    SB_PROXY_CANDS=()
+    [[ -n "${https_proxy:-}${http_proxy:-}" ]] && return 0
+    local host port code
+    for host in 127.0.0.1 localhost; do
+        for port in 7890 7891 7897 10808 10809 8080 8118 1080 1081 20171 33211; do
+            (exec 3<>"/dev/tcp/$host/$port") 2>/dev/null || continue
+            exec 3<&- 2>/dev/null; exec 3>&- 2>/dev/null
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 \
+                   --proxy "http://$host:$port" https://github.com/ 2>/dev/null)
+            # 1xx~4xx 都算可用 (GitHub 会 3xx 重定向); 000 才是不可用
+            [[ "$code" =~ ^[1-4] ]] || continue
+            SB_PROXY_CANDS+=("http://$host:$port")
+        done
+    done
+    return 0
+}
+
+sb_proxy_apply() { # $1 = 代理地址; 空 = 直连
+    if [[ -n "$1" ]]; then
+        export http_proxy="$1" https_proxy="$1" all_proxy="$1"
+        export no_proxy="127.0.0.1,localhost,::1${no_proxy:+,$no_proxy}"
+    fi
+}
+
+sb_pick_proxy() { # 安装时让用户选下载通道; 默认直连
+    # 已显式配置: 不打扰
+    if [[ -n "${https_proxy:-}${http_proxy:-}" ]]; then
+        print_msg "下载通道: 环境变量 ${https_proxy:-$http_proxy}"
+        return 0
+    fi
+    sb_proxy_scan
+    (( ${#SB_PROXY_CANDS[@]} == 0 )) && return 0   # 没代理 -> 静默直连
+    # 非交互: 静默直连
+    [[ -t 0 ]] || return 0
+    print_warn "检测到本机可用代理 (内核/UI 将从 GitHub 下载):"
+    local i c
+    for i in "${!SB_PROXY_CANDS[@]}"; do
+        printf "  %d) 使用 %s\n" "$((i+1))" "${SB_PROXY_CANDS[$i]}" >&2
+    done
+    printf "  0) 不使用代理, 直连 (默认)\n" >&2
+    local c=""
+    read -r -p "请选择下载通道 [0-${#SB_PROXY_CANDS[@]}, 默认 0]: " c || c=""
+    c="${c// /}"
+    if [[ "$c" =~ ^[1-9][0-9]*$ ]] && (( c >= 1 && c <= ${#SB_PROXY_CANDS[@]} )); then
+        sb_proxy_apply "${SB_PROXY_CANDS[$((c-1))]}"
+        print_ok "下载通道: ${SB_PROXY_CANDS[$((c-1))]}"
+    else
+        print_ok "下载通道: 直连"
+    fi
+    return 0
+}
+
 CLIENT_ROOT="${CLIENT_ROOT:-/opt/sb-client}"
 CLIENT_BIN="${CLIENT_BIN:-$CLIENT_ROOT/core/sing-box}"   # 客户端自己配置片段
 CLIENT_CONF="${CLIENT_CONF:-$CLIENT_ROOT/conf}"
@@ -238,13 +335,65 @@ node_count() {
 node_file_count(){ local n=0; for f in "$CLIENT_NODE_DIR"/node-*.json; do [[ -f "$f" ]] && n=$((n+1)); done; echo "$n"; }
 
 # ---------- install: 单独下载内核到 client 目录 ----------
+# ---------- 卸载 ----------
+# 服务端有 uninstall.sh, 客户端此前没有卸载入口 —— 换机/重装时只能手工清理。
+# 这里补上, 与服务端行为对齐: 停服务 -> 删 unit -> 删目录 -> 删入口脚本。
+do_uninstall() {
+    print_title "SB-Panel 客户端卸载"
+    echo "将停止/移除:" >&2
+    echo "  - 服务 $SB_UNIT_NAME / $SB_UNIT_ADHOC" >&2
+    echo "  - /etc/systemd/system/$SB_UNIT_NAME.service" >&2
+    echo "  - $CLIENT_ROOT (内核/节点/配置/Web UI)" >&2
+    echo "  - /usr/local/bin/sb-client" >&2
+    echo "  - /etc/sb-client.env" >&2
+    echo "" >&2
+    echo -e "${GREEN}绝不触碰:${RESET}" >&2
+    echo "  - 本机其它服务 (xray/mihomo/docker 等) 均不动" >&2
+    echo "  - 本机其它代理/面板目录均不动" >&2
+    echo "" >&2
+    local a
+    read -r -p "确认执行完整卸载? 输入 yes 继续: " a
+    [[ "$(echo "$a" | tr A-Z a-z)" == "yes" ]] || { print_warn "已取消"; return 1; }
+    local s
+    for s in "$SB_UNIT_NAME" "$SB_UNIT_ADHOC"; do
+        systemctl stop "$s" 2>/dev/null || true
+        systemctl disable "$s" 2>/dev/null || true
+        rm -f "/etc/systemd/system/$s.service"
+    done
+    systemctl daemon-reload 2>/dev/null
+    print_ok "systemd 单元已清除"
+    local b
+    read -r -p "是否删除 $CLIENT_ROOT 目录 (内核/节点/配置/UI)? [y/N]: " b
+    case "$(echo "$b" | tr A-Z a-z)" in
+        y*|yes*)
+            rm -rf "$CLIENT_ROOT" && print_ok "已删除 $CLIENT_ROOT"
+            rm -f /usr/local/bin/sb-client /etc/sb-client.env
+            print_ok "已删除 /usr/local/bin/sb-client"
+            ;;
+        *) print_warn "保留: $CLIENT_ROOT (可手动恢复)" ;;
+    esac
+    echo
+    print_ok "SB-Panel 客户端卸载完成 (本机其它服务未受影响)"
+}
+
 do_install() {
     local ver_url arch
     arch=$(uname -m); case "$arch" in x86_64) arch=amd64 ;; aarch64) arch=arm64 ;; *) print_err "arch=$arch"; return 1 ;; esac
     mkdir -p "$CLIENT_ROOT/core" "$CLIENT_ROOT/nodes" "$CLIENT_ROOT/share-state" "$CLIENT_UI"
     [[ -x "$CLIENT_BIN" ]] && { print_ok "内核已存在: $($CLIENT_BIN version|head -1)"; return 0; }
-    ver_url=$(curl -fsSL --max-time 20 "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | grep -oE '"tag_name": *"[^"]+' | cut -d'"' -f4 | head -1)
-    [[ -n "$ver_url" ]] || { print_err "获取最新版本号失败"; return 1; }
+    # 内核/UI 都要从 GitHub 下载: 让用户选通道 (默认直连; 没探测到代理则不打扰)
+    sb_pick_proxy
+    ver_url=$(curl -fsSL --max-time 20 "https://api.github.com/repos/SagerNet/sing-box/releases/latest" 2>/dev/null | grep -oE '"tag_name": *"[^"]+' | cut -d'"' -f4 | head -1)
+    # 降级: GitHub API 限流 (403) 时, 从 releases/latest 的重定向地址解析版本号
+    if [[ -z "$ver_url" ]]; then
+        ver_url=$(curl -sIL --max-time 20 -o /dev/null -w '%{url_effective}' \
+                  "https://github.com/SagerNet/sing-box/releases/latest" 2>/dev/null \
+                  | sed -E -n 's|.*/tag/v([0-9][^/]*)$|v\1|p')
+    fi
+    if [[ -z "$ver_url" ]]; then
+        print_err "获取最新版本号失败 (GitHub API 可能限流, 请稍后重试或改用直连)"
+        return 1
+    fi
     local tag="$ver_url"
     local ok=0 url vn="${ver_url#v}"
     [[ "$vn" == "$ver_url" ]] && vn="$ver_url"
@@ -851,6 +1000,7 @@ show_panel() {
     ui_menu 12 "配置检查"
     ui_menu 13 "客户端设置 (端口 / Web UI / 占用检测)"
     ui_menu 14 "软重载配置 (零断流)"
+    ui_menu 15 "卸载客户端 (停服务/删目录/删入口)"
     ui_menu  0 "退出"
     ui_rule
     read -r -p "请输入选项: " c || { ui_clear; exit 0; }
@@ -872,6 +1022,7 @@ show_panel() {
         12) check_menu ;;
         13) settings_menu ;;
         14) do_reload ;;
+        15) do_uninstall ;;
         0) ui_clear; exit 0 ;;
         *) print_err "无效选项 $c" ;;
     esac
@@ -885,6 +1036,7 @@ fi
 
 case "${1:-}" in
     install) do_install ;;
+    uninstall) do_uninstall ;;
     init) do_init ;;
     add) shift; add_node "$@" ;;
     list) regen_selector; for f in "$CLIENT_NODE_DIR"/node-*.json; do [[ -f "$f" ]] && echo "$(basename "$f" .json | sed 's/^node-//')"; done ;;

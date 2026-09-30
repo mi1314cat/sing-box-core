@@ -236,6 +236,7 @@ EOF
     echo "$link" >&2
     open_port "$listen_port"
     print_ok "Hysteria2 节点添加完成: $file"
+    gen_mihomo_yaml "$tag"
 }
 
 # ---------- list / del ----------

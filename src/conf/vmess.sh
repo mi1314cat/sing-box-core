@@ -160,6 +160,7 @@ PYGEN
     echo "{\"tag\":\"$tag\",\"port\":$listen_port,\"mode\":\"$CERT_MODE\",\"path\":\"$tpath\",\"svc\":\"$svc\"}" | jq . > "$SB_OUT_DIR/sb_meta-$tag.json"
     open_port "$listen_port"
     print_ok "VMess 节点添加完成: $file"
+    gen_mihomo_yaml "$tag"
 }
 
 list_configs() {

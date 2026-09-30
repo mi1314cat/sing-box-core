@@ -18,6 +18,95 @@ warn(){ printf "${YELLOW}[WARN] %s${PLAIN}\n" "$*"; }
 err(){  printf "${RED}[ERROR] %s${PLAIN}\n" "$*" >&2; }
 die(){  err "$*"; printf "${RED}请根据上面的原因检查后重试。安装没有完成。${PLAIN}\n" >&2; exit 1; }
 
+# 放行一个端口 (ufw / firewalld / iptables); install.sh 不依赖 lib.sh, 故自带一份
+open_port() {
+    local port="$1"
+    # 登记到 .fw-ports, 供卸载时按清单清理 (不扫全表, 避免误删系统规则)
+    if [[ -n "${SRV_ROOT:-}" ]]; then
+        mkdir -p "$SRV_ROOT" 2>/dev/null
+        grep -qxF "$port" "$SRV_ROOT/.fw-ports" 2>/dev/null || echo "$port" >> "$SRV_ROOT/.fw-ports" 2>/dev/null || true
+    fi
+    if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+        ufw allow "$port/tcp" >/dev/null 2>&1 || return 1
+    elif command -v firewall-cmd >/dev/null && firewall-cmd --state 2>/dev/null | grep -q running; then
+        firewall-cmd --zone=public --add-port="$port/tcp" --permanent >/dev/null 2>&1 || return 1
+        firewall-cmd --reload >/dev/null 2>&1
+    elif command -v iptables >/dev/null; then
+        iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null \
+            || iptables -I INPUT -p tcp --dport "$port" -j ACCEPT
+    else
+        return 1   # 没有防火墙工具: 不算失败, 但也无法保证对外
+    fi
+    return 0
+}
+
+
+# ---------- 客户端下载代理 ----------
+# curl 本身支持 http_proxy/https_proxy, 但很多机器把代理只写在
+# /etc/profile.d/ 下, 而非登录 shell (ssh host 'cmd'、面板内执行、定时任务)
+# 不加载该文件 —— 结果本机明明开着代理, 内核/UI 下载却走直连直到超时。
+#
+# 处理原则:
+#   1. 用户显式设过 http_proxy/https_proxy -> 原样用, 不干预
+#   2. 否则探测本机常见代理端口, 列出可用的让用户选
+#   3. 默认是直连; 没探测到任何代理时不打扰用户
+#   4. 非交互 (无 TTY, 管道/cron) 不提问, 静默直连
+# 只用于客户端安装路径; 服务端不需要, 故不放在 lib.sh。
+SB_PROXY_CANDS=()
+
+sb_proxy_scan() { # 探测本机可用 HTTP 代理, 结果放进 SB_PROXY_CANDS
+    SB_PROXY_CANDS=()
+    [[ -n "${https_proxy:-}${http_proxy:-}" ]] && return 0
+    local host port code
+    for host in 127.0.0.1 localhost; do
+        for port in 7890 7891 7897 10808 10809 8080 8118 1080 1081 20171 33211; do
+            (exec 3<>"/dev/tcp/$host/$port") 2>/dev/null || continue
+            exec 3<&- 2>/dev/null; exec 3>&- 2>/dev/null
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 \
+                   --proxy "http://$host:$port" https://github.com/ 2>/dev/null)
+            # 1xx~4xx 都算可用 (GitHub 会 3xx 重定向); 000 才是不可用
+            [[ "$code" =~ ^[1-4] ]] || continue
+            SB_PROXY_CANDS+=("http://$host:$port")
+        done
+    done
+    return 0
+}
+
+sb_proxy_apply() { # $1 = 代理地址; 空 = 直连
+    if [[ -n "$1" ]]; then
+        export http_proxy="$1" https_proxy="$1" all_proxy="$1"
+        export no_proxy="127.0.0.1,localhost,::1${no_proxy:+,$no_proxy}"
+    fi
+}
+
+sb_pick_proxy() { # 安装时让用户选下载通道; 默认直连
+    # 已显式配置: 不打扰
+    if [[ -n "${https_proxy:-}${http_proxy:-}" ]]; then
+        info "下载通道: 环境变量 ${https_proxy:-$http_proxy}"
+        return 0
+    fi
+    sb_proxy_scan
+    (( ${#SB_PROXY_CANDS[@]} == 0 )) && return 0   # 没代理 -> 静默直连
+    # 非交互: 静默直连
+    [[ -t 0 ]] || return 0
+    warn "检测到本机可用代理 (内核/UI 将从 GitHub 下载):"
+    local i c
+    for i in "${!SB_PROXY_CANDS[@]}"; do
+        printf "  %d) 使用 %s\n" "$((i+1))" "${SB_PROXY_CANDS[$i]}" >&2
+    done
+    printf "  0) 不使用代理, 直连 (默认)\n" >&2
+    local c=""
+    read -r -p "请选择下载通道 [0-${#SB_PROXY_CANDS[@]}, 默认 0]: " c || c=""
+    c="${c// /}"
+    if [[ "$c" =~ ^[1-9][0-9]*$ ]] && (( c >= 1 && c <= ${#SB_PROXY_CANDS[@]} )); then
+        sb_proxy_apply "${SB_PROXY_CANDS[$((c-1))]}"
+        ok "下载通道: ${SB_PROXY_CANDS[$((c-1))]}"
+    else
+        ok "下载通道: 直连"
+    fi
+    return 0
+}
+
 deps_check() {
     local miss=() b
     for b in curl git jq openssl python3 tar; do command -v "$b" >/dev/null 2>&1 || miss+=("$b"); done
@@ -143,7 +232,13 @@ EOF
             ok "服务启动"
         else die "sing-box.service 启动失败"; fi
         if systemctl enable -q --now sing-box-share 2>/dev/null && (sleep 1; curl -fsS localhost:9292/status >/dev/null 2>&1); then
-            ok "分享服务 (9292)"
+            # 防火墙必须放行 9292, 否则服务只在 localhost 自检通过, 外部客户端连不上
+            if open_port 9292 >/dev/null 2>&1; then
+                ok "分享服务 (9292, 防火墙已放行)"
+            else
+                warn "分享服务 (9292) 已启动, 但防火墙放行失败"
+                warn "  分享链接仅本机可用; 请手动放行: ufw allow 9292/tcp"
+            fi
         else
             warn "分享服务未启动, 分享链接功能暂不可用 (不影响主面板)。查看: journalctl -u sing-box-share"
         fi
@@ -168,6 +263,7 @@ do_client() {
     ok "项目文件"
     if [[ ! -x "$CLI_ROOT/core/sing-box" ]]; then
         info "正在安装 Sing-box 内核..."
+        sb_pick_proxy
         CLIENT_ROOT="$CLI_ROOT" bash /usr/local/bin/sb-client install >/dev/null 2>&1 || die "Sing-box 内核下载失败"
         ok "Sing-box 核心 ($("$CLI_ROOT/core/sing-box" version 2>/dev/null | head -1))"
     fi

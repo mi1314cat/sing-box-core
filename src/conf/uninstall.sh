@@ -29,6 +29,80 @@ show_impact() {
     echo "" >&2
 }
 
+# 收集 sing-box 自身配置里的所有监听端口 —— 这是"该端口属于本面板"的权威证据。
+# 只看配置, 不看防火墙: 防火墙全表混着系统与其他服务的规则, 无法据此判断归属。
+# 必须在删除 $SB_ROOT 之前调用, 之后配置就没了。
+collect_own_ports() {
+    SB_OWN_PORTS=$(jq -r '.inbounds[]?.listen_port // empty' \
+        "$SB_CONFIG_DIR"/*.json 2>/dev/null | grep -E '^[0-9]+$' | sort -un)
+}
+
+# 清理防火墙 —— 三重校验后才删
+#
+# 安全设计 (曾因扫全表按端口号猜而误删 SSH 规则导致服务器失联):
+#   1. 绝不扫描防火墙全表, 只处理 .fw-ports 登记过的端口。
+#   2. 必须能在 sing-box 配置里查到该端口 —— 查不到 = 无法证明属于本面板 = 不删。
+#      (端口被释放后若被别的服务接管, 配置里就没有它了, 从而不会误删他人规则)
+#   3. sshd 正在监听的端口一律不删; 系统常用端口硬性黑名单。
+#   4. 逐条打印, 输入 yes 才执行。
+clean_fw() {
+    local list="$SB_ROOT/.fw-ports"
+    if [[ ! -f "$list" ]]; then
+        print_warn "未找到端口记录 ($list), 无需清理防火墙"
+        return 0
+    fi
+    collect_own_ports
+    local p
+    local -a deletable=() unverified=()
+    while read -r p; do
+        [[ -n "$p" ]] || continue
+        if ! printf '%s\n' "$SB_OWN_PORTS" | grep -qx "$p"; then
+            unverified+=("$p"); continue
+        fi
+        case "$p" in
+            22|2222|2200|80|443|8080|8443|9090|9900|3389|21|25|53|110|143|465|587|993|995|1433|1521|2049|3306|5432|6379|11211|27017)
+                unverified+=("$p (系统常用端口)"); continue ;;
+        esac
+        local _sshd
+        _sshd=$(ss -Hltnp 2>/dev/null | grep -i sshd | grep -oE ':[0-9]+[[:space:]]' | tr -d ' :')
+        if printf '%s\n' "$_sshd" | grep -qx "$p"; then
+            unverified+=("$p (sshd 正在监听)"); continue
+        fi
+        deletable+=("$p")
+    done < <(tr -d ' \r' < "$list" | grep -E '^[0-9]+$' | sort -un)
+
+    if (( ${#unverified[@]} )); then
+        print_warn "以下端口无法确认属于本面板 (配置中查不到), 已保留不动:"
+        printf "    %s\n" "${unverified[@]}" >&2
+    fi
+    if (( ${#deletable[@]} == 0 )); then
+        print_warn "没有可安全清理的端口, 已跳过"
+        return 0
+    fi
+    print_warn "以下 ${#deletable[@]} 个端口经 sing-box 配置确认属于本面板:"
+    printf "    %s\n" "${deletable[@]}" >&2
+    local a
+    read -r -p "确认删除这些防火墙规则? 输入 yes 继续: " a
+    [[ "$(echo "$a"|tr A-Z a-z)" == "yes" ]] || { print_warn "已取消, 未修改防火墙"; return 0; }
+    local n=0
+    if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+        for p in "${deletable[@]}"; do
+            ufw delete allow "$p/tcp" >/dev/null 2>&1 && n=$((n+1))
+            ufw delete allow "$p/udp" >/dev/null 2>&1 && n=$((n+1))
+        done
+    elif command -v firewall-cmd >/dev/null && firewall-cmd --state 2>/dev/null | grep -q running; then
+        for p in "${deletable[@]}"; do
+            firewall-cmd --zone=public --remove-port="$p/tcp" --permanent >/dev/null 2>&1 && n=$((n+1))
+        done
+        firewall-cmd --reload >/dev/null 2>&1
+    else
+        print_warn "未检测到 ufw/firewalld, 未做修改"
+        return 0
+    fi
+    print_ok "防火墙规则已清理 ($n 条)"
+    print_warn "提示: 若卸载后无法 SSH, 请用云控制台执行 ufw allow <你的SSH端口>/tcp"
+}
+
 do_uninstall() {
     show_impact
     read -r -p "确认执行完整卸载? 输入 yes 继续: [不存在默认输入] " a
@@ -40,6 +114,12 @@ do_uninstall() {
     done
     systemctl daemon-reload
     print_ok "systemd 单元已清除"
+    # 防火墙清理必须在删除目录之前 —— 它要读 config/*.json 判断端口归属
+    read -r -p "是否一并清理防火墙规则 (只删 sing-box 配置中确认属于本面板的端口)? [y/N]: " f
+    case "$(echo "$f"|tr A-Z a-z)" in
+        y*|yes*) clean_fw ;;
+        *) print_warn "保留防火墙规则 (可手动: ufw status 查看)" ;;
+    esac
     read -r -p "是否删除 $SB_ROOT 目录 (含全部节点配置/备份)? [y/N]: " b
     case "$(echo "$b"|tr A-Z a-z)" in
         y*|yes*) rm -rf "$SB_ROOT" && print_ok "已删除 $SB_ROOT" ;;

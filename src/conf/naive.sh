@@ -90,6 +90,7 @@ EOF
     echo "$link" >> "$SB_OUT_DIR/sb_links-all.txt"
     open_port "$listen_port"
     print_ok "NaiveProxy 节点添加完成: $file"
+    gen_mihomo_yaml "$tag"
     # 实测 (sing-box 1.14.2 官方发布版): naive 出站初始化直接失败
     #   FATAL initialize outbound[0]: cronet: library not found
     # 构建标签里只有 with_naive_outbound, 没有 with_cronet —— naive 依赖的

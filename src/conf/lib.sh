@@ -219,8 +219,18 @@ backup_config() { # backup_config config|kernel|all
 }
 
 # ---- 防火墙放行（ufw/firewall-cmd/iptables 三级回退）----
+# 登记本面板放行过的端口; 卸载时 clean_fw 只按这份清单删除,
+# 绝不扫描防火墙全表 (扫描会误删 SSH 等系统规则, 导致失联)
+fw_log_port() {
+    local port="$1"
+    [[ "$port" =~ ^[0-9]+$ ]] || return 0
+    mkdir -p "$SB_ROOT" 2>/dev/null
+    grep -qxF "$port" "$SB_ROOT/.fw-ports" 2>/dev/null || echo "$port" >> "$SB_ROOT/.fw-ports" 2>/dev/null || true
+}
+
 open_port() {
     local port="$1"
+    fw_log_port "$port"
     if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
         ufw allow "$port/tcp" >/dev/null 2>&1
         ufw allow "$port/udp" >/dev/null 2>&1
