@@ -75,43 +75,242 @@ path_view() {
     done
 }
 
-# ---------- 全部 YAML 合并成单一 mihomo/clash 文件 ----------
-merged_yaml() { # 生成 out/sb_client-all.yaml (proxies + PROXY/AUTO 组) — 交给 python 一次性合并
-    local t
-    t=$(yaml_files)
-    [[ -z "$t" ]] && { print_warn "没有任何 YAML 产物 (先添加节点)"; return 1; }
-    local -a yarr=()
-    [[ -n "$t" ]] && mapfile -t yarr <<<"$t"
-    python3 - "$SB_OUT_DIR/sb_client-all.yaml" "${yarr[@]}" <<PY
-import sys, yaml
-out = sys.argv[1]
-proxies, names = [], []
-for f in sys.argv[2:]:
+# ---------- 全部节点合并成单一 mihomo/clash 文件 ----------
+#
+# 修复记录 (三个用户报告的问题):
+#   1) 只合并 sb_client-*.yaml, 而 yaml 只有 reality/ss/trojan/tuic/vless 五个协议产出
+#      -> vmess / hysteria2 / anytls 全部丢失。改为以 sb_client-*.json (sing-box
+#         outbound, 权威数据源) 为准全量转换, 不再依赖各协议脚本是否顺手产出 yaml。
+#   2) yaml.safe_dump 把序列写在缩进 0 (proxies: 换行后 "- name: x" 顶格),
+#      与各协议脚本自己生成的 2 空格风格不一致, 复制粘贴到编辑器里很别扭。
+#      改为自写序列化, 统一 2 空格缩进。
+#   3) mihomo 不支持的节点原先被静默丢弃。这里逐条列出原因, 不假装"全都导出了"。
+#
+# 字段名依据 mihomo 官方文档 (wiki.metacubex.one/en/config/proxies/*) 逐项核对,
+# 不凭记忆书写; mihomo 明确不支持的组合 (AnyTLS+Reality) 一律跳过并说明。
+merged_yaml() { # 生成 out/sb_client-all.yaml (proxies + PROXY/AUTO 组)
+    local -a jarr=()
+    mapfile -t jarr < <(ls "$SB_OUT_DIR"/sb_client-*.json 2>/dev/null | grep -v 'sb_client-all\.json$' | sort)
+    if (( ${#jarr[@]} == 0 )); then
+        print_warn "没有任何客户端产物 sb_client-<tag>.json (先在「节点管理」创建节点)"
+        return 1
+    fi
+    python3 - "$SB_OUT_DIR/sb_client-all.yaml" "$SB_ROOT/cert" "${jarr[@]}" <<'SBYAML'
+import sys, os, json
+
+MISSING_FP = []
+
+def load(paths, certdir):
+    """sing-box outbound -> mihomo proxy dict。返回 (proxies, names, skipped)"""
+    proxies, names, skipped = [], [], []
+    for f in paths:
+        tag = os.path.basename(f)[len("sb_client-"):-len(".json")]
+        try:
+            d = json.load(open(f))
+        except Exception as e:
+            skipped.append((tag, "JSON 解析失败: %s" % e)); continue
+        obs = [o for o in (d.get("outbounds") or [])
+               if o.get("type") not in ("selector", "urltest", "direct", "block", "dns")]
+        if not obs:
+            skipped.append((tag, "文件里没有出站对象")); continue
+        ob = obs[0]
+        p, why = conv(ob, certdir)
+        if p is None:
+            skipped.append((tag, why)); continue
+        if p["name"] in names:
+            p["name"] = p["name"] + "_dup"; skipped.append((tag, "重名, 已改名"))
+        names.append(p["name"]); proxies.append(p)
+    return proxies, names, skipped
+
+def cert_fingerprint(certdir, sni):
+    """取 <certdir>/cert-<sni>.crt 的证书 DER SHA256 (mihomo fingerprint 语义)"""
+    if not certdir or not sni:
+        return ""
+    import ssl as _ssl, hashlib
+    p = os.path.join(certdir, "cert-%s.crt" % sni)
+    if not os.path.isfile(p):
+        return ""
     try:
-        obj = yaml.safe_load(open(f))
-    except Exception as e:
-        print(f"WARN: {f}: {e}", file=sys.stderr); continue
-    for p in (obj.get("proxies") or []):
-        name = p.get("name")
-        if not name or name in names: continue
-        names.append(name); proxies.append(p)
+        pem = open(p).read()
+        der = _ssl.PEM_cert_to_DER_cert(pem)
+        return hashlib.sha256(der).hexdigest()
+    except Exception:
+        return ""
+
+def conv(ob, certdir):
+    """单个 sing-box outbound -> mihomo proxy dict; 不支持则返回 (None, 原因)"""
+    t = ob.get("type"); tag = ob.get("tag")
+    if ob.get("detour"):
+        return None, "detour 外壳 (被别的出站经 detour 引用), 不能单独使用"
+    srv, port = ob.get("server"), ob.get("server_port")
+    if not srv or not port:
+        return None, "缺少 server/server_port"
+    tls = ob.get("tls") or {}
+    reality = tls.get("reality") or {}
+    sni = tls.get("server_name") or tls.get("servername")
+    alpn = tls.get("alpn")
+    fp = ((tls.get("utls") or {}).get("fingerprint")) or None
+    tr = ob.get("transport") or {}
+    net = tr.get("type")
+
+    d = {"name": tag, "server": srv, "port": int(port)}
+
+    if t == "vless":
+        d["type"] = "vless"; d["uuid"] = ob["uuid"]
+        if ob.get("flow"): d["flow"] = ob["flow"]
+    elif t == "vmess":
+        d["type"] = "vmess"; d["uuid"] = ob["uuid"]
+        d["alterId"] = 0; d["cipher"] = "auto"
+    elif t == "trojan":
+        d["type"] = "trojan"; d["password"] = ob["password"]
+    elif t == "anytls":
+        if reality.get("enabled"):
+            # mihomo 官方原文: "Mihomo does not support AnyTLS+Reality, and will not
+            # support this combination in the future."
+            return None, "AnyTLS+Reality —— mihomo 官方明确不支持 (且声明不会支持)"
+        d["type"] = "anytls"; d["password"] = ob["password"]
+    elif t == "hysteria2":
+        d["type"] = "hysteria2"; d["password"] = ob["password"]
+        if ob.get("up_mbps"):   d["up"] = "%d Mbps" % ob["up_mbps"]
+        if ob.get("down_mbps"): d["down"] = "%d Mbps" % ob["down_mbps"]
+        obfs = ob.get("obfs") or {}
+        if obfs.get("type"):
+            d["obfs"] = obfs["type"]; d["obfs-password"] = obfs.get("password", "")
+    elif t == "tuic":
+        d["type"] = "tuic"; d["uuid"] = ob["uuid"]; d["password"] = ob["password"]
+        d["congestion-controller"] = ob.get("congestion_control", "bbr")
+    elif t == "shadowsocks":
+        d["type"] = "ss"; d["cipher"] = ob["method"]; d["password"] = ob["password"]
+        if ob.get("udp_over_tcp"):
+            d["udp-over-tcp"] = True
+    elif t == "naive":
+        return None, "mihomo 无 naive 类型 (官方文档无此页)"
+    elif t == "shadowtls":
+        return None, "mihomo 无 shadowtls 独立出站类型 (它只是 ss/vmess 的包装插件)"
+    else:
+        return None, "mihomo 无 %s 出站类型" % t
+
+    # ---- TLS 段 (仅在真的开了 TLS 时写) ----
+    need_tls = bool(tls.get("enabled"))
+    if need_tls:
+        d["tls"] = True
+        if sni: d["servername"] = sni
+        if alpn: d["alpn"] = list(alpn)
+        if tls.get("insecure"): d["skip-cert-verify"] = True
+        if fp: d["client-fingerprint"] = fp
+        if reality.get("enabled"):
+            # mihomo 文档: reality-opts: {public-key, short-id}
+            ro = {"public-key": reality.get("public_key", "")}
+            if reality.get("short_id"): ro["short-id"] = reality["short_id"]
+            d["reality-opts"] = ro
+        # 自签证书的钉扎:
+        #   sing-box 侧存的是 SPKI 哈希 (tls.certificate_public_key_sha256),
+        #   mihomo 侧字段叫 fingerprint, 但官方定义是 **X.509 证书 DER 的 SHA256**
+        #   (openssl x509 -noout -fingerprint -sha256), 两者不是一回事,
+        #   直接搬过去会让证书钉扎校验失败。这里按 sni 到 cert/ 找证书实算。
+        pin = tls.get("certificate_public_key_sha256")
+        if pin:
+            fp = cert_fingerprint(certdir, sni)
+            if fp:
+                d["fingerprint"] = fp
+            else:
+                d["skip-cert-verify"] = True
+                MISSING_FP.append(tag)
+
+    # ---- 传输层 ----
+    if net in ("ws", "websocket"):
+        d["network"] = "ws"
+        opts = {"path": tr.get("path") or "/"}
+        hdr = (tr.get("headers") or {}).get("Host")
+        if hdr: opts["headers"] = {"Host": hdr}
+        d["ws-opts"] = opts
+    elif net == "grpc":
+        d["network"] = "grpc"
+        d["grpc-opts"] = {"grpc-service-name": tr.get("service_name") or ""}
+    elif net == "http":
+        d["network"] = "http"
+        d["http-opts"] = {"path": [tr.get("path") or "/"]}
+    return d, ""
+
+def dump_scalar(v):
+    if isinstance(v, bool):  return "true" if v else "false"
+    if v is None:           return "null"
+    if isinstance(v, (int, float)): return str(v)
+    s = str(v)
+    # 需要加引号的场景: 空串 / 含 YAML 特殊字符 / 会被误读成别的类型
+    special = set("#&*!|>%@" + chr(96) + chr(39) + chr(34) + "[]{},?-:")
+    if s == "" or s[0] in special or ": " in s or " #" in s \
+       or s in ("true","false","null","yes","no","on","off","~") or s != s.strip():
+        esc = s.replace(chr(92), chr(92)*2).replace(chr(34), chr(92)+chr(34))
+        return chr(34) + esc + chr(34)
+    return s
+
+def emit(node, ind, buf):
+    pad = " " * ind
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if isinstance(v, dict):
+                buf.append("%s%s:" % (pad, k))
+                emit(v, ind + 2, buf)
+            elif isinstance(v, list):
+                buf.append("%s%s:" % (pad, k))
+                emit_list(v, ind + 2, buf)
+            else:
+                buf.append("%s%s: %s" % (pad, k, dump_scalar(v)))
+    elif isinstance(node, list):
+        emit_list(node, ind, buf)
+
+def emit_list(lst, ind, buf):
+    # 关键: 序列项统一缩进 2 格 (proxies: 下是 "  - name: x", 不是顶格 "- name: x")
+    pad = " " * ind
+    for item in lst:
+        if isinstance(item, dict):
+            first = True
+            for k, v in item.items():
+                pre = pad + "- " if first else pad + "  "
+                first = False
+                if isinstance(v, dict):
+                    buf.append("%s%s:" % (pre, k)); emit(v, ind + 4, buf)
+                elif isinstance(v, list):
+                    buf.append("%s%s:" % (pre, k)); emit_list(v, ind + 4, buf)
+                else:
+                    buf.append("%s%s: %s" % (pre, k, dump_scalar(v)))
+        elif isinstance(item, list):
+            buf.append(pad + "-")
+            emit_list(item, ind + 2, buf)
+        else:
+            buf.append("%s- %s" % (pad, dump_scalar(item)))
+
+out     = sys.argv[1]
+certdir = sys.argv[2] if len(sys.argv) > 2 else ""
+proxies, names, skipped = load(sys.argv[3:], certdir)
 if not proxies:
-    sys.exit("no proxies parsed")
-doc = {
-    "mixed-port": 7890,
-    "log-level": "info",
-    "proxies": proxies,
-    "proxy-groups": [
-        {"name":"PROXY","type":"select","proxies": names + ["AUTO"]},
-        {"name":"AUTO","type":"url-test","url":"https://www.gstatic.com/generate_204","interval":300,"proxies": names},
-    ],
-    "rules": ["MATCH,PROXY"],
-}
-yaml.safe_dump(doc, open(out,"w"), sort_keys=False, allow_unicode=True)
-print(f"merged {len(proxies)} proxies -> {out}", file=sys.stderr)
-PY
+    sys.stderr.write("没有任何可转换的节点\n"); sys.exit(1)
+
+doc = {"mixed-port": 7890, "allow-lan": False, "mode": "rule", "log-level": "info",
+       "external-controller": "127.0.0.1:9090",
+       "proxies": proxies,
+       "proxy-groups": [
+           {"name": "PROXY", "type": "select", "proxies": names + ["AUTO"]},
+           {"name": "AUTO", "type": "url-test",
+            "url": "https://www.gstatic.com/generate_204", "interval": 300,
+            "tolerance": 50, "proxies": names},
+       ],
+       "rules": ["MATCH,PROXY"]}
+
+buf = ["# 由 SB-Panel 生成 (菜单 9 -> 7)", "# 源: sb_client-*.json (sing-box outbound) -> mihomo",
+       "# 导入: mihomo/clash 客户端可直接使用本文件; 亦可只取 proxies 段并入自己的配置", ""]
+emit(doc, 0, buf)
+open(out, "w").write("\n".join(buf) + "\n")
+sys.stderr.write("已生成 %s: %d 个节点\n" % (out, len(proxies)))
+for tag, why in skipped:
+    sys.stderr.write("  [跳过] %-16s %s\n" % (tag, why))
+for tag in MISSING_FP:
+    sys.stderr.write("  [注意] %-16s 自签证书钉扎改用 skip-cert-verify (未找到 cert-<sni>.crt 可算 fingerprint)\n" % tag)
+SBYAML
     local rc=$?
-    (( rc == 0 )) || { print_error "合并失败 (pyYAML)"; return 1; }
+    (( rc == 0 )) || { print_error "生成失败"; return 1; }
+    return 0
 }
 
 merged_yaml_view() {
@@ -120,7 +319,8 @@ merged_yaml_view() {
     printf "${MAGENTA}════════ 全部节点合并 (sb_client-all.yaml) ════════%b\n" "$RESET" >&2
     cat "$SB_OUT_DIR/sb_client-all.yaml"
     echo >&2
-    printf "${CYAN}复制路径: %s%b\n" "$SB_OUT_DIR/sb_client-all.yaml" "$RESET" >&2
+    printf "${CYAN}用法: 整份可直接导入 mihomo/clash; 只换节点的话复制 proxies 段, 其余保留自己的${RESET}\n" >&2
+    printf "${CYAN}文件路径: %s%b\n" "$SB_OUT_DIR/sb_client-all.yaml" "$RESET" >&2
 }
 
 # ---------- 菜单 ----------
