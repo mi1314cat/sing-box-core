@@ -53,7 +53,7 @@ add_config() {
     congestion=$(safe_read "拥塞控制 (bbr/cubic/new-reno)" "bbr")
     case "$congestion" in bbr|cubic|new-reno) ;; *) congestion="bbr"; print_warn "未知算法, 已回落 bbr" ;; esac
 
-    idx=$(get_next_index "$PROTO"); file="$SB_CONFIG_DIR/$PROTO-$idx.json"; tag="${PROTO}${idx}"
+    idx=$(get_next_index "$PROTO"); file="$SB_CONFIG_DIR/$PROTO-$idx.json"; tag="${PROTO}${idx}-TLS"   # 名字体现传输方式
     json=$(cat <<EOF
 {
   "inbounds": [

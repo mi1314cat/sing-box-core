@@ -19,8 +19,14 @@ extract_cert_domain() {
 
 ask_tls() { # 输出: CERT_MODE|cert_file|key_file|cert_domain|trusted(0|1) 到 stdout
     echo "TLS 选项: 1) no-TLS(裸 ws) 2) 真证书 3) 自签(pin) 4) Reality (回车=1 no-TLS)" >&2
-    read -r -p "选择 (默认 1): " c
-    c=$(clean_input "$c"); [[ -z "$c" ]] && c=1
+    # 批量生成 Reality 变体时由 batch 显式指定 (依赖应答串会因 safe_read 不消费
+    # 队列而整体错位, 见 batch.sh 注释)。只替换交互输入, 复用下方原有分支。
+    local c
+    if [[ "${SB_FORCE_TLS_REALTY:-}" == "1" ]]; then c=4
+    else
+        read -r -p "选择 (默认 1): " c
+        c=$(clean_input "$c"); [[ -z "$c" ]] && c=1
+    fi
     case "$c" in
         1) echo "none|||" ;;
         3)
@@ -55,7 +61,12 @@ add_config() {
         *) ttype="ws"; tpath=$(safe_read "WS path (默认 /uuid 随机)" "/$(openssl rand -hex 6)") ;;
     esac
 
-    IFS='|' read -r CERT_MODE CERT_FILE KEY_FILE CERT_DOMAIN <<<"$(ask_tls)"
+    # 不用 read 解析: batch 模式会重定义 read 并无视 herestring (旧写法导致
+    # Reality 变体静默退化成无 TLS)。这里用纯参数展开, 对 read 覆盖免疫。
+    local _tls; _tls=$(ask_tls)
+    CERT_MODE="${_tls%%|*}"; _tls="${_tls#*|}"
+    CERT_FILE="${_tls%%|*}"; _tls="${_tls#*|}"
+    KEY_FILE="${_tls%%|*}";  CERT_DOMAIN="${_tls#*|}"
     local uuid; uuid=$(cat /proc/sys/kernel/random/uuid)
     local REAL_PRIV REAL_PUB
     if [[ "$CERT_MODE" == "reality" ]]; then
@@ -69,6 +80,12 @@ add_config() {
 
     local idx file tag json
     idx=$(get_next_index "$PROTO"); file="$SB_CONFIG_DIR/$PROTO-$idx.json"; tag="${PROTO}${idx}"
+    # 名字体现传输方式: ask_tls 决定 reality / selfsign / real / none
+    case "${CERT_MODE:-none}" in
+        reality)       tag="$tag$(tag_form_suffix reality)" ;;
+        selfsign|real) tag="$tag$(tag_form_suffix tls)" ;;
+        *)             tag="$tag$(tag_form_suffix plain)" ;;
+    esac
 
     local base
     base=$(cat <<EOF

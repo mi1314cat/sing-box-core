@@ -32,7 +32,7 @@ add_config() {
            else key=$(openssl rand -base64 32 | tr -d '\n'); fi ;;
     esac
 
-    idx=$(get_next_index "$PROTO"); file="$SB_CONFIG_DIR/$PROTO-$idx.json"; tag="${PROTO}${idx}"
+    idx=$(get_next_index "$PROTO"); file="$SB_CONFIG_DIR/$PROTO-$idx.json"; tag="${PROTO}${idx}-plain"   # 名字体现传输方式
     json=$(cat <<EOF
 {
   "inbounds": [

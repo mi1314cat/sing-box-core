@@ -41,7 +41,7 @@ add_config() {
         CERT_DOMAIN="$d"; CERT_TRUSTED=false
     fi
 
-    idx=$(get_next_index "$PROTO"); file="$SB_CONFIG_DIR/$PROTO-$idx.json"; tag="${PROTO}${idx}"
+    idx=$(get_next_index "$PROTO"); file="$SB_CONFIG_DIR/$PROTO-$idx.json"; tag="${PROTO}${idx}-TLS"   # 名字体现传输方式
     local json
     json=$(cat <<EOF
 {

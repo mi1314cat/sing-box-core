@@ -141,6 +141,19 @@ default_server_ip() { # 优先公网网卡 IPv4
 }
 
 # ---- 协议文件编号: <proto>-NN.json ----
+# 节点名后缀 —— 让用户从名字就能看出传输方式, 不用打开配置去分辨
+#   reality  -> -REALITY
+#   tls      -> -TLS        (自签 / 真证书的 TLS)
+#   其他      -> -plain      (无 TLS)
+# 例: reality01-REALITY, vless01-TLS, vmess01-plain
+tag_form_suffix() {
+    case "$1" in
+        reality) printf -- "-REALITY" ;;
+        tls)     printf -- "-TLS" ;;
+        *)       printf -- "-plain" ;;
+    esac
+}
+
 get_next_index() {
     local proto="$1" used=() i=1 base
     shopt -s nullglob

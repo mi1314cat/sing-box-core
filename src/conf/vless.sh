@@ -55,6 +55,7 @@ add_config() {
     ask_cert || return 1
 
     idx=$(get_next_index "$PROTO"); file="$SB_CONFIG_DIR/$PROTO-$idx.json"; tag="${PROTO}${idx}"
+    tag="$tag$(tag_form_suffix tls)"   # 名字体现传输方式
     local tls_line
     tls_line="\"enabled\": true, \"certificate_path\": \"$CERT_FILE\", \"key_path\": \"$KEY_FILE\", \"alpn\": [\"http/1.1\"]"
 

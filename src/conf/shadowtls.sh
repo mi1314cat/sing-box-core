@@ -19,6 +19,7 @@ add_config() {
     st_password=$(openssl rand -base64 18 | tr -d '/+=' | head -c 20)
     ss_password=$(openssl rand -base64 16 | tr -d '\n')
     idx=$(get_next_index "$PROTO"); file="$SB_CONFIG_DIR/$PROTO-$idx.json"; tag="${PROTO}${idx}"
+    tag="$tag$(tag_form_suffix tls)"   # 名字体现传输方式
 
     local json
     json=$(cat <<EOF

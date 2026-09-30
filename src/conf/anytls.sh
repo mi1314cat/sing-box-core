@@ -55,7 +55,13 @@ ask_cert() {  # 输出 CERT_FILE/KEY_FILE/CERT_DOMAIN/CERT_TRUSTED, 或 TLS_TYPE
     echo "TLS 模式: 1) 真证书  2) 自签(pin)  3) Reality [默认 2]" >&2
     echo "  (选 3 = AnyTLS+REALITY, 仅 sing-box 客户端可用; mihomo/Clash 不支持该组合)" >&2
     if [[ -n "${SB_BATCH:-}" ]]; then c=2; else
-        read -r -p "选择: " c; c=$(clean_input "$c"); [[ -z "$c" ]] && c=2
+        # 批量生成 Reality 变体时由 batch 显式指定 (见 batch.sh 注释);
+        # 只替换交互输入, 复用下方原有 Reality 分支
+        local c
+        if [[ "${SB_FORCE_TLS_REALTY:-}" == "1" ]]; then c=3
+        else
+            read -r -p "选择: " c; c=$(clean_input "$c"); [[ -z "$c" ]] && c=2
+        fi
     fi
     if [[ "$c" == "3" ]]; then
         local d sid
@@ -97,6 +103,8 @@ add_config() {
     ask_cert || return 1
 
     idx=$(get_next_index "$PROTO"); file="$SB_CONFIG_DIR/$PROTO-$idx.json"; tag="${PROTO}${idx}"
+    # 名字体现传输方式: ask_cert 决定 reality 还是 TLS
+    [[ "${TLS_TYPE:-}" == "reality" ]] && tag="$tag$(tag_form_suffix reality)" || tag="$tag$(tag_form_suffix tls)"
     local json
     if [[ "${TLS_TYPE:-tls}" == "reality" ]]; then
         json=$(cat <<EOF

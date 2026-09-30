@@ -79,6 +79,7 @@ add_config() {
 
     idx=$(get_next_index "$PROTO")
     local file="$SB_CONFIG_DIR/$PROTO-$idx.json" tag="${PROTO}${idx}"
+    tag="$tag$(tag_form_suffix reality)"   # 名字体现传输方式
 
     # QA-F1: 服务端 users 必须带与客户端一致的 flow (vision 才有), 否则客户端 flow mismatch 全部不可连
     local FLOW_JSON=""

@@ -19,7 +19,13 @@ extract_cert_domain() {
 
 ask_cert() {  # 输出三种: CERT_FILE+KEY_FILE (TLS) / REALITY_ENV (Reality = TLS enabled false)
     echo "TLS 证书: 1) 真证书 2) 自签(pin) 3) Reality (AnyReality 同款) [默认 2]" >&2
-    read -r -p "选择: " c; c=$(clean_input "$c"); [[ -z "$c" ]] && c=2
+    # 批量生成 Reality 变体时由 batch 显式指定 (见 batch.sh 注释);
+    # 只替换交互输入, 复用下方原有 Reality 分支
+    local c
+    if [[ "${SB_FORCE_TLS_REALTY:-}" == "1" ]]; then c=3
+    else
+        read -r -p "选择: " c; c=$(clean_input "$c"); [[ -z "$c" ]] && c=2
+    fi
     if [[ "$c" == "3" ]]; then
         local dom sni
         dom=$(safe_read "Reality 握手目标 (统一 domains.sh)" "$(random_domain)")
@@ -65,6 +71,8 @@ add_config() {
     ask_cert || return 1
 
     idx=$(get_next_index "$PROTO"); file="$SB_CONFIG_DIR/$PROTO-$idx.json"; tag="${PROTO}${idx}"
+    # ask_cert 已决定: TLS_TYPE=reality 还是 selfsign/real —— 名字体现传输方式
+    [[ "${TLS_TYPE:-}" == "reality" ]] && tag="$tag$(tag_form_suffix reality)" || tag="$tag$(tag_form_suffix tls)"
     local json
     if [[ "${TLS_TYPE:-}" == "reality" ]]; then
         json=$(cat <<EOF

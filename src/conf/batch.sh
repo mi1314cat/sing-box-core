@@ -241,7 +241,6 @@ batch_main() {
 
     # --- Reality 变体补齐 (vmess/trojan 双形态: run2 以 SB_BATCH_ANSWERS 选择 4/3 Reality) ---
     local -a variant_list=(vmess trojan)
-    local -a variant_answers=(";4" "2")
     for i in "${!variant_list[@]}"; do
         local vp="${variant_list[$i]}"
         printf "%b• %s 变体%b ... " "$CYAN" "$vp" "$RESET" >&2
@@ -250,7 +249,11 @@ batch_main() {
             printf "%b[已存在]%b Reality 变体已生成\n" "$YELLOW" "$RESET" >&2
             continue
         }
-        SB_BATCH=1 SB_NO_RELOAD=1 SB_BATCH_ANSWERS="${variant_answers[$i]}" \
+        # 用显式环境变量指定形态, 不用 SB_BATCH_ANSWERS:
+        # safe_read() 在 SB_BATCH 下直接返回默认值且不消费答案队列, 靠应答串
+        # 定位提问会整体错位 (历史上 4 被当成"传输方式", Reality 变体退化成 plain)。
+        # SB_FORCE_TLS_REALTY=1 让 ask_tls/ask_cert 直接选 Reality, 跳过交互。
+        SB_BATCH=1 SB_NO_RELOAD=1 SB_FORCE_TLS_REALTY=1 \
         SB_BATCH_PORT_START="$SB_BATCH_PORT_START" SB_BATCH_PORT_END="$SB_BATCH_PORT_END" \
         timeout 240 bash "$SELF_DIR/conf/${vp}.sh" add </dev/null >/tmp/batch-$vp-v.log 2>&1
         if [[ $? -eq 0 ]]; then
