@@ -15,11 +15,125 @@ SB_LIB="${SB_LIB:-$SELF_DIR/conf/lib.sh}"
 [[ -f "$SB_LIB" ]] && source "$SB_LIB"
 
 # 协议 + Reality 变体说明: reality/anyreality 本身就是 Reality; vmess/trojan 追加 Reality 第二形态
-PROTOS=(reality hysteria2 anyreality vless shadowsocks tuic vmess trojan naive shadowtls)
+# anytls = 纯 AnyTLS (不带 REALITY); anyreality = AnyTLS+REALITY (mihomo 不支持, 仅 sing-box 客户端)
+# 两者并存: 保证"一键生成"产出的 anytls 系节点在 mihomo 客户端里也至少有一个能用
+PROTOS=(reality hysteria2 anyreality anytls vless shadowsocks tuic vmess trojan naive shadowtls)
 BATCH_ANSWERS_OVERRIDE=""
 
 latest_file() { ls "$SB_CONFIG_DIR"/${1}-*.json 2>/dev/null | sort | tail -1; }
 tag_of() { basename "$(latest_file "$1")" .json | tr -d '-'; }
+
+########## 清空全部节点 (wipe) ##########
+# 用途: 分享链接已发出/疑似暴露时, 一次性删光所有节点并吊销全部分享令牌,
+#       避免逐个协议菜单手工 del (shadowtls 还是两个出站, 尤其麻烦)。
+# 安全: 二次确认必须显式输入 yes; 基础骨架 (00-base.json / cert / reality-keys) 保留;
+#       删除后统一 check + reload, 失败则从备份恢复。
+wipe_all_nodes() {
+    mkdir -p "$SB_CONFIG_DIR" "$SB_OUT_DIR"
+    # 按协议白名单收集, 而不是按文件名黑名单。
+    # 基础设施 (00-log/00-route/01-dns/02-rule-set/03-route ...) 不是协议配置,
+    # 早先用黑名单只挡了 00-*, 结果 01-dns.json 被当协议配置删掉,
+    # 出站引用的 dns-local 随之消失, sing-box check 直接 FATAL
+    # (default domain resolver not found: dns-local)。白名单不会误伤。
+    local -a victims=()
+    local proto f
+    for proto in "${PROTOS[@]}"; do
+        for f in "$SB_CONFIG_DIR"/${proto}-*.json; do
+            [[ -f "$f" ]] && victims+=("$f")
+        done
+    done
+
+    print_title "清空全部节点"
+    if (( ${#victims[@]} == 0 )); then
+        print_warn "当前没有协议节点配置, 无需清空"
+    else
+        printf "将删除 %d 个协议配置文件:\n" "${#victims[@]}" >&2
+        for f in "${victims[@]}"; do printf "  - %s\n" "$(basename "$f")" >&2; done
+        printf "同时删除全部客户端产物 / 分享链接文件, 并吊销所有分享令牌 (旧链接立即 404).\n" >&2
+        printf "${RED}基础骨架与证书会保留; 之后可重新一键生成.%b\n" "$RESET" >&2
+        echo >&2
+        read -r -p "确认清空? 输入 yes (其它任何输入=取消): " w
+        if [[ "$(clean_input "$w")" != "yes" ]]; then
+            print_warn "已取消, 未做任何改动"
+            return 0
+        fi
+    fi
+
+    # 自己建备份目录, 不靠 "ls -t 取最新" —— 万一 backup_config 这次没建成,
+    # 取最新会拿到一个**历史**备份, 回滚就会把服务器恢复到一个错误的时间点。
+    local bdir; bdir=$(mktemp -d "$SB_BACKUP_DIR/$(date +%Y%m%d-%H%M%S)-wipe-XXXXXX" 2>/dev/null)
+    if [[ -n "$bdir" && -d "$SB_CONFIG_DIR" ]]; then
+        mkdir -p "$bdir/config"
+        cp -a "$SB_CONFIG_DIR/." "$bdir/config/"
+        print_ok "已备份到: $bdir"
+    else
+        bdir=""
+        print_warn "未创建备份目录; 若清空后校验失败将无法自动回滚"
+    fi
+    backup_config config >/dev/null 2>&1
+    local n=0
+    for f in "${victims[@]}"; do
+        tag=$(basename "$f" .json | tr -d '-')
+        rm -f "$f"
+        # 客户端产物 + 分享链接文件 (tag 形态与 shadowtls 的双出站都覆盖)
+        rm -f "$SB_OUT_DIR/sb_client-$tag.json" "$SB_OUT_DIR/sb_client-$tag.yaml" \
+              "$SB_OUT_DIR/sb_share-$tag.txt" "$SB_OUT_DIR/sb_meta-$tag.json" \
+              "$SB_OUT_DIR/sb_client-$tag.1.json" "$SB_OUT_DIR/sb_client-$tag.2.json"
+        cleanup_node_shares "$tag"
+        n=$(( n + 1 ))
+    done
+    # 兜底: 任何形态的残留产物
+    rm -f "$SB_OUT_DIR"/sb_client-*.json "$SB_OUT_DIR"/sb_client-*.yaml \
+          "$SB_OUT_DIR"/sb_share-*.txt "$SB_OUT_DIR"/sb_meta-*.json \
+          "$SB_OUT_DIR/sb_client-all.json" "$SB_OUT_DIR/sb_client-all.yaml" \
+          "$SB_OUT_DIR/sb_links-all.txt"
+    # 吊销全部分享令牌 (含 all 聚合分享) —— 旧链接立刻失效
+    local shares_dir="$SB_ROOT/share/shares"
+    local revoked=0
+    if [[ -d "$shares_dir" ]]; then
+        for sf in "$shares_dir"/*.json; do
+            [[ -f "$sf" ]] || continue
+            rm -f "$sf"; revoked=$(( revoked + 1 ))
+        done
+    fi
+
+    if ! sb_check; then
+        print_error "清空后配置校验失败, 自动从备份回滚"
+        if [[ -n "$bdir" && -d "$bdir/config" ]]; then
+            rm -f "$SB_CONFIG_DIR"/*.json
+            cp -a "$bdir/config/." "$SB_CONFIG_DIR/"
+            print_ok "已回滚到: $bdir/config"
+            # 节点配置回来了, 但客户端产物/分享令牌已被删除且无法自动重建
+            # (产物是各协议 add_config 时按当时的密钥/密码写出的, 没有"从配置反推"的入口)
+            rm -f "$SB_OUT_DIR"/sb_client-*.json "$SB_OUT_DIR"/sb_client-*.yaml \
+                  "$SB_OUT_DIR"/sb_share-*.txt "$SB_OUT_DIR"/sb_meta-*.json \
+                  "$SB_OUT_DIR/sb_client-all.json" "$SB_OUT_DIR/sb_client-all.yaml" \
+                  "$SB_OUT_DIR/sb_links-all.txt"
+            print_warn "注意: 客户端产物与分享链接已一并清除, 需重新「一键生成」或重新创建分享"
+        else
+            print_error "未找到可用备份, 请手工从 $SB_BACKUP_DIR 恢复"
+        fi
+        sb_check && sb_reload || print_error "回滚后仍异常, 请立即手工检查"
+        return 1
+    fi
+    sb_reload || print_warn "请手动确认服务状态"
+    print_ok "已清空: $n 个节点配置, 吊销 $revoked 个分享令牌 (旧链接已立即失效)"
+}
+
+########## 覆盖模式: 清掉本协议已有配置 ##########
+wipe_proto() { # wipe_proto <proto> —— 覆盖模式下先删该协议全部配置
+    local proto="$1" f n=0
+    for f in "$SB_CONFIG_DIR"/${proto}-*.json; do
+        [[ -f "$f" ]] || continue
+        tag=$(basename "$f" .json | tr -d '-')
+        rm -f "$f"
+        rm -f "$SB_OUT_DIR/sb_client-$tag.json" "$SB_OUT_DIR/sb_client-$tag.yaml" \
+              "$SB_OUT_DIR/sb_share-$tag.txt" "$SB_OUT_DIR/sb_meta-$tag.json"
+        cleanup_node_shares "$tag"
+        n=$(( n + 1 ))
+    done
+    return 0
+}
 
 ########## 主流程 ##########
 batch_main() {
@@ -53,6 +167,42 @@ batch_main() {
     fi
     export SB_BATCH_PORT_START SB_BATCH_PORT_END
     rm -f "$SB_OUT_DIR/.batch-used" "$SB_OUT_DIR/.batch-port"
+
+    # --- 覆盖模式: 跳过已有 (幂等) / 覆盖全部 (先删后建) ---
+    local -a existing=()
+    local ep
+    for ep in "${PROTOS[@]}"; do
+        [[ -n "$(latest_file "$ep")" ]] && existing+=("$ep")
+    done
+    local SB_OVERWRITE=0
+    if (( ${#existing[@]} > 0 )); then
+        echo >&2
+        print_title "检测到已存在的协议"
+        printf "  %s\n" "${existing[@]}" >&2
+        echo >&2
+        printf "覆盖会先删除上述协议的现有节点再重新生成, ${YELLOW}端口/密码/密钥全部更换, 已发出的分享链接会立即失效${RESET}.\n" >&2
+        # 已显式要求覆盖 (菜单 3 / SB_BATCH_OVERWRITE=1) 就不再问; 否则问一次
+        if [[ "${SB_BATCH_OVERWRITE:-0}" == "1" ]]; then
+            SB_OVERWRITE=1
+        else
+            echo >&2
+            read -r -p "如何处理? 1) 跳过已有 (幂等)  2) 覆盖全部 [默认 1]: " oc
+            oc=$(clean_input "$oc"); [[ -z "$oc" ]] && oc=1
+            [[ "$oc" == "2" ]] && SB_OVERWRITE=1
+        fi
+        if (( SB_OVERWRITE )); then
+            print_warn "覆盖模式: 将先删除 ${#existing[@]} 个协议的现有节点"
+            for ep in "${existing[@]}"; do
+                wipe_proto "$ep"
+                printf "  %b✓ %s 已清空%b\n" "$GREEN" "$ep" "$RESET" >&2
+            done
+            # 覆盖后旧令牌已无意义, 全部吊销
+            [[ -d "$SB_ROOT/share/shares" ]] && rm -f "$SB_ROOT/share/shares"/*.json
+        else
+            print_ok "跳过模式: 已存在的协议不会被改动"
+        fi
+    fi
+    export SB_OVERWRITE
 
     backup_config config >/dev/null 2>&1
 
@@ -169,11 +319,15 @@ main() {
         print_title "全协议一键生成 (Batch Generator)"
         echo -e "${CYAN}1)${RESET} 全协议生成 (默认形态; 唯一交互: 端口范围)"
         echo -e "${CYAN}2)${RESET} 全协议生成 (自动端口, 完全无交互)"
+        echo -e "${CYAN}3)${RESET} 全协议生成 (强制覆盖已有协议, 重新生成全部)"
+        echo -e "${RED}4)${RESET} 清空全部节点 (批量删除 + 吊销所有分享链接)"
         echo -e "${CYAN}0)${RESET} 返回"
-        read -r -p "请输入选项 [0-2]: " c || { echo; exit 0; }
+        read -r -p "请输入选项 [0-4]: " c || { echo; exit 0; }
         case "$(clean_input "$c")" in
             1) batch_main ;;
             2) SB_BATCH_AUTO=1 batch_main ;;
+            3) SB_BATCH_OVERWRITE=1 SB_BATCH_AUTO=1 batch_main ;;
+            4) wipe_all_nodes ;;
             0) return ;;
             *) print_error "无效选项" ;;
         esac
@@ -181,4 +335,9 @@ main() {
     done
 }
 
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi
+# CLI 派发: batch.sh wipe  (供 sing-box.sh 菜单直接调用)
+case "${1:-}" in
+    wipe)  wipe_all_nodes ;;
+    main)  main ;;
+    *)     main ;;
+esac

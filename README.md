@@ -29,8 +29,25 @@ bash src/conf/shadowtls.sh add    # ShadowTLS v3 + 内层 SS-2022 (双 inbound)
 bash src/conf/hysteria2.sh add    # Hysteria2 (UDP + 可选端口跳跃/obfs)
 bash src/conf/tuic.sh add         # TUIC v5
 bash src/conf/shadowsocks.sh add  # SS-2022 blake3
-bash src/conf/anyreality.sh add   # AnyTLS + Reality (sing-box >=1.12)
+bash src/conf/anyreality.sh add   # AnyTLS + Reality (sing-box >=1.12; 仅 sing-box 客户端)
+bash src/conf/anytls.sh add       # 纯 AnyTLS (无 Reality; sing-box 与 mihomo/Clash 都支持)
 ```
+
+> `anyreality` = AnyTLS **+REALITY**，mihomo/Clash 官方明确不支持该组合；`anytls` = 纯 AnyTLS，
+> 两端都能用。需要给 mihomo 客户端提供 AnyTLS 节点时用 `anytls`。
+
+### 一键生成 / 覆盖重生成 / 清空全部
+
+菜单「节点管理」下的入口：
+
+| 菜单 | 作用 | 说明 |
+|---|---|---|
+| `12) 全协议一键生成` | 首次生成全部 11 个协议 | 已存在的协议会先问一次：跳过（幂等）或覆盖全部 |
+| batch 菜单 `3)` | 强制覆盖 | 不再询问，直接先删后建。**端口/密码/密钥全部更换，已发出的分享链接立即失效** |
+| `13) 清空全部节点` | 一键删光 | 删掉所有协议配置 + 客户端产物 + 分享令牌（旧链接立即 404），保留基础骨架与证书。需输入 `yes` 确认，失败自动回滚 |
+
+- 一键生成覆盖的协议：`reality` `hysteria2` `anyreality` `anytls` `vless` `shadowsocks` `tuic` `vmess` `trojan` `naive` `shadowtls`（其中 vmess / trojan 还会补 Reality 变体）。
+- 分享链接已发出、怀疑暴露时，用「清空全部节点」一次解决，不必逐个协议手动删。
 
 ### Share URL（限次/一次性分发）
 
