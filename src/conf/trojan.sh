@@ -137,15 +137,7 @@ if pub and sid:
     out["tls"]["reality"]={"enabled":True,"public_key":pub,"short_id":sid}
 json.dump({"outbounds":[out]},open(ofile,"w"),indent=2)
 PYGEN
-    cat > "$SB_OUT_DIR/sb_client-$tag.yaml" <<EOF
-proxies:
-  - name: $tag
-    type: trojan
-    server: $server_ip
-    port: $listen_port
-    password: $password
-    sni: $CERT_DOMAIN
-EOF
+        gen_mihomo_yaml "$tag"
     [[ -n "$pin" ]] && echo "  # 自签: mihomo 需 skip-cert-verify: true" >> "$SB_OUT_DIR/sb_client-$tag.yaml"
     echo "$link" | tee "$SB_OUT_DIR/sb_share-$tag.txt" | tail -1 >&2
     grep -vF "$link" "$SB_OUT_DIR/sb_links-all.txt" 2>/dev/null > /tmp/l.$$ && mv /tmp/l.$$ "$SB_OUT_DIR/sb_links-all.txt"

@@ -64,15 +64,7 @@ EOF
   ]
 }
 EOF
-    cat > "$SB_OUT_DIR/sb_client-$tag.yaml" <<EOF
-proxies:
-  - name: $tag
-    type: ss
-    server: $server_ip
-    port: $listen_port
-    cipher: $method
-    password: "$key"
-EOF
+        gen_mihomo_yaml "$tag"
     echo "$link" | tee "$SB_OUT_DIR/sb_share-$tag.txt" | tail -1 >&2
     grep -vF "$link" "$SB_OUT_DIR/sb_links-all.txt" 2>/dev/null > /tmp/l.$$ && mv /tmp/l.$$ "$SB_OUT_DIR/sb_links-all.txt"
     echo "$link" >> "$SB_OUT_DIR/sb_links-all.txt"

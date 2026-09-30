@@ -92,20 +92,7 @@ EOF
   ]
 }
 EOF
-    cat > "$SB_OUT_DIR/sb_client-$tag.yaml" <<EOF
-proxies:
-  - name: $tag
-    type: vless
-    server: $server_ip
-    port: $listen_port
-    uuid: $uuid
-    tls: true
-    servername: $CERT_DOMAIN
-    network: ws
-    client-fingerprint: $utls_fp
-    ws-opts:
-      path: $path
-EOF
+        gen_mihomo_yaml "$tag"
     [[ "$CERT_TRUSTED" == "false" ]] && echo "# 自签证书: 为 mihomo 加 skip-cert-verify: true" >> "$SB_OUT_DIR/sb_client-$tag.yaml"
     echo "$link" | tee "$SB_OUT_DIR/sb_share-$tag.txt" | tail -1 >&2
     grep -vF "$link" "$SB_OUT_DIR/sb_links-all.txt" 2>/dev/null > /tmp/l.$$ && mv /tmp/l.$$ "$SB_OUT_DIR/sb_links-all.txt"

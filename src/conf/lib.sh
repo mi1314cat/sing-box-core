@@ -714,3 +714,15 @@ sb_ensure_dns_rule() { # <tag> <jq-rule-filter> [说明]
     fi
     return 1
 }
+
+# ---------- 客户端产物 (mihomo YAML) ----------
+# 统一走 conf/to_mihomo.py, 与菜单 9 的合并 YAML 同一套转换逻辑。
+# 各协议脚本不再手写 YAML —— 手写版本曾出现 trojan 漏指纹/漏证书钉扎、
+# vless 漏证书钉扎等问题, 同一份字段写两处必然漂移。
+gen_mihomo_yaml() { # 按 tag 生成/刷新单节点 YAML; mihomo 不支持的组合会删掉旧文件并说明原因
+    local tag="$1"
+    local here; here=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)
+    [[ -f "$SB_OUT_DIR/sb_client-$tag.json" ]] || return 0
+    python3 "$here/to_mihomo.py" --single "$SB_OUT_DIR" "$SB_ROOT/cert" \
+        "$SB_OUT_DIR/sb_client-$tag.json" 2>&1 | grep -v '^已生成单节点' >&2 || true
+}

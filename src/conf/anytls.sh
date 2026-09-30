@@ -185,21 +185,8 @@ PYGEN
     # mihomo/Clash 不支持 AnyTLS+Reality, 生成了也是一份用不了的配置。
     rm -f "$SB_OUT_DIR/sb_client-$tag.yaml"
     if [[ "${TLS_TYPE:-tls}" != "reality" ]]; then
-    {
-        echo "proxies:"
-        echo "  - name: $tag"
-        echo "    type: anytls"
-        echo "    server: $server_ip"
-        echo "    port: $listen_port"
-        echo "    password: $password"
-        echo "    client-fingerprint: chrome"
-        [[ -n "$fp" ]] && echo "    fingerprint: $fp"
-        [[ "$CERT_TRUSTED" == "false" ]] && echo "    skip-cert-verify: true"
-        echo "    sni: $CERT_DOMAIN"
-        echo "    alpn:"
-        echo "      - h2"
-        echo "      - http/1.1"
-    } > "$SB_OUT_DIR/sb_client-$tag.yaml"
+    gen_mihomo_yaml "$tag"
+
     else
         print_warn "Reality 形态: 已跳过 mihomo YAML (mihomo/Clash 不支持 AnyTLS+Reality)"
     fi

@@ -165,21 +165,7 @@ if trans=="grpc": ob["transport"]={"type":"grpc","service_name":svc}
 if trans=="http": ob["transport"]={"type":"http"}
 json.dump({"outbounds":[ob]}, open(ofile,"w"), indent=2)
 PYGEN
-    cat > "$SB_OUT_DIR/sb_client-$tag.yaml" <<EOF
-proxies:
-  - name: $tag
-    type: vless
-    server: $SERVER_IP
-    port: $port
-    uuid: $uuid
-    flow: xtls-rprx-vision
-    tls: true
-    servername: $sni
-    reality-opts:
-      public-key: $pbk
-      short-id: $sid
-    client-fingerprint: $utls_fp
-EOF
+        gen_mihomo_yaml "$tag"
     echo "$link" | tee "$SB_OUT_DIR/sb_share-$tag.txt" | tail -1
     grep -vF "$link" "$SB_OUT_DIR/sb_links-all.txt" 2>/dev/null > /tmp/l.txt 2>/dev/null && mv /tmp/l.txt "$SB_OUT_DIR/sb_links-all.txt"
     echo "$link" >> "$SB_OUT_DIR/sb_links-all.txt"
