@@ -36,23 +36,36 @@ ask_cert() {
         fi
         CERT_DOMAIN="$dom"; CERT_TRUSTED=false; return 0
     fi
-    read -r -p "  crt 路径: " f; read -r -p "  key 路径: " k
-    f=$(clean_input "$f"); k=$(clean_input "$k")
-    if [[ -f "$f" && -f "$k" ]]; then
-        CERT_FILE="$f"; KEY_FILE="$k"; CERT_DOMAIN=$(extract_cert_domain "$f"); CERT_TRUSTED=true; return 0
-    fi
-    print_error "路径无效"; return 1
+      # 真证书: 从已检测到的证书里选 (域名自动带出, 与 Nginx server_name 对齐)
+      pick_trusted_cert
 }
 
 add_config() {
     print_title "新增 VLESS-WS-TLS 节点 ($PROTO-NN.json)"
     local server_ip listen_ip listen_port uuid path idx file tag json
     server_ip=$(safe_read "服务器对外 IP" "$(default_server_ip)")
-    listen_ip=$(safe_read "监听地址 (0.0.0.0/::)" "0.0.0.0")
     listen_port=$(safe_read_port)
     uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen)
     path=$(safe_read "WS 路径 (以 / 开头)" "/$(openssl rand -hex 4)")
     ask_cert || return 1
+
+    # 接入方式在证书选定之后询问: 只有"真证书 + ws/grpc/http"才有 CDN 可选。
+    # 监听地址由它决定 (CDN+Nginx 必须只听 127.0.0.1), 所以放到这一步问。
+    local ttype="ws" trusted="no"
+    # 判定"是否真证书"必须用 lib.sh 里已有的能力, 不能调 cdn.sh 的函数
+    # (protocol 脚本不一定加载了 cdn.sh, 调不到就等于"不是真证书" -> CDN 选项被藏)
+    sb_key_for "$CERT_FILE" >/dev/null 2>&1 && \
+        cert_not_expired "$CERT_FILE" && \
+        sb_cert_is_real_issuer "$CERT_FILE" && trusted="yes"
+    # ask_access_mode 把结果写进全局 ACCESS_MODE (不靠 stdout):
+    # 命令替换会让函数里的 read 跑在子 shell 上, stdin 可能已耗尽,
+    # 结果是"明明选了 CDN+Nginx 却还在问监听地址"。
+    ask_access_mode "$ttype" "$trusted"
+    case "$ACCESS_MODE" in
+        cdn)        listen_ip="0.0.0.0" ;;
+        cdn-nginx)  listen_ip="127.0.0.1" ;;
+        *)          listen_ip=$(safe_read "监听地址 (0.0.0.0/::)" "0.0.0.0") ;;
+    esac
 
     idx=$(get_next_index "$PROTO"); file="$SB_CONFIG_DIR/$PROTO-$idx.json"; tag="${PROTO}${idx}"
     tag="$tag$(tag_form_suffix tls)"   # 名字体现传输方式
@@ -81,6 +94,10 @@ EOF
     cleanup_node_shares "$tag"
     sb_reload || print_warn "请确认服务状态"
 
+    # CDN 节点只监听 127.0.0.1, 客户端连证书域名而非服务器 IP
+    server_ip=$(sb_cdn_finalize "$file" "$server_ip")
+    # CDN 只在 443 上提供服务; 沿用源站端口会得到连不通的 域名:源站端口
+    sb_node_is_cdn "$file" && listen_port=443
     local link="vless://$uuid@$server_ip:$listen_port?encryption=none&security=tls&sni=$CERT_DOMAIN&type=ws&host=$CERT_DOMAIN&path=$path#$tag"
     local utls_fp; utls_fp=$(ask_utls_fingerprint)
     cat > "$SB_OUT_DIR/sb_client-$tag.json" <<EOF
@@ -94,6 +111,11 @@ EOF
 }
 EOF
         gen_mihomo_yaml "$tag"
+
+    # CDN 节点额外产出 .cdn 版产物 (连域名走 Cloudflare), 与直连版并存
+    if sb_cdn_enabled "$file"; then
+        cdn_node_gen_all "$tag" >/dev/null 2>&1 || true
+    fi
     [[ "$CERT_TRUSTED" == "false" ]] && echo "# 自签证书: 为 mihomo 加 skip-cert-verify: true" >> "$SB_OUT_DIR/sb_client-$tag.yaml"
     echo "$link" | tee "$SB_OUT_DIR/sb_share-$tag.txt" | tail -1 >&2
     grep -vF "$link" "$SB_OUT_DIR/sb_links-all.txt" 2>/dev/null > /tmp/l.$$ && mv /tmp/l.$$ "$SB_OUT_DIR/sb_links-all.txt"

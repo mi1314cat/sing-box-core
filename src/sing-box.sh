@@ -168,6 +168,7 @@ ${GREEN}6.${RESET} 校验配置 + 重载
 ${GREEN}7.${RESET} 查看日志
 ${GREEN}8.${RESET} 列出全部配置文件
 ${GREEN}9.${RESET} 客户端产物 / JSON·YAML·分享链接 (查看/复制)
+${GREEN}10.${RESET} CDN / Nginx 前置 (生成 nginx 配置 / 证书检测)
 ${GREEN}0.${RESET} 退出
 ----------------------
 sing-box 服务状态: $([[ "$status_text" == "active" ]] && echo -e "${GREEN}运行中${RESET}" || echo -e "${RED}未运行${RESET}")
@@ -185,6 +186,7 @@ sing-box 服务状态: $([[ "$status_text" == "active" ]] && echo -e "${GREEN}�
         7)  sb_journal 100; read -r -p "按回车键返回主菜单..." ;;
         8)  list_configs ;;
         9)  run_module artifacts.sh ;;
+        10) run_module cdn.sh cdn_menu ;;
         0)  clear; exit 0 ;;
         *)  echo -e "${RED}无效选项 $choice${RESET}" ;;
     esac

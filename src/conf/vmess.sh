@@ -134,6 +134,10 @@ EOF
 
     local DOM="$CERT_DOMAIN"; [[ "${CERT_MODE:-}" == "reality" ]] && DOM="$rnd"
     local pbk sidq urlsec secpin=""
+    # CDN 节点只监听 127.0.0.1, 客户端连证书域名而非服务器 IP
+    server_ip=$(sb_cdn_finalize "$file" "$server_ip")
+    # CDN 只在 443 上提供服务; 沿用源站端口会得到连不通的 域名:源站端口
+    sb_node_is_cdn "$file" && listen_port=443
     if [[ "$CERT_MODE" == "reality" ]]; then
         pbk="$REAL_PUB"
         url="vless://$uuid@$server_ip:$listen_port?encryption=aes-128-gcm&security=reality&sni=$rnd&fp=chrome&pbk=$pbk&sid=$sid"
@@ -178,6 +182,11 @@ PYGEN
     open_port "$listen_port"
     print_ok "VMess 节点添加完成: $file"
     gen_mihomo_yaml "$tag"
+
+    # CDN 节点额外产出 .cdn 版产物 (连域名走 Cloudflare), 与直连版并存
+    if sb_cdn_enabled "$file"; then
+        cdn_node_gen_all "$tag" >/dev/null 2>&1 || true
+    fi
 }
 
 list_configs() {

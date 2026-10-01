@@ -127,6 +127,10 @@ EOF
     server_ip=$(safe_read "服务器对外 IP" "$(default_server_ip)")
     if [[ "$CERT_TRUSTED" == "false" ]]; then pin=$(cert_spki_pin_base64 "$CERT_FILE"); fi
     local link
+    # CDN 节点只监听 127.0.0.1, 客户端连证书域名而非服务器 IP
+    server_ip=$(sb_cdn_finalize "$file" "$server_ip")
+    # CDN 只在 443 上提供服务; 沿用源站端口会得到连不通的 域名:源站端口
+    sb_node_is_cdn "$file" && listen_port=443
     if [[ "$mode_tls" == "reality" ]]; then
         link="trojan://$password@$server_ip:$listen_port?sni=$CERT_DOMAIN&security=reality&pbk=$T_RE_PUB&sid=$T_RE_SID&type=tcp#$tag"
     else
@@ -146,6 +150,11 @@ if pub and sid:
 json.dump({"outbounds":[out]},open(ofile,"w"),indent=2)
 PYGEN
         gen_mihomo_yaml "$tag"
+
+    # CDN 节点额外产出 .cdn 版产物 (连域名走 Cloudflare), 与直连版并存
+    if sb_cdn_enabled "$file"; then
+        cdn_node_gen_all "$tag" >/dev/null 2>&1 || true
+    fi
     [[ -n "$pin" ]] && echo "  # 自签: mihomo 需 skip-cert-verify: true" >> "$SB_OUT_DIR/sb_client-$tag.yaml"
     echo "$link" | tee "$SB_OUT_DIR/sb_share-$tag.txt" | tail -1 >&2
     grep -vF "$link" "$SB_OUT_DIR/sb_links-all.txt" 2>/dev/null > /tmp/l.$$ && mv /tmp/l.$$ "$SB_OUT_DIR/sb_links-all.txt"

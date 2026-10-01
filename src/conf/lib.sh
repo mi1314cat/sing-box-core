@@ -130,17 +130,251 @@ detect_listen_ip() {
     else echo "none"; fi
 }
 
-default_server_ip() { # 优先公网网卡 IPv4
+# 隧道/虚拟接口名 —— 这些接口上的 IP 是代理出口地址, 不能直接给客户端连
+SB_TUNNEL_IFACE_RE='^(warp|wg[0-9]*|tun[0-9]*|tap[0-9]*|utun[0-9]*|tailscale|ts[0-9]*|ppp[0-9]*|zt|meta|he-ipv6-tun)'
+
+# 机器真实 IPv6 (排除 WARP 等隧道接口)
+#
+# 为什么不能用 "问外部 API 拿出口 IP": 套了 WARP 时, 那条查询本身就走 WARP,
+# 返回的是 WARP 地址 (2606:4700:...) —— 客户端拿去直连必然失败。
+# 外部 API 只在没有隧道、且用户明确要"出口 IP"时才作为最后的兜底。
+sb_real_ipv6() {
+    local dev
+    # -6 -o addr show scope global: 全局单播地址
+    # 第二列是接口名, 第四列是 地址/前缀
+    while read -r dev _ _ cidr _; do
+        [[ -z "$dev" || -z "$cidr" ]] && continue
+        [[ "$dev" =~ $SB_TUNNEL_IFACE_RE ]] && continue
+        case "$cidr" in
+            *:*/*) echo "${cidr%%/*}"; return 0 ;;
+        esac
+    done < <(ip -6 -o addr show scope global 2>/dev/null)
+    return 1
+}
+
+# 是否套了 WARP
+sb_warp_active() {
+    ip -6 -o addr show scope global 2>/dev/null | awk '{print $2}' | grep -qE "$SB_TUNNEL_IFACE_RE"
+}
+
+# 对外使用的服务器地址: 优先真实 IPv4; 没有 v4 再用真实 IPv6
+#
+# 注意与 default_server_ip 的区别: 这里刻意不查外部 API —— 那会经 WARP
+# 拿到 WARP 地址。宁可返回空, 也不要给用户一个连不通的地址。
+default_server_ip_real() {
+    local v4
+    v4=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 |
+         grep -vE '^(127\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)' | head -1)
+    if [[ -n "$v4" ]]; then echo "$v4"; return 0; fi
+    sb_real_ipv6 && return 0
+    return 1
+}
+
+default_server_ip() { # 优先公网网卡 IPv4; 无 v4 则回退 IPv6
     local local_ip public_ip
     local_ip=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 |
         grep -vE '^(127\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)' | head -1)
     [[ -n "$local_ip" ]] && { echo "$local_ip"; return; }
     public_ip=$(curl -4 -s --max-time 8 ip.sb 2>/dev/null | tr -d '[:space:]')
     [[ -n "$public_ip" ]] && { echo "$public_ip"; return; }
+    # 无 IPv4 时用真实 IPv6 (排除 WARP 等隧道接口)
+    sb_real_ipv6 && return 0
     echo ""
 }
 
+
 # ---- 协议文件编号: <proto>-NN.json ----
+# ---------- 证书选择 (CDN 友好) ----------
+# 从已检测到的证书里选, 而不是手打路径:
+#   - 域名自动带出, 与 Nginx server_name 保证一致 (CDN 回源校验 SNI)
+#   - 不新增交互维度, 只是把"手打路径"换成"从列表挑"
+# 用法: pick_trusted_cert  -> 设 CERT_FILE / KEY_FILE / CERT_DOMAIN / CERT_TRUSTED
+pick_trusted_cert() {
+    if ! sb_scan_certs; then
+        print_warn "未检测到任何证书, 回退到手动输入路径"
+        local f k
+        read -r -p "  crt 路径: " f; read -r -p "  key 路径: " k
+        f=$(clean_input "$f"); k=$(clean_input "$k")
+        if [[ -f "$f" && -f "$k" ]]; then
+            CERT_FILE="$f"; KEY_FILE="$k"
+            CERT_DOMAIN=$(extract_cert_domain "$f"); CERT_TRUSTED=true
+            return 0
+        fi
+        print_error "路径无效"; return 1
+    fi
+
+    echo "  检测到 ${#sb_FOUND_CERTS[@]} 张证书:" >&2
+    local i=1 e crt key dom
+    for e in "${sb_FOUND_CERTS[@]}"; do
+        crt="${e%%|*}"; key="${e#*|}"; key="${key%%|*}"
+        dom=$(openssl x509 -in "$crt" -noout -ext subjectAltName 2>/dev/null \
+              | grep -oE 'DNS:[^ ,]+' | head -1 | cut -d: -f2)
+        [[ -z "$dom" ]] && dom=$(extract_cert_domain "$crt")
+        printf "  %d) %s  (%s)\n" "$i" "${dom:-未知域名}" "$crt" >&2
+        i=$((i+1))
+    done
+    local c
+    read -r -p "  选哪张 (数字, 回车=1): " c
+    c=$(clean_input "$c"); [[ -z "$c" ]] && c=1
+    [[ "$c" =~ ^[0-9]+$ ]] && (( c >= 1 && c <= ${#sb_FOUND_CERTS[@]} )) || { print_error "无效选择"; return 1; }
+
+    e="${sb_FOUND_CERTS[$((c-1))]}"
+    crt="${e%%|*}"; key="${e#*|}"; key="${key%%|*}"
+    CERT_FILE="$crt"; KEY_FILE="$key"
+    CERT_DOMAIN=$(openssl x509 -in "$crt" -noout -ext subjectAltName 2>/dev/null \
+                  | grep -oE 'DNS:[^ ,]+' | head -1 | cut -d: -f2)
+    [[ -z "$CERT_DOMAIN" ]] && CERT_DOMAIN=$(extract_cert_domain "$crt")
+    CERT_TRUSTED=true
+    print_ok "已选证书: $CERT_DOMAIN"
+    return 0
+}
+
+# 按 tag 找服务端配置文件路径
+# 约定: 配置文件名是 <proto>-NN.json (如 vless-03.json), tag 形如 vless03-TLS
+# 两者不同名, 不能直接拼 $SB_CONFIG_DIR/$tag.json
+sb_config_by_tag() {
+    local tag="$1" f base num
+    # tag 形如 vless03-TLS / hysteria201-TLS / shadowtls02-TLS
+    # 协议名本身含数字(hysteria2), 所以末尾两位数字才是编号:
+    #   去掉尾部 "-XXX" 后, 再截掉末尾两位数字即协议名
+    base="${tag%-*}"                 # vless03 / hysteria201 / shadowtls02
+    [[ -z "$base" ]] && { echo ""; return 1; }
+    num="${base: -2}"                # 末尾两位 = 编号 (03 / 01 / 02)
+    [[ "$num" =~ ^[0-9]{2}$ ]] || { echo ""; return 1; }
+    f="$SB_CONFIG_DIR/${base:0:${#base}-2}-$num.json"
+    [[ -f "$f" ]] || { echo ""; return 1; }
+    echo "$f"
+}
+
+# 证书是否由受信任 CA 签发 (不是自签)
+# 自签证书 subject == issuer, Cloudflare 一律拒绝回源, 必须能区分出来。
+sb_cert_is_real_issuer() {
+    local crt="$1" subj issuer
+    [[ -f "$crt" ]] || return 1
+    subj=$(openssl x509 -in "$crt" -noout -subject 2>/dev/null | sed 's/^subject=//')
+    issuer=$(openssl x509 -in "$crt" -noout -issuer 2>/dev/null | sed 's/^issuer=//')
+    [[ -z "$subj" || -z "$issuer" ]] && return 1
+    [[ "$subj" == "$issuer" ]] && return 1
+    return 0
+}
+
+# ---------- 建节点时询问接入方式 ----------
+# 参照参考脚本 vlessxhttpecn.sh 的 ACCESS_MODE:
+#   1) 直连       监听对外地址, 客户端连 服务器IP:端口   (最简单, 无需 Nginx)
+#   2) CDN 直连   监听 0.0.0.0, Cloudflare 回源到本节点端口 (不经过 Nginx)
+#   3) CDN+Nginx  监听 127.0.0.1, 由 Nginx 按路径转发      (源站 IP 不暴露)
+# 只有 ws/grpc/http(2) 才能走 CDN; 其余协议 (REALITY/AnyTLS/Hysteria2/
+# TUIC/SS/naive/ShadowTLS) 是原生 TCP/UDP, Cloudflare 代理不了, 只给直连。
+#
+# 输出: direct | cdn | cdn-nginx
+ask_access_mode() {
+    # 结果写进全局 ACCESS_MODE, 而不是靠 stdout 返回值。
+    # 原因: 用 $(ask_access_mode) 命令替换时, 函数里的 safe_read/read 会跑在
+    # 子 shell 里, 子 shell 的 stdin 在某些调用方式下读到的是已耗尽的副本,
+    # 于是 safe_read 拿到空值 -> 默认值也没生效 -> 后面 case 全落到兜底分支,
+    # 表现为"明明选了 CDN+Nginx 却还在问监听地址"。
+    # 写全局变量则始终在当前 shell 的 stdin 上读, 行为可预期。
+    local ttype="${1:-tcp}" trusted="${2:-no}"
+    local can_cdn="no"
+    # 内联判定传输是否支持 CDN (ws/grpc/http(2)), 不依赖 cdn.sh 是否被加载
+    case "$ttype" in ws|grpc|http) [[ "$trusted" == "yes" ]] && can_cdn="yes" ;; esac
+
+    if [[ "$can_cdn" != "yes" ]]; then
+        echo "  接入方式:" >&2
+        echo "    1) 直连 (监听对外地址, 客户端连 服务器IP:端口)" >&2
+        case "$ttype" in
+            ws|grpc|http)
+                echo "    [走 CDN 需要真证书 —— Cloudflare 不接受自签证书]" >&2 ;;
+            *)
+                echo "    [$ttype 传输不能走 CDN —— Cloudflare 只代理 ws/grpc/http(2)]" >&2 ;;
+        esac
+        local c; c=$(safe_read "选择" "1")
+        [[ -z "$c" ]] && c=1
+        ACCESS_MODE="direct"
+        return 0
+    fi
+
+    echo "  接入方式:" >&2
+    echo "    1) 直连 (推荐, 最简单, 无需 Nginx)" >&2
+    echo "    2) CDN 直连 (Cloudflare 回源到本节点端口, 不经 Nginx)" >&2
+    echo "    3) CDN + Nginx (推荐: 源站端口不暴露, 隐藏源站 IP)" >&2
+    local c; c=$(safe_read "选择" "3")
+    [[ -z "$c" ]] && c=3
+    case "$c" in
+        1) ACCESS_MODE="direct" ;;
+        2) ACCESS_MODE="cdn" ;;
+        *) ACCESS_MODE="cdn-nginx" ;;
+    esac
+    return 0
+}
+
+# ---------- CDN 模式 ----------
+# 真证书 + ws/grpc/http 即可走 CDN。判定只依据已生成的配置, 不引入新交互:
+#   - 监听 127.0.0.1 (端口不对外暴露, 由 Nginx 承接 443 后按 path 转发)
+#   - 分享链接用证书域名而非服务器 IP
+# 非 CDN 节点行为完全不变。
+sb_cdn_enabled() { # <配置文件> -> 0 表示该节点走 CDN
+    # 判定: 传输在 ws/grpc/http(2) 之内, 且用的是**真证书**。
+    # 自签证书 Cloudflare 一定拒绝回源, 不能算 CDN 节点 —— 否则会生成
+    # 一份"看着像 CDN 其实永远 502"的客户端配置, 比直接报错更难排查。
+    #
+    # 这里内联判定而不是调 cdn.sh 的 cdn_config_supported:
+    # lib.sh 被各协议脚本 source, 而 cdn.sh 只有进 CDN 菜单时才加载;
+    # 调不到函数会被当成"返回非 0" -> 真证书 ws 节点也被判成非 CDN ->
+    # 产物里写服务器 IP 而不是域名, 客户端连了源站端口, CDN 等于没生效。
+    local f="$1" t crt
+    t=$(jq -r '.inbounds[0].transport.type // "tcp"' "$f" 2>/dev/null)
+    case "$t" in ws|grpc|http) ;; *) return 1 ;; esac
+    crt=$(jq -r '.inbounds[0].tls.certificate_path // ""' "$f" 2>/dev/null)
+    [[ -n "$crt" && -f "$crt" ]] || return 1
+    sb_key_for "$crt" >/dev/null 2>&1 || return 1
+    cert_not_expired "$crt" || return 1
+    sb_cert_is_real_issuer "$crt" || return 1
+    return 0
+}
+# CDN 收尾: 把节点切到 CDN 模式并回显客户端该连的地址
+# 用法: conn=$(sb_cdn_finalize <config> <tag>)
+#   非 CDN 节点: 原样返回传入的 fallback (通常是服务器 IP)
+#   CDN 节点:   改 listen 为 127.0.0.1, 返回证书域名
+sb_cdn_finalize() {
+    local f="$1" fb="${2:-}" dom listen
+    if sb_cdn_enabled "$f"; then
+        # 监听地址由接入方式决定 (对应参考脚本 vlessxhttpecn.sh 的 ACCESS_MODE):
+        #   cdn       = Cloudflare 直连本节点端口 -> 必须对外监听, 否则 CF 连不上
+        #   cdn-nginx = 经 Nginx 按路径转发     -> 只听 127.0.0.1, 源站端口不暴露
+        case "${ACCESS_MODE:-cdn-nginx}" in
+            cdn) listen="0.0.0.0" ;;
+            *)   listen="127.0.0.1" ;;
+        esac
+        jq --arg l "$listen" '.inbounds[0].listen = $l' "$f" > "$f.tmp" 2>/dev/null \
+            && mv -f "$f.tmp" "$f"
+        dom=$(sb_cdn_domain "$f")
+        if [[ -n "$dom" ]]; then
+            # 注意: 调用方必须同时把端口换成 443 —— 只换域名不换端口会得到
+            # 连不通的 域名:源站端口 组合 (CDN 只在 443 上提供服务)
+            if [[ "${ACCESS_MODE:-cdn-nginx}" == "cdn" ]]; then
+                print_ok "CDN 直连模式: 监听 $listen, 客户端连 $dom:443"
+            else
+                print_ok "CDN+Nginx 模式: 监听 127.0.0.1, 客户端连 $dom:443 (源站端口不暴露)"
+            fi
+            printf '%s' "$dom"; return 0
+        fi
+    fi
+    printf '%s' "$fb"
+}
+      # 注意: 调用方必须同时把端口换成 443 —— 只换域名不换端口会得到
+      # 连不通的 域名:源站端口 组合 (源站端口只监听本地, CDN 只在 443 服务)
+
+  # 该节点是否为 CDN 模式 (客户端产物走域名:443)
+  sb_node_is_cdn() { sb_cdn_enabled "$1"; }
+
+sb_cdn_domain() { # <配置文件> -> 证书里的域名
+    local crt; crt=$(jq -r '.inbounds[0].tls.certificate_path // ""' "$1" 2>/dev/null)
+    [[ -f "$crt" ]] || return 1
+    openssl x509 -in "$crt" -noout -ext subjectAltName 2>/dev/null \
+        | grep -oE 'DNS:[^ ,]+' | head -1 | cut -d: -f2
+}
+
 # 节点名后缀 —— 让用户从名字就能看出传输方式, 不用打开配置去分辨
 #   reality  -> -REALITY
 #   tls      -> -TLS        (自签 / 真证书的 TLS)

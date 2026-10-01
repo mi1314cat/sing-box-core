@@ -276,6 +276,28 @@ batch_main() {
     sb_reload
     unset SB_BATCH
 
+    # --- CDN 汇总 ---
+    # 批量生成时能走 CDN 的节点 (ws/grpc/http + 真证书) 已被切成 CDN 模式,
+    # 这里一次性列出来并提示下一步, 免得再逐个进节点菜单去找。
+    echo >&2
+    print_title "CDN 汇总"
+    local cdn_n=0 cdn_f
+    shopt -s nullglob
+    for cdn_f in "$SB_CONFIG_DIR"/*.json; do
+        [[ "$(basename "$cdn_f")" =~ ^(00-|01-|02-|03-) ]] && continue
+        sb_cdn_enabled "$cdn_f" && cdn_n=$((cdn_n + 1))
+    done
+    shopt -u nullglob
+    if (( cdn_n > 0 )); then
+        print_ok "$cdn_n 个节点已走 CDN 模式 (客户端连域名:443, 源站端口不对外暴露)"
+        print_info "下一步: 菜单 10 → 1 自动插入 Nginx, 或 → 2 手工粘贴片段"
+    else
+        print_info "本次没有节点走 CDN"
+        print_info "  CDN 需同时满足: 传输为 ws/grpc/http(2)  且  使用真证书"
+        print_info "  批量生成默认用自签证书, 而 Cloudflare 不接受自签回源, 只能直连"
+    fi
+    echo >&2
+
     # --- 汇总 (节点信息 + 服务状态) ---
     echo >&2
     print_title "SB 全协议生成完成"
