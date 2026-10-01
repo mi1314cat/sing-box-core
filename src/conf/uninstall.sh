@@ -120,6 +120,25 @@ do_uninstall() {
         y*|yes*) clean_fw ;;
         *) print_warn "保留防火墙规则 (可手动: ufw status 查看)" ;;
     esac
+    # Nginx 里的 CDN 片段必须单独问。
+    # 它写的是**用户自己的站点配置文件**(如 /etc/nginx/conf.d/xxx.conf), 不在
+    # SB-Panel 目录内, 所以下面删 $SB_ROOT 不会带走它 —— 卸载完 nginx 里会留着
+    # 一堆指向已删端口的 location, Cloudflare 回源直接 502。
+    # 只删本面板带标记的那一段(BEGIN/END 之间), 其余配置一个字都不动。
+    local _has_cdn=0 _f
+    for _f in /etc/nginx/conf.d/*.conf /etc/nginx/sites-enabled/*.conf; do
+        [[ -f "$_f" ]] || continue
+        grep -q "SB-Panel CDN" "$_f" 2>/dev/null && { _has_cdn=1; break; }
+    done
+    if (( _has_cdn )); then
+        read -r -p "是否一并移除 Nginx 里 SB-Panel 插入的 CDN 配置? [Y/n]: " n
+        case "$(echo "$n" | tr A-Z a-z)" in
+            n*) print_warn "保留 Nginx CDN 配置 (可稍后用菜单 10 → 7 移除)" ;;
+            *)  bash "$SELF_DIR/conf/cdn.sh" remove >/dev/null 2>&1 \
+                    && print_ok "Nginx CDN 配置已移除" \
+                    || print_warn "自动移除失败, 请用菜单 10 → 7 手动移除" ;;
+        esac
+    fi
     read -r -p "是否删除 $SB_ROOT 目录 (含全部节点配置/备份)? [y/N]: " b
     case "$(echo "$b"|tr A-Z a-z)" in
         y*|yes*) rm -rf "$SB_ROOT" && print_ok "已删除 $SB_ROOT" ;;

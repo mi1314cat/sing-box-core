@@ -84,12 +84,37 @@ links_all_view() {
     cat "$f"
 }
 
-path_view() {
-    printf "${CYAN}客户端产物路径 (可 cp/scp/复制):%b\n" "$RESET" >&2
-    for f in "$SB_OUT_DIR"/sb_client-*.json "$SB_OUT_DIR"/sb_client-*.yaml "$SB_OUT_DIR"/sb_share-*.txt "$SB_OUT_DIR/sb_links-all.txt"; do
-        [[ -f "$f" ]] && printf "  %s\n" "$f"
-    done
-}
+  path_view() {
+      printf "${CYAN}客户端产物路径 (可 cp/scp/复制):%b\n" "$RESET" >&2
+      for f in "$SB_OUT_DIR"/sb_client-*.json "$SB_OUT_DIR"/sb_client-*.yaml "$SB_OUT_DIR"/sb_share-*.txt "$SB_OUT_DIR/sb_links-all.txt"; do
+          [[ -f "$f" ]] && printf "  %s\n" "$f"
+      done
+      # Nginx 片段也要能在这里找到 —— 自动插入失败时用户要靠它手工粘贴,
+      # 找不到就只剩一句"配置失败"而无从补救。已插入的目标文件也一并列出,
+      # 否则用户也不知道自己的 nginx 配置被写进了哪个文件。
+      if [[ -f "$SB_OUT_DIR/sb_cdn-nginx-location.conf" ]]; then
+          printf "\n${CYAN}Nginx CDN 相关:%b\n" "$RESET" >&2
+          printf "  %s\n" "$SB_OUT_DIR/sb_cdn-nginx-location.conf" >&2
+          printf "  (手工粘贴用; 自动插入请用菜单 10 → 1)\n" >&2
+      fi
+      # 站点配置不固定在 /etc/nginx 下 —— Docker 部署常挂在别处
+      # (如宿主 /home/web/conf.d 映射进容器)。复用 CDN 模块的探测结果,
+      # 免得菜单9 在 Docker 机器上什么都列不出来。
+      local _cf _dirs=()
+      while read -r _dirs_r; do _dirs+=("$_dirs_r"); done < <(
+          d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          [[ -f "$d/cdn_nginx.sh" ]] && source "$d/cdn_nginx.sh"
+          declare -F cdn_config_roots >/dev/null 2>&1 && cdn_config_roots 2>/dev/null
+          printf '%s\n' /etc/nginx/conf.d /etc/nginx/sites-enabled
+      )
+      for _dir in "${_dirs[@]}"; do
+          [[ -d "$_dir" ]] || continue
+          for _cf in "$_dir"/*.conf; do
+              [[ -f "$_cf" ]] || continue
+              grep -q "SB-Panel CDN" "$_cf" 2>/dev/null && printf "  已插入: %s\n" "$_cf" >&2
+          done
+      done
+  }
 
 # ---------- 全部节点合并成单一 mihomo/clash 文件 ----------
 #

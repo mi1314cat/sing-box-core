@@ -282,11 +282,20 @@ cdn_auto_remove() {
         [[ -z "$target" ]] && continue
         grep -q "SB-Panel CDN" "$target" 2>/dev/null || continue
         print_info "→ $dn : $target"
+        # 同 cdn_auto_insert: 管道的退出码取自 sed, python3 失败也会 +1,
+        # 于是"其实没删掉"被报成"已移除"。先取退出码再过滤输出。
+        local rc=0 of
+        of=$(mktemp)
         python3 "$SELF_DIR/conf/cdn_apply.py" --domain "$dn" --file "$target" \
-            --remove --nginx "$(cdn_nginx_mode)" 2>&1 | sed 's/^/    /' && n=$((n+1))
+            --remove --nginx "$(cdn_nginx_mode)" >"$of" 2>&1 || rc=$?
+        sed 's/^/    /' < "$of"
+        rm -f "$of"
+        (( rc == 0 )) && n=$((n+1)) || print_error "  ↑ 移除失败 (退出码 $rc)"
     done
     (( n == 0 )) && { print_info "没有找到已插入的 CDN 配置"; return 0; }
-    print_ok "已移除 $n 处, 请自行重载 nginx 使其生效"
+    print_ok "已移除 $n 处"
+    # 配置改了不重载 = 仍生效在旧规则上, 等于没删
+    cdn_nginx_reload
 }
 
 # ---------- 接入说明 ----------

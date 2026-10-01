@@ -261,6 +261,7 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
         certs)     cdn_show_certs ;;
         nodes)     cdn_list_nodes ;;
         artifacts) cdn_gen_all_nodes ;;
+        remove)     cdn_auto_remove ;;
         help|-h|--help) cdn_show_help ;;
         *)         cdn_menu ;;
     esac

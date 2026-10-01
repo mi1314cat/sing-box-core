@@ -126,7 +126,13 @@ EOF
     echo "$link" | tee "$SB_OUT_DIR/sb_share-$tag.txt" | tail -1 >&2
     grep -vF "$link" "$SB_OUT_DIR/sb_links-all.txt" 2>/dev/null > /tmp/l.$$ && mv /tmp/l.$$ "$SB_OUT_DIR/sb_links-all.txt"
     echo "$link" >> "$SB_OUT_DIR/sb_links-all.txt"
-    open_port "$listen_port"
+    # CDN 节点只监听 127.0.0.1, 源站端口不对外暴露, **不需要放行防火墙**;
+    # 而且此时 listen_port 已被改成 443 (客户端侧端口), 直接拿去 open_port
+    # 会给 443 加放行规则 —— 那是用户 nginx 的端口, 与节点无关。
+    # 所以这里一律放行源站真实端口, 且 CDN 模式跳过。
+    local _fw_port
+    _fw_port=$(jq -r '.inbounds[0].listen_port // empty' "$file" 2>/dev/null)
+    sb_node_is_cdn "$file" || open_port "$_fw_port"
     print_ok "VLESS 节点添加完成: $file"
     # 重建聚合: 新节点不在 sb_client-all.json 里的话, 分享链接
     # (菜单3 / all-share URL) 下发的还是旧节点列表。

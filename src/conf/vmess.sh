@@ -57,7 +57,6 @@ ask_tls() { # 输出: CERT_MODE|cert_file|key_file|cert_domain|trusted(0|1) 到 
 add_config() {
     print_title "新增 VMess 节点 ($PROTO-NN.json)"
     local listen_ip listen_port svc_if
-    listen_ip=$(safe_read "监听地址 (0.0.0.0/::)" "0.0.0.0")
     listen_port=$(safe_read_port)
     echo "transport: 1) ws 2) grpc 3) http(H2) 4) tcp裸" >&2
     read -r -p "选择 (默认 ws): " tv; tv=$(clean_input "$tv")
@@ -75,6 +74,31 @@ add_config() {
     CERT_MODE="${_tls%%|*}"; _tls="${_tls#*|}"
     CERT_FILE="${_tls%%|*}"; _tls="${_tls#*|}"
     KEY_FILE="${_tls%%|*}";  CERT_DOMAIN="${_tls#*|}"
+      
+    # 接入方式必须在证书与传输都定下来之后问:
+    #   - 自签证书 Cloudflare 一定拒绝回源, 问 CDN 没有意义
+    #   - 传输不是 ws/grpc/http 时也没有 CDN 可用
+    # 而监听地址由它决定 (CDN+Nginx 必须只听 127.0.0.1), 所以放在这里。
+    #
+    # 以前 vmess 根本没有这一步: 开头就直接问监听地址, ACCESS_MODE 恒为空。
+    # 而 sb_cdn_finalize 里 ${ACCESS_MODE:-cdn-nginx} 会默认按 CDN+Nginx 处理,
+    # 于是任何 ws + 真证书的 vmess 节点都被悄悄改成只听 127.0.0.1、客户端连
+    # CDN 域名 —— 但 nginx 里并没有对应的 location, 节点彻底连不上,
+    # 界面上也看不出任何异常。比直接报错更难排查。
+    # 值必须是 "yes"/"no": ask_access_mode 内部判断的是 [[ "$trusted" == "yes" ]]。
+    # 传 "true" 永远匹配不上, 于是 CDN 选项根本不出现, ACCESS_MODE 恒为空 ——
+    # 而 sb_cdn_finalize 里 ${ACCESS_MODE:-cdn-nginx} 会默认按 CDN+Nginx 处理,
+    # 结果节点只听 127.0.0.1、客户端连 CDN 域名, 而 nginx 里什么都没有。
+    local _trusted="no"
+    [[ "${CERT_MODE:-}" == "real" && -n "$CERT_FILE" ]] && _trusted="yes"
+    ACCESS_MODE=""
+    ask_access_mode "$ttype" "$_trusted"
+    case "$ACCESS_MODE" in
+        cdn)        listen_ip="0.0.0.0" ;;
+        cdn-nginx)  listen_ip="127.0.0.1" ;;
+        *)          listen_ip=$(safe_read "监听地址 (0.0.0.0/::)" "0.0.0.0") ;;
+    esac
+      
     local uuid; uuid=$(cat /proc/sys/kernel/random/uuid)
     local REAL_PRIV REAL_PUB
     if [[ "$CERT_MODE" == "reality" ]]; then
@@ -187,7 +211,13 @@ PYGEN
         echo "$url" >> "$SB_OUT_DIR/sb_links-all.txt"
     fi
     echo "{\"tag\":\"$tag\",\"port\":$listen_port,\"mode\":\"$CERT_MODE\",\"path\":\"$tpath\",\"svc\":\"$svc\"}" | jq . > "$SB_OUT_DIR/sb_meta-$tag.json"
-    open_port "$listen_port"
+    # CDN 节点只监听 127.0.0.1, 源站端口不对外暴露, **不需要放行防火墙**;
+    # 而且此时 listen_port 已被改成 443 (客户端侧端口), 直接拿去 open_port
+    # 会给 443 加放行规则 —— 那是用户 nginx 的端口, 与节点无关。
+    # 所以这里一律放行源站真实端口, 且 CDN 模式跳过。
+    local _fw_port
+    _fw_port=$(jq -r '.inbounds[0].listen_port // empty' "$file" 2>/dev/null)
+    sb_node_is_cdn "$file" || open_port "$_fw_port"
     print_ok "VMess 节点添加完成: $file"
     # 重建聚合: 新节点不在 sb_client-all.json 里的话, 分享链接
     # (菜单3 / all-share URL) 下发的还是旧节点列表。
