@@ -536,6 +536,78 @@ open_port() {
     fi
 }
 
+  # ---- 防火墙关闭（删除节点时收口）----
+  #
+  # 安全设计（与 uninstall.sh 的 clean_fw 同一套原则, 那套是为了修
+  # "扫防火墙全表按端口猜, 误删 SSH 规则导致失联" 这个事故而写的）:
+  #   1. 绝不扫描防火墙全表 —— 只认 .fw-ports 登记过的端口。
+  #   2. 端口必须确实属于被删的那个节点 —— 由调用方在删除前把端口传进来,
+  #      不靠"现在没人监听"推断归属（端口释放后可能已被别的服务接管）。
+  #   3. sshd 正在监听的端口一律不关; 系统常用端口硬性黑名单。
+  #   4. 防火墙未启用时只更新登记表, 不做任何系统改动。
+  fw_unlog_port() { # 从登记表移除 (不做任何系统改动)
+      local port="$1" list="$SB_ROOT/.fw-ports"
+      [[ "$port" =~ ^[0-9]+$ ]] || return 0
+      [[ -f "$list" ]] || return 0
+      grep -vxF "$port" "$list" > "$list.tmp" 2>/dev/null && mv -f "$list.tmp" "$list"
+  }
+
+  # 该端口是否正被 sshd 监听 —— 碰它就等于自断连接
+fw_port_is_ssh() {
+      local port="$1"
+      # ss 的一行形如: LISTEN 0 128 0.0.0.0:6541 0.0.0.0:* users:(("sshd",pid=837,fd=6))
+      # 进程名在端口**后面**, 所以不能写成 "sshd.*:PORT" —— 那样永远匹配不到。
+      # 必须同一行里既出现该监听端口, 又出现 sshd。
+      if command -v ss >/dev/null 2>&1; then
+          ss -Hltnp 2>/dev/null | grep -E "[:.]${port}[[:space:]]" | grep -q "sshd" && return 0
+      fi
+      # 兜底: ss 看不到进程名时(权限不足), 读 sshd 自己的配置
+      if [[ -r /etc/ssh/sshd_config ]]; then
+          grep -qiE "^[[:space:]]*Port[[:space:]]+${port}([[:space:]]|$)" /etc/ssh/sshd_config && return 0
+      fi
+      return 1
+  }
+
+  close_node_port() { # <端口> <节点tag>  —— 只关"确认属于该节点"的端口
+      local port="$1" tag="${2:-}"
+      [[ "$port" =~ ^[0-9]+$ ]] || return 0
+      # 不在登记名单里的, 说明本面板没为它开过规则, 不该由本面板去关
+      if ! grep -qxF "$port" "$SB_ROOT/.fw-ports" 2>/dev/null; then
+          fw_unlog_port "$port"
+          return 0
+      fi
+      if fw_port_is_ssh "$port"; then
+          print_warn "端口 $port 正被 sshd 使用, 跳过关闭 (防失联)"
+          return 0
+      fi
+      case "$port" in
+          22|80|443|8443|3306|5432|6379|27017) fw_unlog_port "$port"; return 0 ;;
+      esac
+      local acted=0
+      if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+          ufw delete allow "$port/tcp" >/dev/null 2>&1 && acted=1
+          ufw delete allow "$port/udp" >/dev/null 2>&1 && acted=1
+      elif command -v firewall-cmd >/dev/null && firewall-cmd --state 2>/dev/null | grep -q running; then
+          firewall-cmd --zone=public --remove-port="$port/tcp" --permanent >/dev/null 2>&1 && acted=1
+          firewall-cmd --zone=public --remove-port="$port/udp" --permanent >/dev/null 2>&1 && acted=1
+          firewall-cmd --reload >/dev/null 2>&1
+      elif command -v iptables >/dev/null; then
+          local proto
+          for proto in tcp udp; do
+              if iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; then
+                  iptables -D INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null && acted=1
+              fi
+          done
+      fi
+      fw_unlog_port "$port"
+      if (( acted )); then
+          print_ok "已关闭防火墙端口 $port${tag:+ (原属 $tag)}"
+      else
+          print_info "防火墙未启用或无对应规则, 仅从登记表移除 $port${tag:+ (原属 $tag)}"
+      fi
+      return 0
+  }
+
 # ---- 服务 ----
 sb_service_active() { systemctl is-active "$SB_SERVICE" >/dev/null 2>&1; }
 

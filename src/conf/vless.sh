@@ -152,7 +152,12 @@ delete_config() {
     local idx file tag
     idx=$(printf "%02d" "$num"); file="$SB_CONFIG_DIR/$PROTO-$idx.json"; tag="${PROTO}${idx}"
     [[ -f "$file" ]] || { print_error "编号不存在"; return 1; }
+    # 先取端口再删文件 —— 文件没了就再也证明不了这个端口属于本节点。
+    # 交给 close_node_port 按"归属已确认"的口径关闭, 它只认 .fw-ports 登记过的
+    # 端口, 且 sshd 在听的 / 系统常用端口一律不碰。
+    local fw_port; fw_port=$(jq -r '.inbounds[0].listen_port // empty' "$file" 2>/dev/null)
     rm -f "$file" "$SB_OUT_DIR/sb_share-$tag.txt" "$SB_OUT_DIR/sb_client-$tag.json" "$SB_OUT_DIR/sb_client-$tag.yaml"
+    [[ -n "$fw_port" ]] && close_node_port "$fw_port" "$tag"
     sb_check && sb_reload || print_warn "请手动确认服务状态"
     print_ok "已删除 $tag"
 }

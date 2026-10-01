@@ -92,6 +92,27 @@ def main():
     args = ap.parse_args()
 
     path = args.file
+    # 片段过期检测。
+    # 本脚本只负责"把片段贴进去", 不负责生成片段 —— 所以完全可能拿着上一次
+    # 生成的旧片段来执行, 结果插进去的 proxy_pass 指向已经不存在的端口,
+    # 表现为 404/502, 而脚本自己还报 [OK], 极具迷惑性。
+    # 凡是片段比节点配置旧, 就明说并中止, 不让这种错悄悄进配置。
+    if args.block and not args.remove and os.path.isfile(args.block):
+      root = os.path.dirname(os.path.dirname(os.path.abspath(args.block)))
+      cfgdir = os.path.join(root, "config")
+      newest_cfg = 0.0
+      if os.path.isdir(cfgdir):
+          for fn in os.listdir(cfgdir):
+              if fn.endswith(".json") and not fn[:2].isdigit():
+                  newest_cfg = max(newest_cfg,
+                                   os.path.getmtime(os.path.join(cfgdir, fn)))
+      if newest_cfg and os.path.getmtime(args.block) < newest_cfg - 1:
+          print("[Warn] 片段比节点配置旧, 很可能插进去的是过期端口", file=sys.stderr)
+          print("       请先重新生成: bash conf/cdn.sh nginx", file=sys.stderr)
+          if not args.dry_run and not os.environ.get("SB_ALLOW_STALE_BLOCK"):
+              print("       已中止 (--dry-run 可预览, 或设 SB_ALLOW_STALE_BLOCK=1 强制执行)",
+                    file=sys.stderr)
+              return 3
     if not os.path.isfile(path):
         print("找不到站点配置文件: %s" % path, file=sys.stderr)
         return 2
