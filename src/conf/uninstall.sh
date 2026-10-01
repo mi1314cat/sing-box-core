@@ -45,6 +45,10 @@ collect_own_ports() {
 #      (端口被释放后若被别的服务接管, 配置里就没有它了, 从而不会误删他人规则)
 #   3. sshd 正在监听的端口一律不删; 系统常用端口硬性黑名单。
 #   4. 逐条打印, 输入 yes 才执行。
+# 防火墙清理被取消时, 由 clean_fw 填充: 这些端口的规则会留成孤儿。
+# 删掉 $SB_ROOT 之后就再也认不出归属, 只能手工一条条删。
+SB_FW_ORPHANS=()
+
 clean_fw() {
     local list="$SB_ROOT/.fw-ports"
     if [[ ! -f "$list" ]]; then
@@ -81,9 +85,19 @@ clean_fw() {
     fi
     print_warn "以下 ${#deletable[@]} 个端口经 sing-box 配置确认属于本面板:"
     printf "    %s\n" "${deletable[@]}" >&2
+    # 外层问的是 [y/N], 用户十有八九回 "y"; 这里原本却只认字面的 "yes",
+    # 于是几乎每次都会被判成"已取消", 然后流程继续往下删 $SB_ROOT ——
+    # 防火墙规则留成孤儿, 而判断归属要读的 config/*.json 已经被删光,
+    # 之后再也无法清理。
     local a
-    read -r -p "确认删除这些防火墙规则? 输入 yes 继续: " a
-    [[ "$(echo "$a"|tr A-Z a-z)" == "yes" ]] || { print_warn "已取消, 未修改防火墙"; return 0; }
+    read -r -p "确认删除这些防火墙规则? [y/N]: " a
+    case "$(echo "$a" | tr A-Z a-z)" in
+        y*|yes*) ;;
+        *) print_warn "已取消, 未修改防火墙"
+           # 记下还有哪些端口会留成孤儿, 由调用方在删目录前严肃提醒
+           SB_FW_ORPHANS=("${deletable[@]}")
+           return 1 ;;
+    esac
     local n=0
     if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
         for p in "${deletable[@]}"; do
@@ -117,19 +131,49 @@ do_uninstall() {
     # 防火墙清理必须在删除目录之前 —— 它要读 config/*.json 判断端口归属
     read -r -p "是否一并清理防火墙规则 (只删 sing-box 配置中确认属于本面板的端口)? [y/N]: " f
     case "$(echo "$f"|tr A-Z a-z)" in
-        y*|yes*) clean_fw ;;
-        *) print_warn "保留防火墙规则 (可手动: ufw status 查看)" ;;
+        y*|yes*) clean_fw || true ;;
+        *) print_warn "保留防火墙规则 (可手动: ufw status 查看)"
+           SB_FW_ORPHANS=() ;;
     esac
+    # 防火墙规则没清掉却要删目录 = 制造永久孤儿。
+    # 规则认不出来源 (判断归属依赖的 config/*.json 就在这个目录里), 端口又被占着,
+    # 只能手工一条条去 iptables 里挖。所以这里拦一下, 要求二次确认。
+    if (( ${#SB_FW_ORPHANS[@]} )); then
+        print_warn "警告: 以下 ${#SB_FW_ORPHANS[@]} 个端口的防火墙规则会被永久留下"
+        printf "    %s\n" "${SB_FW_ORPHANS[@]}" >&2
+        print_warn "删除 $SB_ROOT 后, 面板将无法再判断这些规则是否属于自己"
+        local ow
+        read -r -p "仍要继续卸载 (留下这些孤儿规则)? [y/N]: " ow
+        case "$(echo "$ow" | tr A-Z a-z)" in
+            y*|yes*) ;;
+            *) print_warn "已中止卸载 (防火墙规则与 $SB_ROOT 均保持原样)"
+               return 0 ;;
+        esac
+    fi
     # Nginx 里的 CDN 片段必须单独问。
     # 它写的是**用户自己的站点配置文件**(如 /etc/nginx/conf.d/xxx.conf), 不在
     # SB-Panel 目录内, 所以下面删 $SB_ROOT 不会带走它 —— 卸载完 nginx 里会留着
     # 一堆指向已删端口的 location, Cloudflare 回源直接 502。
     # 只删本面板带标记的那一段(BEGIN/END 之间), 其余配置一个字都不动。
-    local _has_cdn=0 _f
-    for _f in /etc/nginx/conf.d/*.conf /etc/nginx/sites-enabled/*.conf; do
-        [[ -f "$_f" ]] || continue
-        grep -q "SB-Panel CDN" "$_f" 2>/dev/null && { _has_cdn=1; break; }
-    done
+    # 站点配置目录必须走 cdn_config_roots 探测, 不能写死 /etc/nginx/conf.d:
+    # Docker 部署常把宿主机目录挂进容器 (如宿主 /home/web/conf.d -> 容器的
+    # /etc/nginx/conf.d), 只扫宿主机这两个标准路径会一个都找不到,
+    # 于是"要不要清 CDN 配置"这个问题**根本不会问**, 卸载完 nginx 里
+    # 留着一堆指向已删端口的 location, Cloudflare 回源直接 502。
+    local _has_cdn=0 _f _dir _d
+    _d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    if [[ -f "$_d/cdn_nginx.sh" ]]; then
+        source "$_d/cdn_nginx.sh" 2>/dev/null
+    fi
+    if declare -F cdn_config_roots >/dev/null 2>&1; then
+        while read -r _dir; do
+            [[ -d "$_dir" ]] || continue
+            for _f in "$_dir"/*.conf; do
+                [[ -f "$_f" ]] || continue
+                grep -q "SB-Panel CDN" "$_f" 2>/dev/null && { _has_cdn=1; break 2; }
+            done
+        done < <(cdn_config_roots 2>/dev/null)
+    fi
     if (( _has_cdn )); then
         read -r -p "是否一并移除 Nginx 里 SB-Panel 插入的 CDN 配置? [Y/n]: " n
         case "$(echo "$n" | tr A-Z a-z)" in

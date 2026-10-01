@@ -86,7 +86,7 @@ sb_proxy_apply() { # $1 = 代理地址; 空 = 直连
     fi
 }
 
-sb_pick_proxy() { # 安装时让用户选下载通道; 默认直连
+sb_pick_proxy() { # 让用户选下载通道; 默认直连。$1 = 用途说明(给提示文案用)
     # 已显式配置: 不打扰
     if [[ -n "${https_proxy:-}${http_proxy:-}" ]]; then
         print_msg "下载通道: 环境变量 ${https_proxy:-$http_proxy}"
@@ -96,7 +96,7 @@ sb_pick_proxy() { # 安装时让用户选下载通道; 默认直连
     (( ${#SB_PROXY_CANDS[@]} == 0 )) && return 0   # 没代理 -> 静默直连
     # 非交互: 静默直连
     [[ -t 0 ]] || return 0
-    print_warn "检测到本机可用代理 (内核/UI 将从 GitHub 下载):"
+    print_warn "检测到本机可用代理 (${1:-内核/UI 将从 GitHub 下载}):"
     local i c
     for i in "${!SB_PROXY_CANDS[@]}"; do
         printf "  %d) 使用 %s\n" "$((i+1))" "${SB_PROXY_CANDS[$i]}" >&2
@@ -506,8 +506,14 @@ add_node() {
     [[ -n "$src" ]] || { print_err "用法: client.sh add <share-url|本地配置文件>"; return 1; }
     local tmp; tmp=$(mktemp "$CLIENT_ROOT/share-state/.import.XXXXXX.json")
     if [[ "$src" =~ ^https?:// ]]; then
+        # 拉分享链接同样会卡: 服务端在境外/被墙时直连就是干等 30 秒超时。
+        # 安装时本来就有这个选项, 但只在安装流程里问过 (sb_pick_proxy 仅被
+        # install 调用), 菜单 3 的拉取完全直连 —— 用户没安装时选过的通道,
+        # 后面每次更新节点都用不上。这里复用同一个选择逻辑。
+        sb_pick_proxy "拉取分享链接 (直连不通时可走本机代理)"
         local code
-        code=$(curl -sSL -o "$tmp" -w '%{http_code}' --max-time 30 "$src" 2>/dev/null) || { rm -f "$tmp"; print_err "网络错误, 下载失败"; return 1; }
+        code=$(curl -sSL -o "$tmp" -w '%{http_code}' --max-time 30 "$src" 2>/dev/null) || { rm -f "$tmp"; print_err "网络错误, 下载失败"
+            print_warn "可重试并在提示时选择走本机代理"; return 1; }
         case "$code" in
             200) ;;
             410) rm -f "$tmp"; print_err "分享链接已失效(用尽/过期/禁用)"; return 1 ;;

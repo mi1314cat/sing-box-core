@@ -15,7 +15,14 @@ cdn_menu() {
         print_info "  9) CDN 接入说明"
         print_info "  0) 返回"
         echo
-        local c; c=$(read -r -p "请选择 [0-9]: " c 2>/dev/null) || return 0
+        # 必须是普通 read, 不能写成 c=$(read ...)。
+        # 命令替换会开子 shell, read 把值赋给**子 shell 的** c, 父 shell 拿到的
+        # 永远是空 —— 于是 case 全部落空, 菜单 10 的 9 个选项都是空操作,
+        # 表现为"选任何一项都直接退回主菜单、什么也没发生"。
+        # 这正是用户最早报的"批量生成后去菜单 10 → 1 配 Nginx 却没反应"的根源。
+        # lib.sh 的 ask_access_mode 里已经踩过同一个坑并留了注释, 这里又踩了一次。
+        local c=""
+        read -r -p "请选择 [0-9]: " c 2>/dev/null || return 0
         case "${c// /}" in
             1) cdn_auto_insert ;;
             2) cdn_gen_nginx_conf ;;

@@ -113,6 +113,15 @@ safe_read_port() { # 默认值 = 随机空闲端口
         port="${input:-$default}"
         if ! [[ "$port" =~ ^[0-9]+$ ]]; then print_error "端口必须是数字"; continue; fi
         if (( 10#$port < 1 || 10#$port > 65535 )); then print_error "端口范围 1-65535"; continue; fi
+        # 1-1023 是特权端口, 代理服务没有正当理由占用。
+        # 只查 1-65535 会放过明显是手滑的值 (比如把"传输选 1"误填进端口框
+        # 得到端口 1), 而 root 确实能绑上去 —— 于是生成出一份
+        # "proxy_pass https://127.0.0.1:1" 的 nginx 配置, 全程一路 [OK],
+        # 直到客户端连不上才暴露。端口 22 更危险: 会直接顶掉 sshd。
+        if (( 10#$port < 1024 )); then
+            print_error "端口 $port 是特权端口 (1-1023 保留给系统服务), 请用 1024 以上"
+            continue
+        fi
         if port_in_use "$port"; then print_error "端口 $port 已被占用"; continue; fi
         echo "$port"
         return
