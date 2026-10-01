@@ -9,6 +9,26 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"     # $SB_ROOT
 SB_ROOT="${SB_ROOT:-$SELF_DIR}"
 SERVICES=(sing-box.service sing-box-share.service)
 
+# 本文件由 run_module 以独立 bash 进程执行, **不会**继承主脚本 source 的
+# lib.sh —— 下面这些 print_* 是本文件自己定义的。同理 fw_detect_backend
+# 也在 lib.sh 里, 不加载就是空命令, clean_fw 会静默走错分支。
+# 这里主动加载一次 (重复 source 无害), 拿不到就退化为本文件自带的实现。
+if [[ -f "$SELF_DIR/conf/lib.sh" && -z "${SB_UNINSTALL_LIB_LOADED:-}" ]]; then
+    SB_UNINSTALL_LIB_LOADED=1
+    # shellcheck disable=SC1091
+    source "$SELF_DIR/conf/lib.sh" 2>/dev/null || true
+fi
+# 兜底: lib.sh 不可用时至少保证后端判定不会返回空
+if ! declare -F fw_detect_backend >/dev/null 2>&1; then
+    fw_detect_backend() {
+        nft list table inet filter >/dev/null 2>&1 && { echo nft; return; }
+        command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active" && { echo ufw; return; }
+        command -v firewall-cmd >/dev/null && firewall-cmd --state 2>/dev/null | grep -q running && { echo firewalld; return; }
+        command -v iptables >/dev/null && { echo iptables; return; }
+        echo none
+    }
+fi
+
 GREEN="${GREEN:-\e[32m}"; RED="${RED:-\e[31m}"; YELLOW="${YELLOW:-\e[33m}"; CYAN="${CYAN:-\e[96m}"; RESET="${RESET:-\e[0m}"
 print_title(){ printf "\e[95m\e[1m===\e[0m ${GREEN}%s${RESET}\n" "$1" >&2; }
 print_ok(){ echo -e "\e[32m[OK]  $1\e[0m" >&2; }
@@ -98,23 +118,55 @@ clean_fw() {
            SB_FW_ORPHANS=("${deletable[@]}")
            return 1 ;;
     esac
-    local n=0
-    if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
-        for p in "${deletable[@]}"; do
-            ufw delete allow "$p/tcp" >/dev/null 2>&1 && n=$((n+1))
-            ufw delete allow "$p/udp" >/dev/null 2>&1 && n=$((n+1))
-        done
-    elif command -v firewall-cmd >/dev/null && firewall-cmd --state 2>/dev/null | grep -q running; then
-        for p in "${deletable[@]}"; do
-            firewall-cmd --zone=public --remove-port="$p/tcp" --permanent >/dev/null 2>&1 && n=$((n+1))
-        done
-        firewall-cmd --reload >/dev/null 2>&1
-    else
-        print_warn "未检测到 ufw/firewalld, 未做修改"
-        return 0
-    fi
-    print_ok "防火墙规则已清理 ($n 条)"
-    print_warn "提示: 若卸载后无法 SSH, 请用云控制台执行 ufw allow <你的SSH端口>/tcp"
+    # 后端判定必须与 open_port / close_node_port 用同一个 fw_detect_backend。
+    # 之前这里写死只处理 ufw/firewalld, 而放行规则是 open_port 按
+    # fw_detect_backend 的结果加的 —— 在没有 ufw (firewalld 也没装) 的机器上
+    # fw_detect_backend 返回 iptables, 规则是用 iptables 加的, 卸载却因为
+    # "未检测到 ufw/firewalld" 直接不做任何修改。实测卸载后残留 26 条规则。
+    local n=0 p proto be h
+    be=$(fw_detect_backend)
+    case "$be" in
+        nft)
+            for p in "${deletable[@]}"; do
+                while read -r h; do
+                    [[ "$h" =~ ^[0-9]+$ ]] || continue
+                    nft delete rule inet filter input handle "$h" >/dev/null 2>&1 && n=$((n+1))
+                done < <(nft -a list chain inet filter input 2>/dev/null \
+                          | grep -E "dport ${p}([[:space:]]|$)" \
+                          | grep -v 'UFW_PANEL_SSH' \
+                          | grep -oE "handle [0-9]+" | awk '{print $2}')
+            done
+            # 清掉本面板自己的持久化文件, 否则重启后规则又被写回来
+            [[ -n "${SB_NFT_OWN_FILE:-}" ]] && : > "$SB_NFT_OWN_FILE" 2>/dev/null
+            ;;
+        ufw)
+            for p in "${deletable[@]}"; do
+                ufw delete allow "$p/tcp" >/dev/null 2>&1 && n=$((n+1))
+                ufw delete allow "$p/udp" >/dev/null 2>&1 && n=$((n+1))
+            done
+            ;;
+        firewalld)
+            for p in "${deletable[@]}"; do
+                firewall-cmd --zone=public --remove-port="$p/tcp" --permanent >/dev/null 2>&1 && n=$((n+1))
+            done
+            firewall-cmd --reload >/dev/null 2>&1
+            ;;
+        iptables)
+            for p in "${deletable[@]}"; do
+                for proto in tcp udp; do
+                    if iptables -C INPUT -p "$proto" --dport "$p" -j ACCEPT 2>/dev/null; then
+                        iptables -D INPUT -p "$proto" --dport "$p" -j ACCEPT >/dev/null 2>&1 && n=$((n+1))
+                    fi
+                done
+            done
+            ;;
+        *)
+            print_warn "未检测到可用的防火墙后端, 未做修改"
+            return 0
+            ;;
+    esac
+    print_ok "防火墙规则已清理 ($n 条, 后端 $be)"
+    print_warn "提示: 若卸载后无法 SSH, 请用云控制台放行本机 SSH 端口"
 }
 
 do_uninstall() {
