@@ -548,6 +548,7 @@ fw_log_port() {
 open_port() {
       local port="$1"
       fw_log_port "$port"
+      fw_unlog_closed_port "$port"
       local be; be=$(fw_detect_backend)
       case "$be" in
           nft)
@@ -564,6 +565,7 @@ open_port() {
                            comment "$SB_NFT_COMMENT" 2>/dev/null
               done
               print_ok "nft 已放行 $port (tcp+udp)"
+              fw_persist_nft
               ;;
           ufw)
               ufw allow "$port/tcp" >/dev/null 2>&1
@@ -588,6 +590,96 @@ open_port() {
   }
 
   # 该端口是否正被 sshd 监听 —— 碰它就等于自断连接
+  # ---- nft 规则持久化 ----
+  #
+  # nft 规则是内存态的: 动态 add 的规则重启就没了。用户自己的 nftables.sh
+  # 靠它自己的 systemd 单元加载 zz-ufw-panel-dynamic.nft 解决持久化, 但那份
+  # 文件不包含本面板开的端口 —— 所以切到 nft 后端后, 重启会丢掉我们所有规则。
+  #
+  # 这里自建一份规则文件和单元, 排在对方单元**之后**执行, 按登记表 (.fw-ports)
+  # 重新落一遍 —— 登记表是唯一的真实来源, 因此文件与实际状态不会漂移。
+  SB_NFT_OWN_FILE="/etc/nftables.d/zz-sb-panel.nft"
+  # 脚本目录取 lib.sh 自身所在位置 —— SB_CONFIG_DIR 是 <root>/config,
+  # 与 <root>/conf 同级, 不能拿它拼出脚本路径。
+  SB_FW_APPLY="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/fw_apply.sh"
+  SB_NFT_UNIT="sb-panel-nft.service"
+  
+  # 记录"本面板主动关掉过"的端口。
+  # 对方那套 nftables.sh 会把链上规则扫进它自己的文件, 注释被抹掉; 我们关掉
+  # 端口后那份文件里仍留着条目, 重启会被重新打开。开机时靠这份名单认领那些
+  # 残留并清掉 (见 conf/fw_apply.sh)。
+  fw_log_closed_port() {
+      local port="$1" list="$SB_ROOT/.fw-closed-ports"
+      [[ "$port" =~ ^[0-9]+$ ]] || return 0
+      mkdir -p "$SB_ROOT" 2>/dev/null
+      grep -qxF "$port" "$list" 2>/dev/null || echo "$port" >> "$list" 2>/dev/null || true
+  }
+  fw_unlog_closed_port() { # 端口重新被打开时撤销记账
+      local port="$1" list="$SB_ROOT/.fw-closed-ports"
+      [[ "$port" =~ ^[0-9]+$ ]] || return 0
+      [[ -f "$list" ]] || return 0
+      grep -vxF "$port" "$list" > "$list.tmp" 2>/dev/null && mv -f "$list.tmp" "$list"
+  }
+  
+  fw_persist_nft() {
+      command -v nft >/dev/null 2>&1 || return 0
+      [[ "$(fw_detect_backend)" == "nft" ]] || return 0
+      local be; be=$(fw_detect_backend)
+      [[ "$be" == "nft" ]] || return 0
+      local port tmp; tmp=$(mktemp)
+      {
+          echo "# 由 SB-Panel 自动生成 —— 请勿手改, 改动会在下次开/关节点时丢失"
+          echo "table inet filter {"
+          echo "  chain input {"
+          # 系统常用端口一律不放行: 443 是用户自己的 nginx, 80/22 等同理。
+          # 这些端口由各自的服务负责, 不该由节点放行逻辑接管。
+          while read -r port; do
+              [[ "$port" =~ ^[0-9]+$ ]] || continue
+              case "$port" in 22|80|443|8443|3306|5432|6379|27017) continue ;; esac
+              echo "    tcp dport $port accept comment \"SB_PANEL\""
+              echo "    udp dport $port accept comment \"SB_PANEL\""
+          done < <(sort -n "$SB_ROOT/.fw-ports" 2>/dev/null)
+          echo "  }"
+          echo "}"
+      } > "$tmp"
+      mkdir -p "$(dirname "$SB_NFT_OWN_FILE")" 2>/dev/null
+      if ! install -m 0644 "$tmp" "$SB_NFT_OWN_FILE" 2>/dev/null; then
+          cp -f "$tmp" "$SB_NFT_OWN_FILE" 2>/dev/null
+      fi
+      rm -f "$tmp"
+      # 这里**只重写文件, 不做 nft -f**。
+      # open_port 已经把规则加到链上了, 再加载一次文件会把同样的规则再加一遍
+      # (nft -f 是追加语义, 不去重), 每开关一个端口就多一倍重复规则。
+      # 文件只在开机时由 fw_apply.sh 加载一次。
+      fw_install_nft_unit
+      return 0
+  }
+  
+  fw_install_nft_unit() {
+      local unit="/etc/systemd/system/$SB_NFT_UNIT"
+      [[ -f "$unit" ]] && return 0
+      command -v nft >/dev/null 2>&1 || return 0
+      # 用 printf 而非 heredoc: 嵌在函数里的 heredoc 终止符容易和调用方
+      # 的 heredoc 撞车, 单元内容又需要 $SB_NFT_OWN_FILE 在生成时就展开。
+      printf '%s\n' \
+        '[Unit]' \
+        "Description=SB-Panel nftables rules (regenerated from .fw-ports)" \
+        'After=network.target nftables.service ufw-panel-nftables.service nftables-panel.service' \
+        'Wants=nftables.service' \
+        '' \
+        '[Service]' \
+        'Type=oneshot' \
+        "ExecStart=/bin/sh $SB_FW_APPLY" \
+        'RemainAfterExit=yes' \
+        '' \
+        '[Install]' \
+        'WantedBy=multi-user.target' > "$unit" 2>/dev/null || return 0
+      chmod 0644 "$unit" 2>/dev/null
+      systemctl daemon-reload >/dev/null 2>&1
+      systemctl enable "$SB_NFT_UNIT" >/dev/null 2>&1
+  }
+
+
   fw_unlog_port() { # 从登记表移除 (不做任何系统改动)
       local port="$1" list="$SB_ROOT/.fw-ports"
       [[ "$port" =~ ^[0-9]+$ ]] || return 0
@@ -637,15 +729,23 @@ close_node_port() { # <端口> <节点tag>  —— 只关"确认属于该节点"
       local be; be=$(fw_detect_backend)
       case "$be" in
           nft)
-              # 只删带本面板 comment 的规则 —— 同一链上可能还有用户自己的
-              # nftables.sh 规则、fail2ban 的封禁规则等, 那些一律不碰。
-              # 用 -a 拿到 handle 再精确删除, 避免按序号删错行。
+              # 关掉这个端口 = 删掉链上**所有**针对它、且不是 SSH 的规则。
+              #
+              # 为什么不能只删带 SB_PANEL 标记的: 用户自己那套 nftables.sh 的
+              # persist_dynamic_ports() 会把链上所有 "dport N accept" 的规则扫走,
+              # 去掉注释写进它自己的文件, 于是我们的规则会多出一份无标记副本。
+              # 只删带标记的那条, 无标记副本会留下来 —— 端口看着关了, 其实还开着。
+              #
+              # 安全性来自调用侧: 只有"本面板确实开过、且随节点一起删掉"的端口
+              # 才会走到这里 (来自 .fw-ports 登记表), 所以按端口整体清理是正确的。
+              # SSH 规则仍然逐条排除, 那是唯一不能碰的。
               local h
               while read -r h; do
                   [[ "$h" =~ ^[0-9]+$ ]] || continue
                   nft delete rule inet filter input handle "$h" >/dev/null 2>&1 && acted=1
               done < <(nft -a list chain inet filter input 2>/dev/null \
-                        | grep -E "dport ${port} .*${SB_NFT_COMMENT}" \
+                        | grep -E "dport ${port}([[:space:]]|$)" \
+                        | grep -v 'UFW_PANEL_SSH' \
                         | grep -oE "handle [0-9]+" | awk '{print $2}')
               # 注: nft -a 的行尾是 "# handle 2", # 后面跟的是空格而不是数字,
               # 所以不能写成 grep -oE "#[0-9]+" —— 那永远匹配不到, 会导致
@@ -670,6 +770,8 @@ close_node_port() { # <端口> <节点tag>  —— 只关"确认属于该节点"
               ;;
       esac
       fw_unlog_port "$port"
+      [[ "$be" == "nft" ]] && fw_log_closed_port "$port"
+      [[ "$be" == "nft" ]] && fw_persist_nft
       if (( acted )); then
           print_ok "已关闭防火墙端口 $port${tag:+ (原属 $tag, 后端 $be)}"
       else
