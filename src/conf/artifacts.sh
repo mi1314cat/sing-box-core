@@ -59,6 +59,22 @@ view_aggregate() {
     cat "$f"
     echo >&2
     printf "${CYAN}复制路径: %s%b\n" "$f" "$RESET" >&2
+    # 菜单承诺 "sb_client-all.json + all-share URL", 但这里原来只 cat 文件,
+    # URL 从没被生成过 —— 用户按提示去找分享链接会扑空。
+    # 顺带发一个聚合 share token, 让"全量聚合"名副其实。
+    if declare -F make_aggregate_share >/dev/null 2>&1; then
+        local mu tt
+        printf "  max_uses (0=不限, 回车=1): " >&2; read -r mu
+        mu=$(clean_input "$mu"); [[ -z "$mu" ]] && mu=1
+        printf "  有效期小时 (0=永久, 回车=24): " >&2; read -r tt
+        tt=$(clean_input "$tt"); [[ -z "$tt" ]] && tt=24
+        echo >&2
+        print_title "全量分享链接 (客户端 sb-client 菜单3 直接粘这个)"
+        make_aggregate_share "$mu" "$tt" >&2
+        echo >&2
+    else
+        print_warn "分享模块未加载, 跳过 URL 生成"
+    fi
 }
 
 links_all_view() {

@@ -25,7 +25,9 @@ meta_file() {
     done
 }
 
-share_url_for() { echo "http://$(default_server_ip):9292/share/$(jq -r .share_token "$1")"; }
+# IPv6 必须包方括号, 否则 "http://2001:db8::1:9292/..." 里的端口会被
+# 并进地址, 客户端解析成非法 host 而失败。
+share_url_for() { echo "http://$(sb_url_host "$(default_server_ip)"):9292/share/$(jq -r .share_token "$1")"; }
 
 # 聚合全部节点 outbound → 一份 client profile (selector PROXY + urltest AUTO + route.final)
 gen_full_profile() {
@@ -151,6 +153,44 @@ PY
     fi
 }
 
+  # 为聚合配置 (sb_client-all.json) 单独发一个 share token。
+  # create_share 走单节点文件路径 (sb_client-<tag>.json), 聚合产物走不了那条路,
+  # 于是菜单"全量聚合"承诺的 all-share URL 实际上从来没被生成过。
+  # 这里直接对聚合文件发 token, 与单节点链接同一套元数据/消费语义。
+  make_aggregate_share() { # <max_uses> <ttl_hours>
+      local max_uses="${1:-1}" ttl="${2:-24}"
+      local client_file="$SB_OUT_DIR/sb_client-all.json"
+      [[ -f "$client_file" ]] || { print_error "找不到聚合配置: $client_file"; return 1; }
+      [[ "$max_uses" =~ ^[0-9]+$ ]] || { print_error "max_uses 必须是非负整数 (0=不限)"; return 1; }
+      [[ "$ttl" =~ ^[0-9]+$ ]] || { print_error "ttl_hours 必须是小时数 (0=永久)"; return 1; }
+      # 聚合链接与旧聚合 token 互斥: 一个 tag 只保留一个有效链接
+      local f
+      for f in "$SHARED"/*.json; do
+          [[ -f "$f" ]] || continue
+          [[ "$(jq -r .tag "$f" 2>/dev/null)" == "all" ]] && rm -f "$f"
+      done
+      local token now expires
+      token=$(openssl rand -hex 16)
+      now=$(date +%s)
+      if [[ "$ttl" -gt 0 ]]; then expires=$((now + ttl*3600)); else expires=0; fi
+      python3 - "$SHARED" "$token" "$max_uses" "$expires" "$client_file" <<'PY'
+import json,sys,os,time
+d,token,maxu,exp = sys.argv[1:5]
+# client_file 必须是绝对路径: 服务端用 os.path.isfile() 校验, 相对路径会按
+# share_server 的 CWD 解析而找不到文件, 返回 503 "config unavailable"。
+meta={"share_token":token,"tag":"all","client_file":sys.argv[5],
+      "created_at":int(time.time()),"expires_at":int(exp),
+      "max_uses":int(maxu),"used_count":0,"enabled":True,"last_used_at":0}
+open(os.path.join(d,f"{token}.json"),"w").write(json.dumps(meta,indent=1))
+PY
+      local url; url="$(share_url_for "$SHARED/$token.json")"
+      echo "$url" | tee "$SB_OUT_DIR/share_all.txt"
+      if [[ "$ttl" -gt 0 ]]; then
+          print_ok "聚合链接: max_uses=$max_uses, 有效期 ${ttl} 小时 ($(date -d @$expires '+%F %T'))"
+      else
+          print_ok "聚合链接: max_uses=$max_uses, 有效期: 永久"
+      fi
+  }
 share_files_sorted() { ls "$SHARED"/*.json 2>/dev/null | sort; }
 
 list_shares() {

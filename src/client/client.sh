@@ -525,20 +525,41 @@ add_node() {
         rm -f "$tmp"; print_err "sing-box check 失败, 旧配置未变"; return 1
     fi
     local n_count
-    n_count=$(jq '[.outbounds[] | select(.type != "selector" and .type != "urltest" and .type != "direct")] | length' "$tmp" 2>/dev/null || echo 1)
+      # 被别的 outbound 当作 detour 依赖的 tag (如 shadowtls 的 "<tag>-out" 包装层)
+      # 不是独立节点, 必须排除, 否则:
+      #   - 它会单独建一个 node-<tag>-out.json, 与主节点文件里的依赖层重复
+      #   - regen_selector 聚合时出现 duplicate outbound tag, 内核 check 直接失败
+      # 与服务端 share.sh 的 gen_full_profile 保持同一套判定。
+      HELPER_JQ='(.outbounds | map(select(.detour != null) | .detour)) as $deps
+                 | .outbounds[]
+                 | select(.type != "selector" and .type != "urltest" and .type != "direct")
+                 | select((.tag as $t | $deps | index($t)) == null)'
+      n_count=$(jq "[$HELPER_JQ] | length" "$tmp" 2>/dev/null || echo 1)
     if (( n_count <= 1 )); then
         import_one_outbound "$tmp"
     else
         local n=0 t tags
-        tags=$(jq -r '.outbounds[] | select(.type != "selector" and .type != "urltest" and .type != "direct") | .tag' "$tmp" 2>/dev/null)
+          tags=$(jq -r "$HELPER_JQ | .tag" "$tmp" 2>/dev/null)
         for t in $tags; do
             [[ -n "$t" ]] || continue
-            jq "{outbounds: [.outbounds[] | select(.tag == \"$t\")]}" "$tmp" > "$CLIENT_NODE_DIR/node-$t.json"
+              # 必须连 detour 依赖一起切出来。
+              # shadowtls 是两层结构: shadowsocks(tag=X) detour→ shadowtls(tag=X-out, 带
+              # server/port)。只按 tag 选主节点会把 X-out 丢掉, 得到一份
+              # server=null 且引用不存在 outbound 的坏配置 —— 内核启动即报
+              # "dependency[X-out] not found", 表现为该节点连不上。
+              jq --arg t "$t" '
+                  [.outbounds[] | select(.tag == $t)] as $main
+                  | (.outbounds[] | select(.tag == $t) | .detour) as $dep
+                  | (if $dep == null then [] else [.outbounds[] | select(.tag == $dep)] end) as $helper
+                  | {outbounds: ($helper + $main)}
+              ' "$tmp" > "$CLIENT_NODE_DIR/node-$t.json"
             echo "$src" > "$CLIENT_NODE_DIR/node-$t.txt"
             echo "{\"tag\":\"$t\",\"source\":\"share\",\"imported_at\":\"$(date -Is)\"}" > "$CLIENT_NODE_DIR/node-$t.meta"
             n=$((n+1))
         done
-        for t in $(jq -r '.outbounds[] | select(.type == "selector" or .type == "urltest" or .type == "direct") | .tag' "$tmp" 2>/dev/null); do
+          for t in $(jq -r '.outbounds[] | select(.type == "selector" or .type == "urltest" or .type == "direct") | .tag' "$tmp" 2>/dev/null) \
+                   $(jq -r '(.outbounds | map(select(.detour != null) | .detour)) as $deps | .outbounds[] | select((.tag as $t | $deps | index($t)) != null) | .tag' "$tmp" 2>/dev/null); do
+              [[ -n "$t" ]] || continue
             rm -f "$CLIENT_NODE_DIR/node-$t.json" "$CLIENT_NODE_DIR/node-$t.txt" "$CLIENT_NODE_DIR/node-$t.meta"
         done
         rm -f "$tmp"

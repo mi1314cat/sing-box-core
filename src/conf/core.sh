@@ -192,6 +192,17 @@ do_update() {
 
 do_uninstall() {
     print_warn "将停止并卸载 sing-box 内核与 service（保留配置目录）"
+      # 明确说清这一步**不**做什么 —— 之前只提示"保留配置", 用户容易以为
+      # 已经卸载干净, 结果留下: 分享服务仍在跑 (且指向已删的内核, 成悬空服务)、
+      # 全部节点/分享链接/产物都还在, 端口还占着。
+      echo "" >&2
+      print_info "本步骤**不会**删除:"
+      print_info "  - $SB_ROOT/config  (全部节点配置)"
+      print_info "  - $SB_ROOT/out     (客户端产物 / 分享链接)"
+      print_info "  - $SB_ROOT/cert    (自签证书)"
+      print_info "  - sing-box-share 服务 (会继续运行, 但内核已删, 分享链接将失效)"
+      echo "" >&2
+      print_info "要彻底清空请回到本菜单选 7) 完整卸载面板"
     read -r -p "确认? [y/N]: " yn
     [[ "$yn" =~ ^[yY] ]] || return 0
     systemctl stop "$SB_SERVICE" 2>/dev/null || true

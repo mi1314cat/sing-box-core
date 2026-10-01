@@ -183,6 +183,19 @@ default_server_ip() { # 优先公网网卡 IPv4; 无 v4 则回退 IPv6
 }
 
 
+  # URL 里的主机: IPv6 必须用方括号包起来, 否则端口会被当成地址的一部分。
+  #   错误: http://2001:db8::1:9292/share/xxx
+  #   正确: http://[2001:db8::1]:9292/share/xxx
+  # 客户端(浏览器/curl/sing-box)把前者解析成非法 host, 直接失败。
+  # IPv4 不加括号 (加了多数实现也认, 但没必要, 且日志难读)。
+  sb_url_host() {
+      local h="$1"
+      [[ -z "$h" ]] && { echo ""; return; }
+      case "$h" in
+          *:*) printf '[%s]' "$h" ;;   # 含冒号 = IPv6
+          *)   printf '%s' "$h" ;;
+      esac
+  }
 # ---- 协议文件编号: <proto>-NN.json ----
 # ---------- 证书选择 (CDN 友好) ----------
 # 从已检测到的证书里选, 而不是手打路径:

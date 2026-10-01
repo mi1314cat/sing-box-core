@@ -95,8 +95,9 @@ core_menu() {
         echo -e "${CYAN}2)${RESET} 安装/重装内核"
         echo -e "${CYAN}3)${RESET} 更新内核 (已是最新则跳过)"
         echo -e "${CYAN}4)${RESET} 版本管理 (当前/最新/指定)"
-        echo -e "${CYAN}5)${RESET} 卸载内核"
+        echo -e "${CYAN}5)${RESET} 卸载内核 (仅删内核+service, 保留配置)"
         echo -e "${CYAN}6)${RESET} 更新管理脚本 (git, 与内核更新分离)"
+        echo -e "${CYAN}7)${RESET} ${YELLOW}完整卸载面板${RESET} (内核+分享服务+全部节点/链接/配置)"
         echo -e "${CYAN}0)${RESET} 返回"
         read -r -p "请选择: " c || { clear; exit 0; }
         case "$c" in
