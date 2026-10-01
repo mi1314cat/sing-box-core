@@ -506,7 +506,7 @@ apply_change() { # $1=说明 ; 0=成功
     fi
     rm -f /tmp/.sbapply.$$
     if [[ -n "$(find_sb_pid || true)" ]]; then
-        do_reload && { print_ok "$what 已生效 (软重载, 零断流)"; return 0; }
+        do_reload && { print_ok "$what 已生效 (已重启)"; return 0; }
         print_warn "软重载未成功, 改为重启"
     fi
     do_start && print_ok "$what 已生效 (已启动服务)" || { print_err "启动失败"; return 1; }
@@ -1056,7 +1056,7 @@ show_panel() {
     ui_menu 11 "Web UI / Clash API"
     ui_menu 12 "配置检查"
     ui_menu 13 "客户端设置 (端口 / Web UI / 占用检测)"
-    ui_menu 14 "软重载配置 (零断流)"
+    ui_menu 14 "应用配置 (重启, sing-box 无热重载)"
     ui_menu 15 "卸载客户端 (停服务/删目录/删入口)"
     ui_menu  0 "退出"
     ui_rule
