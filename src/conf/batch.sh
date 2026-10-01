@@ -192,7 +192,6 @@ batch_main() {
           [[ "$rc" == "2" ]] || { SB_BATCH_CDN=1; SB_BATCH_CDN_DOMAIN="$cdn_dom"; }
           if (( SB_BATCH_CDN )); then
               print_ok "已启用 CDN: vless / vmess 将用 $cdn_dom 的证书, 并只监听 127.0.0.1"
-              print_info "生成完成后到 菜单 10 → 1 可自动把 Nginx 配好"
           fi
       else
           print_warn "未检测到真证书 (Cloudflare 不接受自签回源) —— 本次全部只能直连"
@@ -317,7 +316,6 @@ batch_main() {
     shopt -u nullglob
     if (( cdn_n > 0 )); then
         print_ok "$cdn_n 个节点已走 CDN 模式 (客户端连域名:443, 源站端口不对外暴露)"
-        print_info "下一步: 菜单 10 → 1 自动插入 Nginx, 或 → 2 手工粘贴片段"
     else
         print_info "本次没有节点走 CDN"
         print_info "  CDN 需同时满足: 传输为 ws/grpc/http(2)  且  使用真证书"
@@ -364,7 +362,13 @@ batch_main() {
     bash "$SELF_DIR/conf/share.sh" create-all </dev/null 2>&1 | grep -E "http://|已创建" | tail -2 >&2 || true
 
     show_service
-    print_ok "全协议一键生成 流程结束"
+      show_service
+      
+      # CDN 节点生成完就把 nginx 配好。之前这里只打印一句"请到菜单 10 → 1",
+      # 节点的 server 已经是 CDN 域名, 而 nginx 里没有对应 location,
+      # 节点连不上, 用户却只能自己再走一遍菜单才知道该做什么。
+      sb_cdn_autosetup
+      print_ok "全协议一键生成 流程结束"
 }
 
 show_service() {

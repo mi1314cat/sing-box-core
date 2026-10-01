@@ -152,6 +152,24 @@ cdn_check_orphans() {
 }
 
 # ---------- 自动插入 ----------
+# 生成完 CDN 节点后自动把 nginx 配好 —— 批量和单协议共用这一个入口。
+# 之前两条路径都只打印一句"请到菜单 10 → 1", 有的甚至什么都不说, 节点
+# 的 server 已经是 CDN 域名而 nginx 里没有对应 location, 连不上也无从查起。
+cdn_autosetup() {
+      # 没有任何走 CDN 的节点就别刷屏
+      local f n=0
+      shopt -s nullglob
+      for f in "$SB_CONFIG_DIR"/*.json; do
+          [[ "$(basename "$f")" =~ ^(00-|01-|02-|03-) ]] && continue
+          sb_cdn_enabled "$f" && n=$((n+1))
+      done
+      shopt -u nullglob
+      if (( n == 0 )); then return 0; fi
+      print_title "自动配置 Nginx (CDN)"
+      cdn_auto_insert
+  }
+  
+
 cdn_auto_insert() {
     local tmp; tmp=$(mktemp)
     local frag; frag="$SB_OUT_DIR/sb_cdn-nginx-location.conf"
@@ -186,20 +204,40 @@ cdn_auto_insert() {
         fi
         nfile=$((nfile+1))
         print_info "→ $dn : $target"
-        if python3 "$SELF_DIR/conf/cdn_apply.py" --domain "$dn" --file "$target" \
-             --block "$frag" --nginx "$(cdn_nginx_mode)" 2>&1 | sed 's/^/    /'; then
+        # 先把将要写入的内容摘要打出来再改文件 —— 出问题时能立刻看出
+        # 是哪几条 location 被写进了哪个文件。
+        print_info "  将写入的 location:"
+        grep -E "^[[:space:]]*location /|proxy_pass" "$frag" 2>/dev/null \
+            | sed 's/^[[:space:]]*/    /'
+        echo >&2
+        # 不能写成 `if python3 ... | sed ...; then` —— 管道的退出码取自最后一个
+        # 命令(sed), python3 失败也被判成成功, 于是明明没插入却报 [OK]。
+        # 实测踩过: $SELF_DIR 为空导致 cdn_apply.py 找不到文件, 照样显示"已成功插入"。
+        # 这里先跑 python3 拿退出码, 再单独把输出过滤一遍。
+        local rc=0 outf
+        outf=$(mktemp)
+        python3 "$SELF_DIR/conf/cdn_apply.py" --domain "$dn" --file "$target" \
+             --block "$frag" --nginx "$(cdn_nginx_mode)" >"$outf" 2>&1 || rc=$?
+        sed 's/^/    /' < "$outf"
+        rm -f "$outf"
+        if (( rc == 0 )); then
             ok=$((ok+1))
+        else
+            print_error "  ↑ 该站点插入失败 (退出码 $rc), 未做任何修改"
         fi
     done
 
     echo
     rm -f "$tmp"
 
-    if (( ok > 0 )); then
-        print_ok "已成功插入 $ok 个站点的 CDN 配置"
-    else
-        print_error "没有任何站点被自动修改"
-    fi
+      if (( ok > 0 )); then
+          print_ok "已成功插入 $ok 个站点的 CDN 配置"
+          # 插入成功但没重载 = 配置没生效, 节点照样连不上。
+          # reload 是平滑的(不断现有连接), 交给用户自己跑等于让功能半残。
+          cdn_nginx_reload
+      else
+          print_error "没有任何站点被自动修改"
+      fi
 
     # 关键: 自动没做成的, 一律给出片段让用户手工粘贴。
     # 自动化只是省事, 不是唯一路径 —— nginx 配置出错代价高, 必须留手工兜底。

@@ -94,6 +94,9 @@ EOF
     echo "$link" >> "$SB_OUT_DIR/sb_links-all.txt"
     open_port "$listen_port"
     print_ok "TUIC 节点添加完成: $file"
+    # 重建聚合: 新节点不在 sb_client-all.json 里的话, 分享链接
+    # (菜单3 / all-share URL) 下发的还是旧节点列表。
+    declare -F sb_regen_aggregate >/dev/null 2>&1 && sb_regen_aggregate
 }
 
 list_configs() {
@@ -121,9 +124,23 @@ delete_config() {
     # 交给 close_node_port 按"归属已确认"的口径关闭, 它只认 .fw-ports 登记过的
     # 端口, 且 sshd 在听的 / 系统常用端口一律不碰。
     local fw_port; fw_port=$(jq -r '.inbounds[0].listen_port // empty' "$file" 2>/dev/null)
-    rm -f "$file" "$SB_OUT_DIR/sb_share-$tag.txt" "$SB_OUT_DIR/sb_client-$tag.json" "$SB_OUT_DIR/sb_client-$tag.yaml"
+    # 产物文件名带形态后缀(如 sb_client-trojan03-TLS.json), 而这里的 $tag
+    # 不带后缀, 所以按字面删的是 sb_client-trojan03.json —— 永远删不到,
+    # 于是已删节点的产物长期残留, 还会被 gen_full_profile 读进聚合配置,
+    # 分享链接一直下发连不上的假节点。改按前缀通配删。
+    # 两种后缀都要匹配: 形态后缀是 "-TLS"/"-REALITY"(sb_client-tuic02-TLS.json),
+    # 而 "tuic02.*" 只匹配点号开头的后缀, 匹配不到带形态后缀的那个文件。
+    rm -f "$file" "$SB_OUT_DIR/sb_share-$tag".* "$SB_OUT_DIR/sb_share-$tag"-* \
+          "$SB_OUT_DIR/sb_client-$tag".* "$SB_OUT_DIR/sb_client-$tag"-* \
+          "$SB_OUT_DIR/sb_meta-$tag".* "$SB_OUT_DIR/sb_meta-$tag"-* 2>/dev/null
     [[ -n "$fw_port" ]] && close_node_port "$fw_port" "$tag"
     sb_check && sb_reload || print_warn "请手动确认服务状态"
+    # 重建聚合产物, 并同步 nginx ——
+    # 少了前者, sb_client-all.json 里会一直留着已删节点的 outbound, 分享链接
+    # 下发连不上的假节点; 少了后者, 站点配置里留着指向已删端口的 location,
+    # Cloudflare 回源直接 502。
+    declare -F sb_regen_aggregate >/dev/null 2>&1 && sb_regen_aggregate
+    declare -F sb_resync_cdn >/dev/null 2>&1 && sb_resync_cdn
     print_ok "已删除 $tag"
 }
 

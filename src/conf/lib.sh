@@ -538,6 +538,58 @@ backup_config() { # backup_config config|kernel|all
   # 绝不碰别的组件 (用户自己的 nftables.sh、fail2ban 等) 落在同一链上的规则。
   SB_NFT_COMMENT="SB_PANEL"
 
+  # 生成完走 CDN 的节点后, 自动把 nginx 配好。
+  #
+  # 协议脚本 (vless/vmess) 只 source 了 lib.sh, 拿不到定义在 cdn_menu.sh 里的
+  # cdn_autosetup, 所以这里做懒加载: 缺哪个文件补哪个, 再调用。
+  # 单独跑 conf/cdn.sh 时它会 source 本文件, 所以这里不会反过来套娃。
+  # 删节点后重建聚合产物。
+  #
+  # 以前 delete_config 只删单节点产物, 不管 out/sb_client-all.json, 于是聚合
+  # 里一直留着已删除节点的 outbound —— 分享链接(菜单3 / all-share URL)会一直
+  # 下发已经不存在的节点, 客户端导入后多出连不上的假节点。
+  # 实测: trojan03 删掉很久了, 聚合里仍有它的条目。
+  sb_regen_aggregate() {
+      # SELF_DIR 由 sing-box.sh 定义; 协议脚本单独执行时为空, 所以这里从
+      # lib.sh 自身位置反推 —— 否则 [[ -f "/conf/share.sh" ]] 直接假, 静默跳过。
+      local d; d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+      [[ -f "$d/share.sh" ]] || return 0
+      bash "$d/share.sh" regen-aggregate >/dev/null 2>&1 || return 0
+  }
+  
+  # 删节点后同步 nginx —— 否则站点配置里留着指向已删端口的 location,
+  # 表现为 Cloudflare 回源 502, 而且要等到真有人访问那条路径才会暴露。
+  # cdn_autosetup 会重新生成片段并替换旧块, 是幂等的。
+  sb_resync_cdn() {
+      local d; d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+      [[ -f "$d/cdn_node.sh" && -f "$d/cdn.sh" ]] || return 0
+      sb_cdn_autosetup
+  }
+  
+
+  sb_cdn_autosetup() {
+      local d; d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+      # SELF_DIR = $SB_ROOT, 由 sing-box.sh 定义。协议脚本单独跑时没有它,
+      # 而 cdn_auto_insert 内部用它拼 cdn_apply.py 的路径 —— 为空就会
+      # "can't open file '/conf/cdn_apply.py'" 然后静默失败。
+      [[ -n "${SELF_DIR:-}" ]] || SELF_DIR="$(cd "$d/.." && pwd)"
+      export SELF_DIR
+      declare -F cdn_autosetup >/dev/null 2>&1 || {
+          # cdn.sh 里除了 source 那两个, 还自己定义 cdn_gen_nginx_conf 等,
+          # 漏掉它会直接 "command not found"。三个都要, 缺一个都不行。
+          [[ -f "$d/cdn_node.sh"  ]] && source "$d/cdn_node.sh"
+          [[ -f "$d/cdn_nginx.sh"  ]] && source "$d/cdn_nginx.sh"
+          [[ -f "$d/cdn.sh"       ]] && source "$d/cdn.sh"
+          [[ -f "$d/cdn_menu.sh"  ]] && source "$d/cdn_menu.sh"
+      }
+      declare -F cdn_autosetup >/dev/null 2>&1 || {
+          print_info "如需自动配置 Nginx, 请用菜单 10 → 1"
+          return 0
+      }
+      cdn_autosetup
+  }
+  
+
 fw_log_port() {
     local port="$1"
     [[ "$port" =~ ^[0-9]+$ ]] || return 0

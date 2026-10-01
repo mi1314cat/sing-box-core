@@ -46,6 +46,39 @@ cdn_probe_nginx() {
 
 # ---------- 给 cdn_apply.py 用的校验方式 ----------
 # docker:<容器名> | systemd | none
+
+  # ---------- nginx 优雅重载 ----------
+  # 只重载, 不重启 —— restart 会掐断现有连接, reload 是平滑的。
+  # 这里不碰容器的启停, 只发信号: 容器仍由它的原有编排方式管理。
+  cdn_nginx_reload() {
+      local mode c
+      mode=$(cdn_nginx_mode)
+      case "$mode" in
+          docker:*)
+              c="${mode#docker:}"
+              docker exec "$c" nginx -s reload >/dev/null 2>&1 \
+                  && { print_ok "已重载 nginx (容器 $c)"; return 0; }
+              print_warn "重载容器 $c 失败 —— 请手工执行: docker exec $c nginx -s reload"
+              return 1
+              ;;
+          systemd)
+              if systemctl reload nginx >/dev/null 2>&1; then
+                  print_ok "已重载 nginx (systemd)"; return 0
+              fi
+              if nginx -s reload >/dev/null 2>&1; then
+                  print_ok "已重载 nginx (nginx -s reload)"; return 0
+              fi
+              print_warn "重载 nginx 失败 —— 请手工执行: nginx -s reload"
+              return 1
+              ;;
+          *)
+              print_warn "未检测到运行中的 nginx, 跳过重载"
+              print_warn "  配置已写入, 生效方式取决于你的部署 (面板/容器/编排)"
+              return 1
+              ;;
+      esac
+  }
+
 cdn_nginx_mode() {
     local mode rest c
     mode=$(cdn_probe_nginx)

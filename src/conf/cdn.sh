@@ -246,11 +246,22 @@ source "$_conf_dir/lib.sh"
 # shellcheck source=/dev/null
 [[ -f "$_here/cdn_menu.sh" ]] && source "$_here/cdn_menu.sh"
 
-case "${1:-}" in
-    nginx)     cdn_gen_nginx_conf ;;
-    certs)     cdn_show_certs ;;
-    nodes)     cdn_list_nodes ;;
-    artifacts) cdn_gen_all_nodes ;;
-    help|-h|--help) cdn_show_help ;;
-    *)         cdn_menu ;;
-esac
+# 只有被直接执行时才走下面的派发。被 lib.sh 懒加载 source 时必须跳过 ——
+# 否则一 source 就弹出菜单, 协议脚本刚加完节点突然冒出一个菜单框。
+if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
+    SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    _here="$SELF_DIR/conf"
+    _conf_dir="$_here"
+    [[ -f "$_conf_dir/lib.sh" ]] || _conf_dir="$_here"
+    source "$_conf_dir/lib.sh"
+    [[ -f "$_here/cdn_menu.sh" ]] && source "$_here/cdn_menu.sh"
+    
+    case "${1:-}" in
+        nginx)     cdn_gen_nginx_conf ;;
+        certs)     cdn_show_certs ;;
+        nodes)     cdn_list_nodes ;;
+        artifacts) cdn_gen_all_nodes ;;
+        help|-h|--help) cdn_show_help ;;
+        *)         cdn_menu ;;
+    esac
+fi
