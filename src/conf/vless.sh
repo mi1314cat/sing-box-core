@@ -18,6 +18,12 @@ extract_cert_domain() {
 }
 
 ask_cert() {
+    # 批量生成且启用 CDN: 直接选真证书。
+    # 自签无法被 Cloudflare 回源, 走 CDN 也没有意义, 所以批量 CDN 必须用真证书。
+    if [[ "${SB_BATCH:-}" == "1" && "${SB_BATCH_CDN:-0}" == "1" ]]; then
+        if sb_batch_cdn_pick_cert; then return 0; fi
+        print_warn "批量 CDN: 未找到可用真证书, 本节点退回自签 (将只能直连)"
+    fi
     echo "TLS 证书：" >&2
     echo "  1) 手动输入 crt/key 路径" >&2
     echo "  2) 生成自签证书 (客户端需 insecure/pin)" >&2

@@ -173,6 +173,31 @@ batch_main() {
         fi
     fi
     export SB_BATCH_PORT_START SB_BATCH_PORT_END
+
+      # --- CDN 策略 (第二次也是最后一次交互) ---
+      # 能走 CDN 的协议: vless / vmess (传输 ws/grpc/http + 真证书)。
+      # 其余协议是原生 TCP/UDP 或专用协议, Cloudflare 代理不了, 只能直连。
+      # 这里默认开启: 反正只有这两个协议受影响, 开不开都由协议本身决定,
+      # 不需要为"不支持 CDN 的协议"单独做任何事。
+      local SB_BATCH_CDN=0 SB_BATCH_CDN_DOMAIN=""
+      if sb_scan_certs >/dev/null 2>&1; then
+          local cdn_dom cdn_first
+          cdn_first="${sb_FOUND_CERTS[0]%%|*}"
+          cdn_dom=$(extract_cert_domain "$cdn_first")
+          echo >&2
+          print_info "检测到真证书: $cdn_dom (可用于 CDN 回源)"
+          printf "  CDN 模式: 1) vless/vmess 自动走 CDN (推荐)  2) 全部直连 [默认 1]: " >&2
+          read -r -p "  " rc 2>/dev/null
+          rc=$(clean_input "${rc:-}")
+          [[ "$rc" == "2" ]] || { SB_BATCH_CDN=1; SB_BATCH_CDN_DOMAIN="$cdn_dom"; }
+          if (( SB_BATCH_CDN )); then
+              print_ok "已启用 CDN: vless / vmess 将用 $cdn_dom 的证书, 并只监听 127.0.0.1"
+              print_info "生成完成后到 菜单 10 → 1 可自动把 Nginx 配好"
+          fi
+      else
+          print_warn "未检测到真证书 (Cloudflare 不接受自签回源) —— 本次全部只能直连"
+      fi
+      export SB_BATCH_CDN SB_BATCH_CDN_DOMAIN
     rm -f "$SB_OUT_DIR/.batch-used" "$SB_OUT_DIR/.batch-port"
 
     # --- 覆盖模式: 跳过已有 (幂等) / 覆盖全部 (先删后建) ---
@@ -227,6 +252,7 @@ batch_main() {
             skip_list+=("$proto"); continue
         fi
         SB_BATCH=1 SB_NO_RELOAD=1 \
+          SB_BATCH_CDN="${SB_BATCH_CDN:-0}" SB_BATCH_CDN_DOMAIN="${SB_BATCH_CDN_DOMAIN:-}" \
         SB_BATCH_PORT_START="$SB_BATCH_PORT_START" SB_BATCH_PORT_END="$SB_BATCH_PORT_END" \
         timeout 240 bash "$SELF_DIR/conf/${proto}.sh" add </dev/null >/tmp/batch-$proto.log 2>&1
         local mod_rc=$?
@@ -253,6 +279,7 @@ batch_main() {
         # safe_read() 在 SB_BATCH 下直接返回默认值且不消费答案队列, 靠应答串
         # 定位提问会整体错位 (历史上 4 被当成"传输方式", Reality 变体退化成 plain)。
         # SB_FORCE_TLS_REALTY=1 让 ask_tls/ask_cert 直接选 Reality, 跳过交互。
+          SB_BATCH_CDN=0 \
         SB_BATCH=1 SB_NO_RELOAD=1 SB_FORCE_TLS_REALTY=1 \
         SB_BATCH_PORT_START="$SB_BATCH_PORT_START" SB_BATCH_PORT_END="$SB_BATCH_PORT_END" \
         timeout 240 bash "$SELF_DIR/conf/${vp}.sh" add </dev/null >/tmp/batch-$vp-v.log 2>&1

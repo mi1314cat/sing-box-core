@@ -258,6 +258,27 @@ sb_cert_is_real_issuer() {
     return 0
 }
 
+# ---------- 批量模式下的 CDN 证书选择 ----------
+# 批量生成时若启用 CDN (SB_BATCH_CDN=1), 从已检测到的证书里挑一张真证书。
+# 若可用证书的域名与站点配置的 server_name 不一致, 客户端仍能连
+# (CDN 只认域名本身), 但 Nginx 需要有对应 server{} —— 由 cdn_auto_insert
+# 负责定位; 定位不到会提示手工粘贴, 不会静默写错地方。
+sb_batch_cdn_pick_cert() {
+    sb_scan_certs >/dev/null 2>&1 || return 1
+    local want="${SB_BATCH_CDN_DOMAIN:-}" e crt key dom
+    # 指定了域名就找匹配的, 否则第一张可用即可
+    for e in "${sb_FOUND_CERTS[@]}"; do
+        crt="${e%%|*}"; key="${e#*|}"; key="${key%%|*}"
+        dom=$(extract_cert_domain "$crt")
+        if [[ -n "$want" && "$dom" != "$want" ]]; then continue; fi
+        CERT_FILE="$crt"; KEY_FILE="$key"; CERT_DOMAIN="$dom"
+        CERT_TRUSTED=true
+        print_info "批量 CDN: 使用证书 $dom"
+        return 0
+    done
+    return 1
+}
+
 # ---------- 建节点时询问接入方式 ----------
 # 参照参考脚本 vlessxhttpecn.sh 的 ACCESS_MODE:
 #   1) 直连       监听对外地址, 客户端连 服务器IP:端口   (最简单, 无需 Nginx)
@@ -291,6 +312,12 @@ ask_access_mode() {
         local c; c=$(safe_read "选择" "1")
         [[ -z "$c" ]] && c=1
         ACCESS_MODE="direct"
+        return 0
+    fi
+
+    # 批量模式: 直接定成 CDN+Nginx, 不再逐个询问
+    if [[ "${SB_BATCH:-}" == "1" && "${SB_BATCH_CDN:-0}" == "1" ]]; then
+        ACCESS_MODE="cdn-nginx"
         return 0
     fi
 

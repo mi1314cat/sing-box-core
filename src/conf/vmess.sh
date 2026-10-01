@@ -18,6 +18,14 @@ extract_cert_domain() {
 }
 
 ask_tls() { # 输出: CERT_MODE|cert_file|key_file|cert_domain|trusted(0|1) 到 stdout
+    # 批量 CDN: 必须真证书 (自签 Cloudflare 不接受; no-TLS 裸 ws 也走不了 CDN)
+    if [[ "${SB_BATCH:-}" == "1" && "${SB_BATCH_CDN:-0}" == "1" ]]; then
+        if sb_batch_cdn_pick_cert; then
+            echo "real|$CERT_FILE|$KEY_FILE|$CERT_DOMAIN"
+            return 0
+        fi
+        print_warn "批量 CDN: 未找到可用真证书, 退回 no-TLS (该节点只能直连)"
+    fi
     echo "TLS 选项: 1) no-TLS(裸 ws) 2) 真证书 3) 自签(pin) 4) Reality (回车=1 no-TLS)" >&2
     # 批量生成 Reality 变体时由 batch 显式指定 (依赖应答串会因 safe_read 不消费
     # 队列而整体错位, 见 batch.sh 注释)。只替换交互输入, 复用下方原有分支。
