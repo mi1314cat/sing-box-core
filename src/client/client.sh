@@ -32,9 +32,15 @@ sb_detect_proxy() {
     local host port code
     for host in 127.0.0.1 localhost; do
         for port in 7890 7891 7897 10808 10809 8080 8118 1080 1081 20171 33211; do
-            (exec 3<>"/dev/tcp/$host/$port") 2>/dev/null || continue
-            exec 3<&- 2>/dev/null; exec 3>&- 2>/dev/null
-            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 \
+            # 探测必须带超时。裸的 (exec 3<>/dev/tcp/...) 在端口被防火墙
+            # DROP (而不是 REJECT) 时不会立刻失败, 而是挂满整个 TCP 超时
+            # (Linux 默认约 130 秒)。11 个端口 x 2 个 host 串下来就是几分钟,
+            # 表现为"选了菜单 3 之后界面卡住不动"。
+            # 端口没开时 REJECT 会秒回, 所以卡住只发生在被静默丢弃的端口上,
+            # 但只要有一个中招, 整轮探测就废了。
+            timeout 2 bash -c "exec 3<>/dev/tcp/$host/$port" 2>/dev/null || continue
+            # (fd 3 在上面的 timeout 子 shell 里, 父进程无需再关)
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
                    --proxy "http://$host:$port" https://github.com/ 2>/dev/null)
             [[ "$code" =~ ^[1-4] ]] || continue
             export http_proxy="http://$host:$port" https_proxy="http://$host:$port"
@@ -67,9 +73,15 @@ sb_proxy_scan() { # 探测本机可用 HTTP 代理, 结果放进 SB_PROXY_CANDS
     local host port code
     for host in 127.0.0.1 localhost; do
         for port in 7890 7891 7897 10808 10809 8080 8118 1080 1081 20171 33211; do
-            (exec 3<>"/dev/tcp/$host/$port") 2>/dev/null || continue
-            exec 3<&- 2>/dev/null; exec 3>&- 2>/dev/null
-            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 \
+            # 探测必须带超时。裸的 (exec 3<>/dev/tcp/...) 在端口被防火墙
+            # DROP (而不是 REJECT) 时不会立刻失败, 而是挂满整个 TCP 超时
+            # (Linux 默认约 130 秒)。11 个端口 x 2 个 host 串下来就是几分钟,
+            # 表现为"选了菜单 3 之后界面卡住不动"。
+            # 端口没开时 REJECT 会秒回, 所以卡住只发生在被静默丢弃的端口上,
+            # 但只要有一个中招, 整轮探测就废了。
+            timeout 2 bash -c "exec 3<>/dev/tcp/$host/$port" 2>/dev/null || continue
+            # (fd 3 在上面的 timeout 子 shell 里, 父进程无需再关)
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
                    --proxy "http://$host:$port" https://github.com/ 2>/dev/null)
             # 1xx~4xx 都算可用 (GitHub 会 3xx 重定向); 000 才是不可用
             [[ "$code" =~ ^[1-4] ]] || continue
