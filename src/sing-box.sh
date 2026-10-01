@@ -32,7 +32,7 @@ service_menu() {
         echo -e "${CYAN}1)${RESET} 启动服务"
         echo -e "${CYAN}2)${RESET} 停止服务"
         echo -e "${CYAN}3)${RESET} 重启服务 (restart)"
-        echo -e "${CYAN}4)${RESET} 软重载配置 (SIGHUP, 零断流)"
+        echo -e "${CYAN}4)${RESET} 应用配置 (重启, sing-box 无热重载)"
         echo -e "${CYAN}5)${RESET} 状态查看"
         echo -e "${CYAN}0)${RESET} 返回"
         read -r -p "请选择: " c || { echo; exit 0; }
@@ -40,7 +40,7 @@ service_menu() {
             1) systemctl start "$SB_SERVICE" && sleep 1 && sys_status ;;
             2) systemctl stop "$SB_SERVICE";  sys_status ;;
             3) sb_restart ;;
-            4) sb_reload ;;
+            4) sb_restart ;;
             5) sys_status ;;
             0) return ;;
             *) echo -e "${RED}无效选项 $c${RESET}" ;;
@@ -56,18 +56,19 @@ sys_status() {
     echo >&2
 }
 
-check_all() {
-    print_title "校验配置 + 服务状态"
-    if sb_check; then
-        sys_status
-        read -r -p "重载 (SIGHUP) 还是重启 (restart)? [r/R=重启, 回车=软重载, n=不重载]: " m
-        case "$(clean_input "$m")" in
-            n|N) : ;;
-            r|R) sb_restart ;;
-            *)   sb_reload ;;
-        esac
-    fi
-}
+  check_all() {
+      print_title "校验配置 + 服务状态"
+      if sb_check; then
+          sys_status
+          # 原来默认是"SIGHUP 软重载", 而 sing-box 根本不支持 SIGHUP 重读配置:
+          # 回车只是发个信号, 什么都不做, 却一路显示成功。改成默认重启。
+          read -r -p "是否重启服务以应用新配置? [Y/重启, n=不重载]: " m
+          case "$(clean_input "$m")" in
+              n|N) : ;;
+              *)   sb_restart ;;
+          esac
+      fi
+  }
 
 # ---- 安装 / 内核子菜单 (脚本更新与内核更新分离) ----
 update_scripts() {

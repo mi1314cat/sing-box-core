@@ -639,6 +639,12 @@ do_start(){
     if [[ "$SB_UNIT_NAME" != "$SB_UNIT_ADHOC" ]]; then
         systemctl stop "$SB_UNIT_ADHOC" 2>/dev/null || true
     fi
+    # 服务已在跑时, `systemctl start` 是空操作(返回 0 但什么都不做), 调用方
+    # 会以为"新配置已生效"。实测: 导入 12 个新节点后显示"已生效 (已启动服务)",
+    # 实际运行实例仍在用旧端口拨不出去。已在跑就 restart, 让新配置真正加载。
+    if systemctl is-active --quiet "$SB_UNIT_NAME" 2>/dev/null; then
+        systemctl restart "$SB_UNIT_NAME" && return 0
+    fi
     systemctl start "$SB_UNIT_NAME" && return 0
     print_err "systemd 启动失败, 诊断信息:"
     systemctl is-active "$SB_UNIT_NAME" >&2 || true
@@ -657,17 +663,29 @@ do_stop(){
     return 0
 }
 do_restart(){ do_stop; sleep 1; do_start; }
-do_reload(){
-    local p; p="$(find_sb_pid || true)"
-    [[ -n "$p" ]] || { print_err "sing-box 未运行, 无需重载 (请先启动)"; return 1; }
-    if have_systemd && unit_installed && systemctl is-active --quiet "$SB_UNIT_NAME" 2>/dev/null; then
-        systemctl reload "$SB_UNIT_NAME" 2>/dev/null && return 0
-    fi
-    kill -HUP "$p" 2>/dev/null || return 1
-    sleep 1
-    [[ -d "/proc/$p" ]] || { print_err "重载后进程退出"; return 1; }
-    return 0
-}
+  do_reload(){
+      # 必须 restart。unit 里是 ExecReload=/bin/kill -HUP $MAINPID, 但 sing-box
+      # **不支持 SIGHUP 热重载** —— 没有 reload 子命令, 收到 SIGHUP 也不重读配置。
+      # 而 kill 返回 0, 所以 `systemctl reload` 永远"成功", PID 也不变, 旧代码
+      # 一路返回 0 并打印"软重载, 零断流", 而新配置根本没生效。
+      #
+      # 实测: 配置文件里 anytls 端口已是 25959, 运行实例仍在拨 20478;
+      # systemctl reload 返回 0, 行为毫无变化。导入新节点后旧节点继续被使用,
+      # 面板却一路 [OK] —— 又是静默假成功。
+      local p; p="$(find_sb_pid || true)"
+      [[ -n "$p" ]] || { print_err "sing-box 未运行, 无需重载 (请先启动)"; return 1; }
+      if have_systemd && unit_installed && systemctl is-active --quiet "$SB_UNIT_NAME" 2>/dev/null; then
+          systemctl restart "$SB_UNIT_NAME" 2>/dev/null || return 1
+      else
+          kill "$p" 2>/dev/null || return 1
+          sleep 1
+          "$CLIENT_BIN" run -D "$CLIENT_CONF" -C "$CLIENT_CONF" >/dev/null 2>&1 &
+      fi
+      sleep 1
+      p="$(find_sb_pid || true)"
+      [[ -n "$p" ]] || { print_err "重载后进程未起来"; return 1; }
+      return 0
+  }
 
 do_status(){ # 详细状态
     collect_status

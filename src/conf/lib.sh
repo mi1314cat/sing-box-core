@@ -844,7 +844,7 @@ close_node_port() { # <端口> <节点tag>  —— 只关"确认属于该节点"
 # ---- 服务 ----
 sb_service_active() { systemctl is-active "$SB_SERVICE" >/dev/null 2>&1; }
 
-sb_reload() { # HUP 软重载：check 通过才发；SIGHUP 失败时 sing-box 自动保留旧实例
+sb_reload() { # 应用新配置: check 通过才重启
     if [[ -n "${SB_NO_RELOAD:-}" ]]; then
         print_ok "批量模式: 跳过本次 reload (由全协议生成收尾统一执行)"
         return 0
@@ -859,17 +859,25 @@ sb_reload() { # HUP 软重载：check 通过才发；SIGHUP 失败时 sing-box �
         if sb_service_active; then print_ok "服务已启动"; return 0; fi
         print_error "服务启动失败"; return 1
     fi
-    if ! systemctl reload "$SB_SERVICE" 2>/dev/null; then
-        print_warn "systemctl reload 失败，尝试 restart"
-    elif sleep 1 && sb_service_active; then
-        print_ok "已通过 SIGHUP 软重载（不重启进程，零断流）"
-        return 0
-    fi
-    systemctl restart "$SB_SERVICE"
-    sleep 1
-    if sb_service_active; then
-        print_ok "SIGHUP 软重载失败，已改用 restart 兜底恢复"
-        return 0
+    # 必须 restart, 不能靠 SIGHUP。
+    #
+    # unit 里写的是 ExecReload=/bin/kill -HUP $MAINPID, 而 sing-box **不支持**
+    # SIGHUP 热重载 —— 它没有 reload 子命令, 收到 SIGHUP 不会重读配置。
+    # 但 kill 本身返回 0, 所以 `systemctl reload` 永远"成功", 旧代码据此
+    # 打印"已通过 SIGHUP 软重载(零断流)"就返回了, 新配置其实**根本没生效**。
+    #
+    # 实测: 配置文件里 anytls 端口已是 25959, 运行中的实例仍在拨 20478;
+    # 执行 systemctl reload 返回 0、进程 PID 不变、行为完全不变。
+    # 也就是说"加节点/删节点/改节点"在不重启的情况下全是空操作, 面板一路
+    # 显示成功, 用户却看不到任何变化 —— 这是最坏的一类假成功。
+    #
+    # sing-box 没有热重载能力, 所以这里只能 restart。
+    if systemctl restart "$SB_SERVICE" 2>/dev/null; then
+        sleep 1
+        if sb_service_active; then
+            print_ok "已重启生效 (sing-box 不支持 SIGHUP 热重载, 只能重启)"
+            return 0
+        fi
     fi
     print_error "服务异常，请查看 journalctl -u $SB_SERVICE"
     journalctl -u "$SB_SERVICE" -n 10 --no-pager 2>/dev/null | tail -10 >&2
