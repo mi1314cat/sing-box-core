@@ -508,6 +508,36 @@ backup_config() { # backup_config config|kernel|all
 # ---- 防火墙放行（ufw/firewall-cmd/iptables 三级回退）----
 # 登记本面板放行过的端口; 卸载时 clean_fw 只按这份清单删除,
 # 绝不扫描防火墙全表 (扫描会误删 SSH 等系统规则, 导致失联)
+  # 防火墙后端探测 —— 决定放行/关闭规则写到哪去。
+  #
+  # 为什么要分得这么细: 原生 nft 规则与 iptables 规则**互不可见**。
+  # 实测: 在 inet 表加一条原生 nft 规则后, `iptables -C INPUT` 完全查不到 ——
+  # 因为 iptables(nf_tables 后端) 管的是 `table ip filter / chain INPUT`,
+  # 而原生 nft 是 `table inet filter / chain input`, 表族和链名都不同。
+  # 只认 iptables 的话, 换用原生 nft 后本面板的关端口一条都删不掉,
+  # 节点删了端口还开着。
+  fw_detect_backend() {
+      # 有 inet filter 表 = 有组件在用原生 nft 管理防火墙
+      if command -v nft >/dev/null 2>&1 \
+         && nft list table inet filter >/dev/null 2>&1; then
+          echo nft; return 0
+      fi
+      if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+          echo ufw; return 0
+      fi
+      if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state 2>/dev/null | grep -q running; then
+          echo firewalld; return 0
+      fi
+      if command -v iptables >/dev/null 2>&1; then
+          echo iptables; return 0
+      fi
+      echo none
+  }
+
+  # 本面板在 nft 里加的规则一律带这个 comment; 关端口时只认带它的,
+  # 绝不碰别的组件 (用户自己的 nftables.sh、fail2ban 等) 落在同一链上的规则。
+  SB_NFT_COMMENT="SB_PANEL"
+
 fw_log_port() {
     local port="$1"
     [[ "$port" =~ ^[0-9]+$ ]] || return 0
@@ -516,35 +546,48 @@ fw_log_port() {
 }
 
 open_port() {
-    local port="$1"
-    fw_log_port "$port"
-    if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
-        ufw allow "$port/tcp" >/dev/null 2>&1
-        ufw allow "$port/udp" >/dev/null 2>&1
-        print_ok "ufw 已放行 $port (tcp+udp)"
-    elif command -v firewall-cmd >/dev/null && firewall-cmd --state 2>/dev/null | grep -q running; then
-        firewall-cmd --zone=public --add-port="$port/tcp" --permanent >/dev/null 2>&1
-        firewall-cmd --zone=public --add-port="$port/udp" --permanent >/dev/null 2>&1
-        firewall-cmd --reload >/dev/null 2>&1
-        print_ok "firewalld 已放行 $port (tcp+udp)"
-    elif command -v iptables >/dev/null; then
-        iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$port" -j ACCEPT
-        iptables -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport "$port" -j ACCEPT
-        print_ok "iptables 已放行 $port (tcp+udp)"
-    else
-        print_warn "未检测到防火墙工具，请手动放行 $port"
-    fi
-}
+      local port="$1"
+      fw_log_port "$port"
+      local be; be=$(fw_detect_backend)
+      case "$be" in
+          nft)
+              # 表/链不存在就建出来(装了原生 nft 防火墙但还没建表的场景)
+              nft list table inet filter >/dev/null 2>&1 || nft add table inet filter 2>/dev/null
+              nft list chain inet filter input >/dev/null 2>&1 || {
+                  nft add chain inet filter input '{ type filter hook input priority 0; policy accept; }' 2>/dev/null
+              }
+              local proto
+              for proto in tcp udp; do
+                  nft list chain inet filter input 2>/dev/null \
+                      | grep -qE "${proto} dport ${port} accept.*${SB_NFT_COMMENT}" \
+                      || nft add rule inet filter input "$proto" dport "$port" accept \
+                           comment "$SB_NFT_COMMENT" 2>/dev/null
+              done
+              print_ok "nft 已放行 $port (tcp+udp)"
+              ;;
+          ufw)
+              ufw allow "$port/tcp" >/dev/null 2>&1
+              ufw allow "$port/udp" >/dev/null 2>&1
+              print_ok "ufw 已放行 $port (tcp+udp)"
+              ;;
+          firewalld)
+              firewall-cmd --zone=public --add-port="$port/tcp" --permanent >/dev/null 2>&1
+              firewall-cmd --zone=public --add-port="$port/udp" --permanent >/dev/null 2>&1
+              firewall-cmd --reload >/dev/null 2>&1
+              print_ok "firewalld 已放行 $port (tcp+udp)"
+              ;;
+          iptables)
+              iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$port" -j ACCEPT
+              iptables -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport "$port" -j ACCEPT
+              print_ok "iptables 已放行 $port (tcp+udp)"
+              ;;
+          *)
+              print_warn "未检测到防火墙工具，请手动放行 $port"
+              ;;
+      esac
+  }
 
-  # ---- 防火墙关闭（删除节点时收口）----
-  #
-  # 安全设计（与 uninstall.sh 的 clean_fw 同一套原则, 那套是为了修
-  # "扫防火墙全表按端口猜, 误删 SSH 规则导致失联" 这个事故而写的）:
-  #   1. 绝不扫描防火墙全表 —— 只认 .fw-ports 登记过的端口。
-  #   2. 端口必须确实属于被删的那个节点 —— 由调用方在删除前把端口传进来,
-  #      不靠"现在没人监听"推断归属（端口释放后可能已被别的服务接管）。
-  #   3. sshd 正在监听的端口一律不关; 系统常用端口硬性黑名单。
-  #   4. 防火墙未启用时只更新登记表, 不做任何系统改动。
+  # 该端口是否正被 sshd 监听 —— 碰它就等于自断连接
   fw_unlog_port() { # 从登记表移除 (不做任何系统改动)
       local port="$1" list="$SB_ROOT/.fw-ports"
       [[ "$port" =~ ^[0-9]+$ ]] || return 0
@@ -552,23 +595,30 @@ open_port() {
       grep -vxF "$port" "$list" > "$list.tmp" 2>/dev/null && mv -f "$list.tmp" "$list"
   }
 
-  # 该端口是否正被 sshd 监听 —— 碰它就等于自断连接
+
 fw_port_is_ssh() {
       local port="$1"
       # ss 的一行形如: LISTEN 0 128 0.0.0.0:6541 0.0.0.0:* users:(("sshd",pid=837,fd=6))
-      # 进程名在端口**后面**, 所以不能写成 "sshd.*:PORT" —— 那样永远匹配不到。
-      # 必须同一行里既出现该监听端口, 又出现 sshd。
+      # 进程名在端口**后面**, 所以不能写成 "sshd.*:PORT" —— 那样永远匹配不到,
+      # 安全网会形同虚设。必须同一行里既出现该监听端口, 又出现 sshd。
       if command -v ss >/dev/null 2>&1; then
           ss -Hltnp 2>/dev/null | grep -E "[:.]${port}[[:space:]]" | grep -q "sshd" && return 0
       fi
-      # 兜底: ss 看不到进程名时(权限不足), 读 sshd 自己的配置
+      # 兜底1: sshd 自己的配置
       if [[ -r /etc/ssh/sshd_config ]]; then
           grep -qiE "^[[:space:]]*Port[[:space:]]+${port}([[:space:]]|$)" /etc/ssh/sshd_config && return 0
+      fi
+      # 兜底2: 防火墙里被标成 SSH 的放行规则 (含原生 nft)
+      if command -v nft >/dev/null 2>&1; then
+          nft list ruleset 2>/dev/null | grep -iE "dport ${port} accept" | grep -qi "ssh" && return 0
+      fi
+      if command -v iptables >/dev/null 2>&1; then
+          iptables -S 2>/dev/null | grep -E -- "--dport ${port} " | grep -qi "ssh\|SSH" && return 0
       fi
       return 1
   }
 
-  close_node_port() { # <端口> <节点tag>  —— 只关"确认属于该节点"的端口
+close_node_port() { # <端口> <节点tag>  —— 只关"确认属于该节点"的端口
       local port="$1" tag="${2:-}"
       [[ "$port" =~ ^[0-9]+$ ]] || return 0
       # 不在登记名单里的, 说明本面板没为它开过规则, 不该由本面板去关
@@ -584,26 +634,46 @@ fw_port_is_ssh() {
           22|80|443|8443|3306|5432|6379|27017) fw_unlog_port "$port"; return 0 ;;
       esac
       local acted=0
-      if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
-          ufw delete allow "$port/tcp" >/dev/null 2>&1 && acted=1
-          ufw delete allow "$port/udp" >/dev/null 2>&1 && acted=1
-      elif command -v firewall-cmd >/dev/null && firewall-cmd --state 2>/dev/null | grep -q running; then
-          firewall-cmd --zone=public --remove-port="$port/tcp" --permanent >/dev/null 2>&1 && acted=1
-          firewall-cmd --zone=public --remove-port="$port/udp" --permanent >/dev/null 2>&1 && acted=1
-          firewall-cmd --reload >/dev/null 2>&1
-      elif command -v iptables >/dev/null; then
-          local proto
-          for proto in tcp udp; do
-              if iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; then
-                  iptables -D INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null && acted=1
-              fi
-          done
-      fi
+      local be; be=$(fw_detect_backend)
+      case "$be" in
+          nft)
+              # 只删带本面板 comment 的规则 —— 同一链上可能还有用户自己的
+              # nftables.sh 规则、fail2ban 的封禁规则等, 那些一律不碰。
+              # 用 -a 拿到 handle 再精确删除, 避免按序号删错行。
+              local h
+              while read -r h; do
+                  [[ "$h" =~ ^[0-9]+$ ]] || continue
+                  nft delete rule inet filter input handle "$h" >/dev/null 2>&1 && acted=1
+              done < <(nft -a list chain inet filter input 2>/dev/null \
+                        | grep -E "dport ${port} .*${SB_NFT_COMMENT}" \
+                        | grep -oE "handle [0-9]+" | awk '{print $2}')
+              # 注: nft -a 的行尾是 "# handle 2", # 后面跟的是空格而不是数字,
+              # 所以不能写成 grep -oE "#[0-9]+" —— 那永远匹配不到, 会导致
+              # 一条都删不掉却报"未找到规则"。
+              ;;
+          ufw)
+              ufw delete allow "$port/tcp" >/dev/null 2>&1 && acted=1
+              ufw delete allow "$port/udp" >/dev/null 2>&1 && acted=1
+              ;;
+          firewalld)
+              firewall-cmd --zone=public --remove-port="$port/tcp" --permanent >/dev/null 2>&1 && acted=1
+              firewall-cmd --zone=public --remove-port="$port/udp" --permanent >/dev/null 2>&1 && acted=1
+              firewall-cmd --reload >/dev/null 2>&1
+              ;;
+          iptables)
+              local proto
+              for proto in tcp udp; do
+                  if iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; then
+                      iptables -D INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null && acted=1
+                  fi
+              done
+              ;;
+      esac
       fw_unlog_port "$port"
       if (( acted )); then
-          print_ok "已关闭防火墙端口 $port${tag:+ (原属 $tag)}"
+          print_ok "已关闭防火墙端口 $port${tag:+ (原属 $tag, 后端 $be)}"
       else
-          print_info "防火墙未启用或无对应规则, 仅从登记表移除 $port${tag:+ (原属 $tag)}"
+          print_info "后端 $be 未找到本面板对该端口的规则, 仅从登记表移除 $port${tag:+ (原属 $tag)}"
       fi
       return 0
   }
