@@ -169,20 +169,34 @@ cdn_gen_nginx_conf() {
     done
 
     {
+        printf '# ============================================================================\n'
+        printf '#  SB-Panel 生成 —— Cloudflare CDN 接入配置\n'
+        printf '#  生成时间: %s\n' "$(date '+%F %T')"
+        printf '#\n'
+        printf '#  节点一览 (共 %d 个可走 CDN)\n' "${#NODES[@]}"
+        printf '#  %-22s %-6s %-8s %-18s %s\n' "节点" "传输" "回源端口" "CDN 路径" "回源域名"
+        local _nf _tt _pt _pd
+        for _nf in "${NODES[@]}"; do
+            _tt=$(jq -r '.inbounds[0].transport.type // "ws"' "$_nf" 2>/dev/null)
+            _pt=$(jq -r '.inbounds[0].listen_port' "$_nf" 2>/dev/null)
+            if [[ "$_tt" == "grpc" ]]; then _pd=$(cdn_node_service "$_nf"); else _pd=$(cdn_node_path "$_nf"); fi
+            printf '#  %-22s %-6s %-8s %-18s %s\n' \
+                "$(jq -r '.inbounds[0].tag' "$_nf" 2>/dev/null)" "$_tt" "$_pt" "$_pd" \
+                "$(cdn_cert_domain "$(jq -r '.inbounds[0].tls.certificate_path // ""' "$_nf" 2>/dev/null)")"
+        done
         cat <<'EOF'
-# ============================================================================
-#  SB-Panel 生成 —— Cloudflare CDN location 片段
-#  生成时间: __NOW__
 #
-#  【怎么用】把下面的 location 块复制粘贴进你已有的 Nginx 站点 server{} 块内
-#           (建议放在 location / 之前 —— 更具体的路径会优先匹配)。
+#  【怎么用】下面每个回源域名都有一段 BEGIN → END 的整段配置, **一次性**复制
+#           粘贴进你已有 Nginx 站点里 server_name <该域名>; 的那个 server{}
+#           块内 (建议放在 location / 之前 —— 更具体的路径优先匹配)。
+#           一个域名一次复制, 不用一个节点一个节点地挑。
 #
 #  【不要】新建 server{} 块 —— 你的站点已经 listen 443 且配好了 ssl_certificate,
 #         再加一个同 server_name 的 server 块会导致 nginx 起不来。
 #
 #  【前提】对应节点的端口只监听 127.0.0.1, 外部无法直连 (CDN 生效的基础)。
-#  【验证】nginx -t 通过后再 reload。
-#  =============================================================================
+#  【验证】粘贴后先 nginx -t, 通过再 reload。
+# =============================================================================
 EOF
         for d in "${!by_dom[@]}"; do
             local sample; sample=$(head -1 <<<"${by_dom[$d]}")
@@ -200,18 +214,21 @@ EOF
                     found="${e#*|}"; found="${found%%|*}"; break
                 done
             fi
-            printf '\n# ===== 回源域名: %s  (%s 个节点) =====\n' "$d" "$(grep -c . <<<"${by_dom[$d]}")"
-            printf '# 粘贴到 server_name %s; 的那个 server{} 内\n' "$d"
-            printf '# 证书: %s\n' "$(basename "$crt")"
-            [[ -n "$found" ]] && printf '# 私钥: %s\n' "$(basename "$found")"
-            printf '\n'
+            printf '\n\n# ============================================================================\n'
+            printf '#  回源域名: %s   (%s 个节点)\n' "$d" "$(grep -c . <<<"${by_dom[$d]}")"
+            printf '#  证书: %s' "$(basename "$crt")"
+            [[ -n "$found" ]] && printf '   私钥: %s' "$(basename "$found")"
+            printf '\n#  ↓↓↓ 从下面这行开始整体复制, 贴到 server_name %s; 的 server{} 内 ↓↓↓\n' "$d"
+            printf '# >>> SB-Panel CDN BEGIN %s >>>\n\n' "$d"
             local nf
             while read -r nf; do
                 [[ -f "$nf" ]] || continue
                 cdn_render_location "$nf"
             done <<<"${by_dom[$d]}"
+            printf '# <<< SB-Panel CDN END %s <<<\n' "$d"
+            printf '# ============================================================================\n\n'
         done
-    } | sed "s/__NOW__/$(date '+%F %T')/" > "$out"
+    } > "$out"
 
     print_ok "location 片段已生成: $out"
     print_info "共 ${#NODES[@]} 个节点, 分 ${#by_dom[@]} 个回源域名"

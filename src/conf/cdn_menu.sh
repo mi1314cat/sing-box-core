@@ -4,16 +4,16 @@
 cdn_menu() {
     while true; do
         print_title "CDN / Nginx 前置"
-        print_info "  1) 自动插入 CDN location 到站点配置 (推荐)"
-        print_info "  2) 只生成配置片段, 手工粘贴"
-        print_info "  3) 检测证书 (看有哪些可用)"
-        print_info "  4) 列出站点 (看域名对应哪个配置文件)"
-        print_info "  5) 列出节点 (哪些能走 CDN)"
-        print_info "  6) 生成全部节点的 CDN 版产物 (.cdn.json/.yaml/链接)"
-        print_info "  7) 移除已插入的 CDN 配置"
-        print_info "  8) 检查残留 (节点删了配置还在?)"
-        print_info "  9) CDN 接入说明"
-        print_info "  0) 返回"
+        echo -e "${CYAN}1)${RESET} 自动插入 CDN location 到站点配置 (推荐)"
+        echo -e "${CYAN}2)${RESET} 生成完整配置, 整段复制到 Nginx"
+        echo -e "${CYAN}3)${RESET} 检测证书 (看有哪些可用)"
+        echo -e "${CYAN}4)${RESET} 列出站点 (看域名对应哪个配置文件)"
+        echo -e "${CYAN}5)${RESET} 列出节点 (哪些能走 CDN)"
+        echo -e "${CYAN}6)${RESET} 生成全部节点的 CDN 版产物 (.cdn.json/.yaml/链接)"
+        echo -e "${CYAN}7)${RESET} 移除已插入的 CDN 配置"
+        echo -e "${CYAN}8)${RESET} 检查残留 (节点删了配置还在?)"
+        echo -e "${CYAN}9)${RESET} CDN 接入说明"
+        echo -e "${CYAN}0)${RESET} 返回"
         echo
         # 必须是普通 read, 不能写成 c=$(read ...)。
         # 命令替换会开子 shell, read 把值赋给**子 shell 的** c, 父 shell 拿到的
@@ -21,8 +21,13 @@ cdn_menu() {
         # 表现为"选任何一项都直接退回主菜单、什么也没发生"。
         # 这正是用户最早报的"批量生成后去菜单 10 → 1 配 Nginx 却没反应"的根源。
         # lib.sh 的 ask_access_mode 里已经踩过同一个坑并留了注释, 这里又踩了一次。
+        # 不能写 2>/dev/null: read -p 的提示语是输出到 **stderr** 的, 那个重定向
+        # 会把提示语一起吞掉 —— 菜单画完 10 个选项, 底下却光秃秃什么都没有,
+        # 看着就像"菜单坏了"。其他所有菜单(core_menu / net_menu / ...)都没加这个
+        # 重定向, 所以只有菜单 10 有这个怪样子。
+        # 顺带: 菜单有 1-10 共 10 项, [0-9] 是错的 (同主菜单的老毛病)。
         local c=""
-        read -r -p "请选择 [0-9]: " c 2>/dev/null || return 0
+        read -r -p "请选择 [0-10]: " c || return 0
         case "${c// /}" in
             1) cdn_auto_insert ;;
             2) cdn_gen_nginx_conf ;;
@@ -186,7 +191,12 @@ cdn_auto_insert() {
 
     # 从片段里读回要处理哪些域名
     local domains
-    domains=$(grep -oE '^# 粘贴到 server_name [^;]+;' "$frag" 2>/dev/null | sed 's/^# 粘贴到 server_name //; s/;$//' | sort -u)
+    # 域名从 BEGIN 标记里取。
+    # 原来匹配的是 "# 粘贴到 server_name X;" 那行注释, 配置头部改版后那行已经
+    # 没了 —— 自动插入会因此认为"片段里没有域名信息"直接报错退出。
+    # BEGIN 标记是配置本身的组成部分, 不会因为排版调整消失, 比注释可靠。
+    domains=$(grep -oE '^# >>> SB-Panel CDN BEGIN [^>]+ >>>' "$frag" 2>/dev/null \
+              | sed 's/^# >>> SB-Panel CDN BEGIN //; s/ >>>$//' | sort -u)
     if [[ -z "$domains" ]]; then
         print_error "片段里没有域名信息"; rm -f "$tmp"; return 1
     fi
