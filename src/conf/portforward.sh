@@ -28,7 +28,7 @@ ensure_route_rule() { # 确保 inbound tag → direct
 add_config() {
     print_title "新增端口转发 ($PROTO-NN.json)"
     local listen_ip listen_port idx file tag
-    listen_ip=$(safe_read "监听地址 (0.0.0.0/::)" "0.0.0.0")
+    listen_ip=$(ask_listen_addr)
     listen_port=$(safe_read_port)
     local dst_addr dst_port net
     dst_addr=$(safe_read "目标地址 (IP/域名)" "127.0.0.1")

@@ -11,7 +11,7 @@ PROTO="shadowtls"
 add_config() {
     print_title "新增 ShadowTLS v3 节点 ($PROTO-NN.json)"
     local listen_ip listen_port idx file tag
-    listen_ip=$(safe_read "监听地址 (0.0.0.0/::)" "0.0.0.0")
+    listen_ip=$(ask_listen_addr)
     listen_port=$(safe_read_port)
     local rnd; rnd=$(reality_random_domain)     # 统一 domains.sh
     print_info "伪装目标 (handshake): $rnd"
@@ -54,7 +54,7 @@ EOF
     if ! sb_check; then rm -f "$file"; print_error "已删除非法配置（现网未受影响）"; return 1; fi
     cleanup_node_shares "$tag"
     sb_reload || true
-    server_ip=$(safe_read "服务器对外 IP" "$(default_server_ip)")
+    server_ip=$(ask_server_addr)
     local link="shadowtls://$st_password@$server_ip:$listen_port?sni=$rnd&version=3#$tag"
     local utls_fp; utls_fp=$(ask_utls_fingerprint)
     python3 - "$utls_fp" "$SB_OUT_DIR/sb_client-$tag.json" "$tag" "$server_ip" "$listen_port" "$st_password" "$ss_password" "$rnd" <<'PYGEN'

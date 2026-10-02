@@ -27,7 +27,14 @@ meta_file() {
 
 # IPv6 必须包方括号, 否则 "http://2001:db8::1:9292/..." 里的端口会被
 # 并进地址, 客户端解析成非法 host 而失败。
-share_url_for() { echo "http://$(sb_url_host "$(default_server_ip)"):9292/share/$(jq -r .share_token "$1")"; }
+# 订阅地址里的主机跟着"产物地址族"走: 选了 IPv6 就下发 IPv6, 客户端拿 IPv6 去拉。
+# sb_url_host 负责给 IPv6 加方括号 —— 不加的话 URL 里的端口会被当成地址的一部分,
+# 客户端直接解析失败。
+share_url_for() {
+    local host; host=$(sb_addr_current)
+    [[ -z "$host" ]] && host=$(default_server_ip)
+    echo "http://$(sb_url_host "$host"):9292/share/$(jq -r .share_token "$1")"
+}
 
 # 聚合全部节点 outbound → 一份 client profile (selector PROXY + urltest AUTO + route.final)
 gen_full_profile() {
@@ -291,6 +298,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
             echo -e "${CYAN}4)${RESET} 删除链接"
             echo -e "${CYAN}5)${RESET} 禁用/启用 (toggle)"
             echo -e "${CYAN}6)${RESET} 重新生成 token (regen)"
+            echo -e "${CYAN}7)${RESET} 切换地址族 (IPv4 / IPv6)"
             echo -e "${CYAN}0)${RESET} 返回"
             read -r -p "选择: " c
             case "$(clean_input "$c")" in
@@ -313,6 +321,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
                 4) list_shares; read -r -p "输入编号/token/tag (回车取消): " t; [[ -n "$t" ]] && del_share "$t" ;;
                 5) list_shares; read -r -p "输入编号/token/tag (回车取消): " t; [[ -n "$t" ]] && toggle_share "$t" ;;
                 6) list_shares; read -r -p "输入编号/token/tag (回车取消): " t; [[ -n "$t" ]] && regen_share "$t" ;;
+                7) sb_menu_addr_family ;;
                 0) break ;;
                 *) print_error "无效选项 $c" ;;
             esac

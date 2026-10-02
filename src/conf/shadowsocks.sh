@@ -10,7 +10,7 @@ PROTO="shadowsocks"
 add_config() {
     print_title "新增 Shadowsocks-2022 节点 ($PROTO-NN.json)"
     local listen_ip listen_port idx file tag json method key
-    listen_ip=$(safe_read "监听地址 (0.0.0.0/::)" "0.0.0.0")
+    listen_ip=$(ask_listen_addr)
     listen_port=$(safe_read_port)
     # 默认算法按 CPU 架构自动选最优: x86/AMD64 AES-NI -> aes-128-gcm; ARM 无 AES 硬件 -> chacha20
     local arch; arch=armv6

@@ -179,6 +179,129 @@ default_server_ip_real() {
     return 1
 }
 
+# ==================== 地址族: IPv4 / IPv6 ====================
+#
+# 为什么需要: 同一个节点端口, 想让 IPv4 和 IPv6 的客户端都能连, 服务端就得
+# 监听在双栈地址上。实测踩过的坑:
+#   监听 0.0.0.0  -> 只收 IPv4。客户端拿 IPv6 来连, 服务器直接
+#                     "Connection refused" (注意是**拒绝**不是超时 —— 说明包到了,
+#                     那个端口在 IPv6 上压根没人监听)。
+#   监听 ::       -> Linux 上默认双栈 (net.ipv6.bindv6only=0), 一个端口同时收
+#                     IPv4 和 IPv6, 不会因为开了 IPv6 就丢掉 IPv4。
+# 所以监听地址这一项要让人能选, 而不是只能填 0.0.0.0。
+#
+# 另外客户端产物 (sb_client-*.json / .yaml / 分享链接) 里写的是"连哪个地址",
+# 这跟服务端监听地址是两件事 —— 监听双栈但产物里写死 IPv4, 客户端还是只会走
+# IPv4。所以两边都要能选, 这里负责探测地址和切换产物里的地址。
+
+SB_ADDR_FAMILY_FILE=""
+
+sb_addr_state_file() {
+    SB_ADDR_FAMILY_FILE="$SB_ROOT/.addr-family"
+    printf '%s' "$SB_ADDR_FAMILY_FILE"
+}
+
+sb_addr4() {
+    local ip
+    ip=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 |
+         grep -vE '^(127\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)' | head -1)
+    [[ -z "$ip" ]] && ip=$(curl -4 -s --max-time 6 ip.sb 2>/dev/null | tr -d '[:space:]')
+    printf '%s' "$ip"
+}
+
+# 服务器真实 IPv6 —— 排除 WARP/wg/tun 等隧道接口上的地址。
+# 隧道地址对外不可达, 写进客户端产物等于给一个连不上的地址。
+sb_addr6() { sb_real_ipv6 2>/dev/null || true; }
+
+sb_addr_family_get() {
+    local f; f=$(sb_addr_state_file)
+    local v=""
+    [[ -f "$f" ]] && v=$(head -1 "$f" 2>/dev/null | tr -d '[:space:]')
+    [[ "$v" == "v6" ]] && { printf 'v6'; return 0; }
+    printf 'v4'
+}
+
+# 地址族的显示名 —— 不要用 "IPv$(( 6 - cur + 1 ))" 这种算术。
+# 写着省事, 实际算反了: cur=1 表示 v4, 6-1+1=6 会显示成 "IPv6"。
+# 排查时菜单写着 IPv6、日志却是 IPv4, 就是这行干的。
+sb_family_num()   { [[ "$(sb_addr_family_get)" == "v6" ]] && echo 6 || echo 4; }
+sb_family_label() { echo "IPv$(sb_family_num)"; }
+
+sb_addr_family_set() {
+    local f; f=$(sb_addr_state_file)
+    mkdir -p "$SB_ROOT" 2>/dev/null
+    printf '%s\n' "$1" > "$f"
+}
+
+# 当前地址族对应的地址 (产物里该写什么)
+sb_addr_current() {
+    if [[ "$(sb_addr_family_get)" == "v6" ]]; then
+        local a; a=$(sb_addr6)
+        if [[ -n "$a" ]]; then printf '%s' "$a"; return 0; fi
+        print_warn "本机没有可用的真实 IPv6, 回退 IPv4" >&2
+    fi
+    sb_addr4
+}
+
+# ---------- 监听地址选择 ----------
+# 原来是 safe_read "监听地址 (0.0.0.0/::)" "0.0.0.0" —— 纯自由输入,
+# 默认值又是 0.0.0.0, 于是"想同时支持 IPv6"这件事没有任何提示, 很容易就建成
+# 只收 IPv4 的节点。改成显式菜单, 并把每一项的后果说清楚。
+ask_listen_addr() {
+    local dual="::" v6ok="无"
+    local a6; a6=$(sb_addr6)
+    [[ -n "$a6" ]] && v6ok="检测到 $a6"
+    echo >&2
+    echo -e "${CYAN}  监听地址 —— 决定这个节点收 IPv4、收 IPv6、还是只收本机${RESET}" >&2
+    echo -e "    ${GREEN}1)${RESET} ${YELLOW}0.0.0.0${RESET}  仅 IPv4${RESET} (默认, 兼容性最好)" >&2
+    echo -e "    ${GREEN}2)${RESET} ${CYAN}::${RESET}       IPv4+IPv6 双栈${RESET} ← 想两种协议都能连就选这个" >&2
+    echo -e "       ${MAGENTA}(${v6ok})${RESET}" >&2
+    echo -e "    ${GREEN}3)${RESET} 127.0.0.1 仅本机${RESET} (给 CDN/Nginx 前置用, 外部连不上)" >&2
+    local c="" d
+    read -r -p "    请选择 [1-3, 回车=1]: " c || { echo; return 0; }
+    case "${c// /}" in
+        2) d="::" ;;
+        3) d="127.0.0.1" ;;
+        "") d="0.0.0.0" ;;
+        *) d="$c" ;;
+    esac
+    if [[ "$d" == "::" ]]; then
+        if [[ -z "$a6" ]]; then
+            print_warn "本机没有检测到可用的 IPv6 地址, 选双栈可能白选 (确认 ip -6 addr 有全局地址)"
+        else
+            print_ok "双栈监听: IPv4 与 IPv6 客户端都能连这个端口"
+        fi
+        if [[ "$(cat /proc/sys/net/ipv6/bindv6only 2>/dev/null || echo 0)" == "1" ]]; then
+            print_warn "net.ipv6.bindv6only=1, 监听 :: 只收 IPv6, IPv4 会连不上"
+        fi
+    fi
+    printf '%s' "$d"
+}
+
+# ---------- 对外地址选择 (写进客户端产物) ----------
+# 同样从自由输入改成显式选择, 并把"这次产物用 IPv4 还是 IPv6"落到状态文件,
+# 后续生成聚合/分享链接时保持一致, 不会出现单节点写 IPv4、聚合写 IPv6 的情况。
+ask_server_addr() {
+    local a4 a6
+    a4=$(sb_addr4); a6=$(sb_addr6)
+    echo >&2
+    echo -e "${CYAN}  服务器对外地址 —— 客户端配置里写哪个地址${RESET}" >&2
+    [[ -n "$a4" ]] && echo -e "    ${GREEN}1)${RESET} IPv4   ${CYAN}$a4${RESET}" >&2 || echo -e "    ${MAGENTA}(未检测到 IPv4)${RESET}" >&2
+    [[ -n "$a6" ]] && echo -e "    ${GREEN}2)${RESET} IPv6   ${CYAN}$a6${RESET}" >&2 || echo -e "    ${MAGENTA}(未检测到 IPv6)${RESET}" >&2
+    echo -e "    ${GREEN}3)${RESET} 手工输入${RESET}" >&2
+    local c="" cur
+    cur=$(sb_addr_family_get); [[ "$cur" == "v6" ]] && cur=2 || cur=1
+    read -r -p "    请选择 [1-3, 回车=$([[ "$cur" == 2 ]] && echo IPv6 || echo IPv4)]: " c || { echo; return 0; }
+    case "${c// /}" in
+        2) [[ -n "$a6" ]] || { print_warn "没有可用 IPv6, 仍按 IPv6 处理"; }; sb_addr_family_set v6; printf '%s' "$a6" ;;
+        3) local m=""; read -r -p "    请输入地址: " m || { echo; return 0; }
+           [[ -z "$m" ]] && m="$a4"
+           [[ "$m" == *:* ]] && sb_addr_family_set v6 || sb_addr_family_set v4
+           printf '%s' "$m" ;;
+        *) sb_addr_family_set v4; [[ -n "$a4" ]] && printf '%s' "$a4" || printf '%s' "$(default_server_ip)" ;;
+    esac
+}
+
 default_server_ip() { # 优先公网网卡 IPv4; 无 v4 则回退 IPv6
     local local_ip public_ip
     local_ip=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 |
@@ -1530,4 +1653,91 @@ gen_mihomo_yaml() { # 按 tag 生成/刷新单节点 YAML; mihomo 不支持的�
     [[ -f "$SB_OUT_DIR/sb_client-$tag.json" ]] || return 0
     python3 "$here/to_mihomo.py" --single "$SB_OUT_DIR" "$SB_ROOT/cert" \
         "$SB_OUT_DIR/sb_client-$tag.json" 2>&1 | grep -v '^已生成单节点' >&2 || true
+}
+
+# ---------- 切换产物里的地址族 ----------
+# 节点建好之后想把产物从 IPv4 换成 IPv6 (或反过来), 不必重建节点:
+# 把所有客户端产物里"连哪个地址"统一改掉即可。
+# 覆盖: sb_client-*.json (单节点) / .yaml (mihomo) / sb_client-all.json (聚合)
+#       / sb_share-*.txt 与 sb_links-all.txt (分享链接里的 @host)
+sb_switch_addr_family() {
+    local want="$1"
+    [[ "$want" == "v4" || "$want" == "v6" ]] || { print_error "用法: sb_switch_addr_family v4|v6"; return 1; }
+      # 目标地址和"被替换的地址"都必须按 want 明确取, 不能走 sb_addr_current ——
+      # 状态文件此刻可能已经是 want 了 (建节点时就写过), 再用它判断就会取反:
+      # 切到 IPv6 时把 IPv4 填进去, 却报"已切换为 IPv6"。
+      local ip old
+      if [[ "$want" == "v6" ]]; then ip=$(sb_addr6); old=$(sb_addr4)
+      else                          ip=$(sb_addr4); old=$(sb_addr6); fi
+      if [[ -z "$ip" ]]; then
+          print_error "本机没有可用的 IPv$([[ "$want" == v6 ]] && echo 6 || echo 4), 无法生成产物"
+          return 1
+      fi
+      [[ -z "$old" ]] && print_warn "旧地址不可用, 只更新能更新的部分"
+
+    local n=0 f base
+    shopt -s nullglob
+    # 1) 单节点 JSON 与聚合 JSON: 直接改 outbounds[].server
+    for f in "$SB_OUT_DIR"/sb_client-*.json; do
+        base=$(basename "$f")
+        [[ "$base" == "sb_client-all.json" ]] && continue
+        local t="${base#sb_client-}"; t="${t%.json}"
+        jq --arg s "$ip" '(.outbounds[] | select(.server != null) | .server) = $s' "$f" > "$f.tmp" 2>/dev/null \
+            && mv -f "$f.tmp" "$f" && n=$((n+1)) || { print_warn "跳过 $base (改写失败)"; rm -f "$f.tmp"; }
+    done
+    # 2) mihomo YAML: 改 server: 字段
+    for f in "$SB_OUT_DIR"/sb_client-*.yaml; do
+        local t; t=$(grep -m1 '^ *server:' "$f" 2>/dev/null)
+        if [[ -n "$t" ]]; then
+            sed -i -E "s|^( *server:).*|\\1 $ip|" "$f" && n=$((n+1))
+        fi
+    done
+    # 3) 分享链接: 主机在 URI 的 @host:port 里。IPv6 必须带方括号,
+    #    否则客户端会把最后一段当成端口 —— 这是 IPv6 最常见的踩坑。
+    local v4re v6re
+    if [[ -n "$old" ]]; then
+        v4re=${old//./\\.}
+        for f in "$SB_OUT_DIR"/sb_share-*.txt "$SB_OUT_DIR"/sb_links-all.txt; do
+            [[ -f "$f" ]] || continue
+            sed -i -E "s|@${v4re}(:[0-9]+)|@$(sb_url_host "$ip")\\1|g" "$f"
+        done
+        n=$((n+1))
+    fi
+    shopt -u nullglob
+    # 4) 聚合文件重新生成, 让 sb_client-all.json 和单节点保持一致
+    if declare -F sb_regen_aggregate >/dev/null 2>&1; then
+        sb_regen_aggregate
+        n=$((n+1))
+    fi
+    if [[ -f "$SB_OUT_DIR/sb_client-all.yaml" ]] || [[ -d "$SB_OUT_DIR" ]]; then
+        declare -F gen_all_mihomo >/dev/null 2>&1 && gen_all_mihomo >/dev/null 2>&1 && n=$((n+1))
+    fi
+    sb_addr_family_set "$want"
+    print_ok "产物地址已切换为 $([[ "$want" == "v6" ]] && echo IPv6 || echo IPv4): $ip  (共更新 $n 处)"
+    [[ -n "$old" ]] && print_info "已替换的旧地址: $old"
+    return 0
+}
+
+# 菜单入口: 问用户要 IPv4 还是 IPv6, 然后切换
+sb_menu_addr_family() {
+    print_title "切换客户端产物的地址族 (IPv4 / IPv6)"
+    local a4 a6 cur
+    a4=$(sb_addr4); a6=$(sb_addr6)
+    cur=$(sb_addr_family_get); [[ "$cur" == "v6" ]] && cur=2 || cur=1
+    echo
+    echo -e "  当前产物使用: ${YELLOW}$(sb_family_label)${RESET}" >&2
+    echo -e "  ${GREEN}1)${RESET} IPv4   ${CYAN}${a4:-未检测到}${RESET}" >&2
+    echo -e "  ${GREEN}2)${RESET} IPv6   ${CYAN}${a6:-未检测到}${RESET}" >&2
+    echo >&2
+    print_info "只改客户端产物里的地址, 不动服务器监听, 也不动已生成的分享 token"
+    print_info "改完记得重新生成聚合/分享链接, 让它们用上新地址"
+    echo >&2
+    local c=""
+    read -r -p "  请选择 [1-2, 回车不变]: " c || { echo; return 0; }
+    case "${c// /}" in
+        1) sb_switch_addr_family v4 ;;
+        2) sb_switch_addr_family v6 ;;
+        "") print_info "未选择, 未做修改" ;;
+        *) print_error "无效选项" ;;
+    esac
 }

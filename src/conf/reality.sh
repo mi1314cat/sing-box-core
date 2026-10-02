@@ -54,9 +54,8 @@ add_config() {
     ensure_reality_keys
 
     local server_ip listen_ip listen_port idx
-    server_ip=$(default_server_ip)
-    server_ip=$(safe_read "服务器对外 IP" "$server_ip")
-    listen_ip=$(safe_read "监听地址 (0.0.0.0/::)" "0.0.0.0")
+    server_ip=$(ask_server_addr)
+    listen_ip=$(ask_listen_addr)
     listen_port=$(safe_read_port)
     echo -n "" >&2
     local pick dest sni dport

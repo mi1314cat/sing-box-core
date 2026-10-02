@@ -122,8 +122,8 @@ ask_cert() {
 add_config() {
     print_title "新增 Hysteria2 节点 ($PROTO-NN.json)"
     local server_ip listen_ip listen_port idx
-    server_ip=$(safe_read "服务器对外 IP" "$(default_server_ip)")
-    listen_ip=$(safe_read "监听地址 (0.0.0.0/::)" "0.0.0.0")
+    server_ip=$(ask_server_addr)
+    listen_ip=$(ask_listen_addr)
     listen_port=$(safe_read_port)
     read -r -p "是否开启 UDP 端口跳跃? [y/N]: " yn
     local hop=""

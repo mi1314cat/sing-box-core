@@ -20,7 +20,7 @@ extract_cert_domain() {
 add_config() {
     print_title "新增 NaiveProxy 节点 ($PROTO-NN.json)"
     local listen_ip listen_port idx file tag
-    listen_ip=$(safe_read "监听地址 (0.0.0.0/::)" "::")
+    listen_ip=$(ask_listen_addr)
     listen_port=$(safe_read_port)
     local user pass
     user=$(openssl rand -hex 6)
@@ -64,7 +64,7 @@ EOF
     cleanup_node_shares "$tag"
     sb_reload || true
 
-    server_ip=$(safe_read "服务器对外 IP" "$(default_server_ip)")
+    server_ip=$(ask_server_addr)
     local pin=""
     [[ "$CERT_TRUSTED" == "false" ]] && pin=$(cert_spki_pin_base64 "$CERT_FILE")
     local link="naive+https://$user:$pass@$server_ip:$listen_port?sni=$CERT_DOMAIN${pin:+&pinSHA256=$pin}#$tag"

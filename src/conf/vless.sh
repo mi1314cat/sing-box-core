@@ -49,7 +49,7 @@ ask_cert() {
 add_config() {
     print_title "新增 VLESS-WS-TLS 节点 ($PROTO-NN.json)"
     local server_ip listen_ip listen_port uuid path idx file tag json
-    server_ip=$(safe_read "服务器对外 IP" "$(default_server_ip)")
+    server_ip=$(ask_server_addr)
     listen_port=$(safe_read_port)
     uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen)
     path=$(safe_read "WS 路径 (以 / 开头)" "/$(openssl rand -hex 4)")
@@ -70,7 +70,7 @@ add_config() {
     case "$ACCESS_MODE" in
         cdn)        listen_ip="0.0.0.0" ;;
         cdn-nginx)  listen_ip="127.0.0.1" ;;
-        *)          listen_ip=$(safe_read "监听地址 (0.0.0.0/::)" "0.0.0.0") ;;
+        *)          listen_ip=$(ask_listen_addr) ;;
     esac
 
     idx=$(get_next_index "$PROTO"); file="$SB_CONFIG_DIR/$PROTO-$idx.json"; tag="${PROTO}${idx}"

@@ -65,7 +65,7 @@ ask_cert() {  # 输出三种: CERT_FILE+KEY_FILE (TLS) / REALITY_ENV (Reality = 
 add_config() {
     print_title "新增 Trojan 节点 ($PROTO-NN.json)"
     local listen_ip listen_port password file tag idx
-    listen_ip=$(safe_read "监听地址 (0.0.0.0/::)" "0.0.0.0")
+    listen_ip=$(ask_listen_addr)
     listen_port=$(safe_read_port)
     password=$(openssl rand -base64 18 | tr -d '/+=' | head -c 20)
     ask_cert || return 1
@@ -124,7 +124,7 @@ EOF
 
     local server_ip pin="" mode_tls="tls"
     [[ "${TLS_TYPE:-}" == "reality" ]] && mode_tls="reality"
-    server_ip=$(safe_read "服务器对外 IP" "$(default_server_ip)")
+    server_ip=$(ask_server_addr)
     if [[ "$CERT_TRUSTED" == "false" ]]; then pin=$(cert_spki_pin_base64 "$CERT_FILE"); fi
     local link
     # CDN 节点只监听 127.0.0.1, 客户端连证书域名而非服务器 IP

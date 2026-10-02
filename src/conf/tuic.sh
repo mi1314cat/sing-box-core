@@ -44,7 +44,7 @@ ask_cert() {
 add_config() {
     print_title "新增 TUIC v5 节点 ($PROTO-NN.json)"
     local listen_ip listen_port uuid password idx file tag json
-    listen_ip=$(safe_read "监听地址 (0.0.0.0/::)" "0.0.0.0")
+    listen_ip=$(ask_listen_addr)
     listen_port=$(safe_read_port "8443")
     uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen)
     password=$(openssl rand -hex 16)

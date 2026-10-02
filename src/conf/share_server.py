@@ -9,7 +9,7 @@ GET  /status                   -> 文本健康
 并发安全: flock(SHARE_DIR/.share.lock) 串行化 read-modify-write
 */
 """
-import json, os, sys, time, fcntl, struct, http.server, socketserver, threading, subprocess
+import json, os, sys, time, fcntl, struct, http.server, socketserver, threading, subprocess, socket
 from urllib.parse import urlsplit
 
 
@@ -118,9 +118,40 @@ class Srv(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-if __name__ == "__main__":
+
+class Srv6(socketserver.ThreadingTCPServer):
+    """双栈监听: IPv6 通配地址 + 打开 v4 映射, 一个端口同时收 IPv4 和 IPv6.
+
+    原来固定绑 0.0.0.0 (仅 IPv4), 于是纯 IPv6 或 IPv6 优先的客户端
+    连不上订阅地址 —— 节点配置里就算写了 IPv6, 拉取分享那一步照样失败。
+    Linux 上 IPV6_V6ONLY 默认就是 0 (双栈), 这里再显式设一次, 不依赖
+    系统默认值 (有些发行版或容器会把它改成 1)。
+    """
+    address_family = socket.AF_INET6
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def server_bind(self):
+        try:
+            self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        except OSError:
+            pass
+        socketserver.ThreadingTCPServer.server_bind(self)
+
+
+def start_server():
+    """优先双栈, 退不回双栈时退回仅 IPv4。"""
     os.makedirs(os.path.join(SHARE_DIR, "shares"), exist_ok=True)
     Store._lock()  # 触发 lock 文件创建
-    with Srv(("0.0.0.0", PORT), Handler) as httpd:
-        print(f"share server on :{PORT}", flush=True)
-        httpd.serve_forever()
+    for srv_cls, addr, label in ((Srv6, "::", "双栈 IPv4+IPv6"), (Srv, "0.0.0.0", "仅 IPv4")):
+        try:
+            return srv_cls((addr, PORT), Handler), label
+        except OSError as e:
+            print(f"bind {addr} 失败: {e}", flush=True)
+    raise SystemExit("无法绑定任何监听地址")
+
+
+if __name__ == "__main__":
+    httpd, label = start_server()
+    print(f"share server on :{PORT} ({label})", flush=True)
+    httpd.serve_forever()

@@ -97,7 +97,7 @@ cert_fingerprint_hex() {
 add_config() {
     print_title "新增 AnyTLS 节点 ($PROTO-NN.json)"
     local listen_ip listen_port password file tag idx server_ip pin=""
-    listen_ip=$(safe_read "监听地址 (0.0.0.0/::)" "0.0.0.0")
+    listen_ip=$(ask_listen_addr)
     listen_port=$(safe_read_port)
     password=$(openssl rand -base64 18 | tr -d '/+=\n' | head -c 24)
     ask_cert || return 1
@@ -158,7 +158,7 @@ EOF
     cleanup_node_shares "$tag"
     sb_reload || true
 
-    server_ip=$(safe_read "服务器对外 IP" "$(default_server_ip)")
+    server_ip=$(ask_server_addr)
     [[ "$CERT_TRUSTED" == "false" ]] && pin=$(cert_spki_pin_base64 "$CERT_FILE")
     local fp=""; [[ "$CERT_TRUSTED" == "false" ]] && fp=$(cert_fingerprint_hex "$CERT_FILE")
 

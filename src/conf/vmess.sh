@@ -96,7 +96,7 @@ add_config() {
     case "$ACCESS_MODE" in
         cdn)        listen_ip="0.0.0.0" ;;
         cdn-nginx)  listen_ip="127.0.0.1" ;;
-        *)          listen_ip=$(safe_read "监听地址 (0.0.0.0/::)" "0.0.0.0") ;;
+        *)          listen_ip=$(ask_listen_addr) ;;
     esac
       
     local uuid; uuid=$(cat /proc/sys/kernel/random/uuid)
@@ -161,8 +161,7 @@ EOF
     sb_reload || true
 
     # server对外IP / 客户端
-    local server_ip; server_ip=$(default_server_ip)
-    server_ip=$(safe_read "服务器对外 IP" "$server_ip")
+    local server_ip; server_ip=$(ask_server_addr)
 
     local DOM="$CERT_DOMAIN"; [[ "${CERT_MODE:-}" == "reality" ]] && DOM="$rnd"
     local pbk sidq urlsec secpin=""

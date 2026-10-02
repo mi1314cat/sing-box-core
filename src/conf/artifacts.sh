@@ -177,8 +177,9 @@ show_menu() {
         echo -e "${CYAN}6)${RESET} 全部文件路径 (给 shell/cp/复制用)"
         echo -e "${CYAN}7)${RESET} 全部节点合并成一份 mihomo YAML (sb_client-all.yaml)"
         echo -e "${CYAN}8)${RESET} 逐个节点生成单节点 mihomo YAML (sb_client-<tag>.yaml)"
+        echo -e "${CYAN}9)${RESET} 切换产物地址族 (IPv4 / IPv6)"
         echo -e "${CYAN}0)${RESET} 返回"
-        read -r -p "请输入选项 [0-8]: " c || { echo; exit 0; }
+        read -r -p "请输入选项 [0-9]: " c || { echo; exit 0; }
         case "$(clean_input "$c")" in
             1) pick_and_cat "$(json_files)" "JSON" ;;
             2) pick_and_cat "$(yaml_files)" "YAML" ;;
@@ -188,6 +189,7 @@ show_menu() {
             6) path_view ;;
             7) merged_yaml_view ;;
             8) single_yaml_view ;;
+            9) sb_menu_addr_family ;;
             0) return ;;
             *) print_error "无效选项" ;;
         esac
