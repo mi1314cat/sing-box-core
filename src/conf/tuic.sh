@@ -22,6 +22,8 @@ ask_cert() {
     echo "  1) 手动输入 crt/key 路径" >&2
     echo "  2) 生成自签证书" >&2
     local c=""; read -r -p "  选择 (默认 2=自签): " c; c=$(clean_input "$c")
+    # 批量选了真证书就改判到真证书分支, 否则这里默认 2=自签 会把 ③ 的选择架空
+    sb_batch_tls_override 1 c
     [[ -z "$c" ]] && c=2
     if [[ "$c" == "2" ]]; then
         local dom
@@ -35,10 +37,9 @@ ask_cert() {
         fi
         CERT_DOMAIN="$dom"; CERT_TRUSTED=false; return 0
     fi
-    read -r -p "  crt 路径: " f; read -r -p "  key 路径: " k
-    f=$(clean_input "$f"); k=$(clean_input "$k")
-    [[ -f "$f" && -f "$k" ]] || { print_error "路径无效"; return 1; }
-    CERT_FILE="$f"; KEY_FILE="$k"; CERT_DOMAIN=$(extract_cert_domain "$f"); CERT_TRUSTED=true
+    # 批量用 batch 入口选好的证书; 交互模式列出本机证书让你选
+    [[ -n "${SB_BATCH:-}" ]] && { sb_apply_batch_cert; return $?; }
+    pick_trusted_cert_verbose
 }
 
 add_config() {

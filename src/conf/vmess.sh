@@ -33,6 +33,7 @@ ask_tls() { # 输出: CERT_MODE|cert_file|key_file|cert_domain|trusted(0|1) 到 
     if [[ "${SB_FORCE_TLS_REALTY:-}" == "1" ]]; then c=4
     else
         read -r -p "选择 (默认 1): " c
+        sb_batch_tls_override 2 c
         c=$(clean_input "$c"); [[ -z "$c" ]] && c=1
     fi
     case "$c" in
@@ -47,8 +48,13 @@ ask_tls() { # 输出: CERT_MODE|cert_file|key_file|cert_domain|trusted(0|1) 到 
             ;;
         4) echo "reality|||" ;;
         2)
-            read -r -p "crt 路径: " f; read -r -p "key 路径: " k
-            echo "real|$(clean_input "$f")|$(clean_input "$k")|$(extract_cert_domain "$f")"
+            # 批量用 batch 入口选好的证书; 交互模式列出本机证书让你选
+            if [[ -n "${SB_BATCH:-}" ]]; then
+                sb_apply_batch_cert
+            else
+                pick_trusted_cert_verbose || { echo "none|||"; return 0; }
+            fi
+            echo "real|$CERT_FILE|$KEY_FILE|$CERT_DOMAIN"
             ;;
         *) echo "none|||" ;;
     esac

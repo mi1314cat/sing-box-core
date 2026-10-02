@@ -1,8 +1,10 @@
 #!/bin/bash
 # ==============================================================
 # batch.sh — 全协议一键生成 (Batch Generator)
-#   * 公共参数只问一次: 监听地址 / 客户端对外地址 / 端口范围 / CDN 策略,
+#   * 公共参数只问一次: 监听地址 / 对外地址 / 证书方案 / 端口范围 / CDN 策略,
 #     其余全用各协议自带默认生成逻辑
+#   * 证书: SB_BATCH_CERT=real|self 配 SB_BATCH_CERT_CRT/KEY/DOMAIN 下发;
+#     选真证书时 CDN 自动沿用同一张, 选自签时 CDN 需另选一张可信证书
 #   * 地址族: SB_LISTEN_ADDR (服务端 bind) 与 SB_SERVER_ADDR (写进客户端配置)
 #     分开设置 —— 可以只让 IPv6 连进来, 但配置里仍然发 IPv4
 #   * 不重新实现协议: 直接调用 conf/<proto>.sh 现有 add_config 流程
@@ -198,7 +200,7 @@ batch_main() {
 
     echo >&2
     print_title "全协议一键生成"
-    echo -e "${CYAN}交互项: 地址族 → 监听端口范围 → CDN. 其余沿用各协议默认值.${RESET}" >&2
+    echo -e "${CYAN}交互项: 监听地址 → 对外地址 → 证书方案 → 端口范围 → CDN. 其余沿用各协议默认值.${RESET}" >&2
     echo -e "${CYAN}如端口被占用或配置失败, 会自动清理; 收尾统一 check + reload.${RESET}" >&2
 
     # --- 第一次交互: 客户端配置用哪个地址连回来 ---
@@ -255,7 +257,41 @@ batch_main() {
     esac
     export SB_LISTEN_ADDR SB_SERVER_ADDR
 
-    # --- 第二次交互: 端口范围 ---
+    # --- 第三次交互: 证书方案 ---
+    # 单协议创建时本来就能选"真证书 / 自签", 批量却一直是硬编码走自签 ——
+    # 于是机器上明明有一堆 Let's Encrypt 真证书, 批量出来的节点全在用自签,
+    # 发给不支持 SPKI pin 的客户端 (mihomo 等) 直接连不上。
+    # 这里补上前置提问, 并把选中的证书通过环境变量传给所有协议。
+    SB_BATCH_CERT=real; SB_BATCH_CERT_CRT=""; SB_BATCH_CERT_KEY=""; SB_BATCH_CERT_DOMAIN=""
+    local ncert=0
+    sb_scan_certs >/dev/null 2>&1 && ncert=${#sb_FOUND_CERTS[@]}
+    sb_scan_nginx_sites
+    echo >&2
+    echo -e "${CYAN}③ 证书方案 —— 节点用什么证书对外服务${RESET}" >&2
+    if (( ncert > 0 )); then
+        echo -e "   ${GREEN}1)${RESET} ${CYAN}使用本机真实证书${RESET} (检测到 ${ncert} 张 CA 可信证书)" >&2
+    else
+        echo -e "   ${MAGENTA}1) 使用本机真实证书 —— 本机没检测到任何证书${RESET}" >&2
+    fi
+    echo -e "   ${GREEN}2)${RESET} ${YELLOW}自签证书${RESET} (伪装成随机大站域名, 客户端用 SPKI pin 锁定)" >&2
+    echo -e "   ${MAGENTA}真实证书=任何客户端都能连; 自签=仅支持 pin 的客户端能连${RESET}" >&2
+    local cch=""
+    read -r -p "   请选择 [1-2, 回车=$([[ $ncert -gt 0 ]] && echo 1 || echo 2)]: " cch
+    case "$(clean_input "${cch:-}")" in
+      2) SB_BATCH_CERT=self; print_ok "证书: 自签 (各节点用 domains.sh 随机域名)" ;;
+      *) if (( ncert > 0 )); then
+           SB_BATCH_CERT=real
+           pick_trusted_cert_verbose || { print_error "证书选择失败"; return 1; }
+           SB_BATCH_CERT_CRT="$CERT_FILE"; SB_BATCH_CERT_KEY="$KEY_FILE"; SB_BATCH_CERT_DOMAIN="$CERT_DOMAIN"
+           print_ok "证书: 真证书 $CERT_DOMAIN"
+         else
+           SB_BATCH_CERT=self
+           print_warn "本机没有真实证书, 改用自签"
+         fi ;;
+    esac
+    export SB_BATCH_CERT SB_BATCH_CERT_CRT SB_BATCH_CERT_KEY SB_BATCH_CERT_DOMAIN
+
+    # --- 第四次交互: 端口范围 ---
     local r
     if [[ -n "${SB_BATCH_AUTO:-}" ]]; then
         SB_BATCH_PORT_START=$(( 20000 + RANDOM % 10000 ))
@@ -288,13 +324,30 @@ batch_main() {
           cdn_first="${sb_FOUND_CERTS[0]%%|*}"
           cdn_dom=$(extract_cert_domain "$cdn_first")
           echo >&2
-          print_info "检测到真证书: $cdn_dom (可用于 CDN 回源)"
+          print_info "检测到 ${#sb_FOUND_CERTS[@]} 张真证书 (可用于 CDN 回源)"
           printf "  CDN 模式: 1) vless/vmess 自动走 CDN (推荐)  2) 全部直连 [默认 1]: " >&2
           read -r -p "  " rc 2>/dev/null
           rc=$(clean_input "${rc:-}")
           [[ "$rc" == "2" ]] || { SB_BATCH_CDN=1; SB_BATCH_CDN_DOMAIN="$cdn_dom"; }
           if (( SB_BATCH_CDN )); then
-              print_ok "已启用 CDN: vless / vmess 将用 $cdn_dom 的证书, 并只监听 127.0.0.1"
+              # ③ 选了真证书 -> CDN 直接沿用同一张, 不必再问
+              if [[ "$SB_BATCH_CERT" == "real" && -n "$SB_BATCH_CERT_DOMAIN" ]]; then
+                  SB_BATCH_CDN_DOMAIN="$SB_BATCH_CERT_DOMAIN"
+                  print_ok "已启用 CDN: 沿用③选的证书 $SB_BATCH_CDN_DOMAIN"
+              else
+                  # ③ 选了自签 -> 自签证书 Cloudflare 一律拒绝回源,
+                  # 必须单独挑一张 CA 可信证书, 这里列出来让用户选
+                  echo >&2
+                  print_info "③ 选了自签证书, Cloudflare 不接受自签回源 —— 请为 CDN 单独选一张真证书:"
+                  if pick_trusted_cert_verbose; then
+                      SB_BATCH_CDN_DOMAIN="$CERT_DOMAIN"
+                      print_ok "CDN 使用证书: $SB_BATCH_CDN_DOMAIN"
+                  else
+                      print_warn "未选择 CDN 证书, 本次不启用 CDN"
+                      SB_BATCH_CDN=0; SB_BATCH_CDN_DOMAIN=""
+                  fi
+              fi
+              (( SB_BATCH_CDN )) && print_ok "vless / vmess 将用 $SB_BATCH_CDN_DOMAIN 回源, 并只监听 127.0.0.1"
           fi
       else
           print_warn "未检测到真证书 (Cloudflare 不接受自签回源) —— 本次全部只能直连"
@@ -356,6 +409,8 @@ batch_main() {
         SB_BATCH=1 SB_NO_RELOAD=1 \
           SB_BATCH_CDN="${SB_BATCH_CDN:-0}" SB_BATCH_CDN_DOMAIN="${SB_BATCH_CDN_DOMAIN:-}" \
           SB_LISTEN_ADDR="$SB_LISTEN_ADDR" SB_SERVER_ADDR="$SB_SERVER_ADDR" \
+          SB_BATCH_CERT="$SB_BATCH_CERT" SB_BATCH_CERT_CRT="$SB_BATCH_CERT_CRT" \
+          SB_BATCH_CERT_KEY="$SB_BATCH_CERT_KEY" SB_BATCH_CERT_DOMAIN="$SB_BATCH_CERT_DOMAIN" \
         SB_BATCH_PORT_START="$SB_BATCH_PORT_START" SB_BATCH_PORT_END="$SB_BATCH_PORT_END" \
         timeout 240 bash "$SELF_DIR/conf/${proto}.sh" add </dev/null >/tmp/batch-$proto.log 2>&1
         local mod_rc=$?

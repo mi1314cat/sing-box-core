@@ -25,6 +25,7 @@ ask_cert() {  # 输出三种: CERT_FILE+KEY_FILE (TLS) / REALITY_ENV (Reality = 
     if [[ "${SB_FORCE_TLS_REALTY:-}" == "1" ]]; then c=3
     else
         read -r -p "选择: " c; c=$(clean_input "$c"); [[ -z "$c" ]] && c=2
+        sb_batch_tls_override 1 c
     fi
     if [[ "$c" == "3" ]]; then
         local dom sni
@@ -56,10 +57,10 @@ ask_cert() {  # 输出三种: CERT_FILE+KEY_FILE (TLS) / REALITY_ENV (Reality = 
             -keyout "$KEY_FILE" -out "$CERT_FILE" -days 3650 -subj "/CN=$d" -addext "subjectAltName=DNS:$d" >/dev/null 2>&1
         CERT_DOMAIN="$d"; CERT_TRUSTED=false; return 0
     fi
-    read -r -p "crt 路径: " CERT_FILE; read -r -p "key 路径: " KEY_FILE
-    CERT_FILE=$(clean_input "$CERT_FILE"); KEY_FILE=$(clean_input "$KEY_FILE")
-    [[ -f "$CERT_FILE" && -f "$KEY_FILE" ]] || { print_error "证书路径无效"; return 1; }
-    CERT_DOMAIN=$(extract_cert_domain "$CERT_FILE"); CERT_TRUSTED=true
+    # 真证书: 批量模式用 batch 入口选好的那张; 交互模式列出本机证书让你选,
+    # 而不是要你手打 crt/key 路径 —— 手打几乎没人填对, 填错了报错还很难看出来。
+    [[ -n "${SB_BATCH:-}" ]] && { sb_apply_batch_cert; return $?; }
+    pick_trusted_cert_verbose
 }
 
 add_config() {

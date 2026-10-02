@@ -82,17 +82,12 @@ ask_cert() {
     echo "  3) 生成自签证书 (无需域名, 用 pin 校验)" >&2
     read -r -p "  选择 (默认 3): " c
     c=$(clean_input "$c"); [[ -z "$c" ]] && c=3
+    sb_batch_tls_override 2 c
     case "$c" in
         2)
-            read -r -p "  crt 路径: " f; read -r -p "  key 路径: " k
-            f=$(clean_input "$f"); k=$(clean_input "$k")
-            if [[ -f "$f" && -f "$k" ]]; then
-                CERT_FILE="$f"; KEY_FILE="$k"
-                CERT_DOMAIN=$(extract_cert_domain "$f")
-                cert_not_expired "$f" || { print_warn "证书已过期"; return 1; }
-                CERT_TRUSTED=true; print_ok "使用手动证书: $CERT_DOMAIN"; return 0
-            fi
-            print_error "路径无效，改用自签"; generate_cert; return $?
+            # 批量用 batch 入口选好的证书; 交互模式列出本机证书让你选
+            [[ -n "${SB_BATCH:-}" ]] && { sb_apply_batch_cert; return $?; }
+            pick_trusted_cert_verbose
             ;;
     esac
     if [[ "$c" == "1" ]]; then

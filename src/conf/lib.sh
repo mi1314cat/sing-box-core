@@ -374,6 +374,123 @@ default_server_ip() { # 优先公网网卡 IPv4; 无 v4 则回退 IPv6
 #   - 域名自动带出, 与 Nginx server_name 保证一致 (CDN 回源校验 SNI)
 #   - 不新增交互维度, 只是把"手打路径"换成"从列表挑"
 # 用法: pick_trusted_cert  -> 设 CERT_FILE / KEY_FILE / CERT_DOMAIN / CERT_TRUSTED
+# ---------- nginx 站点检测 ----------
+# 批量选证书时用得上: 光列出一堆 /etc/letsencrypt/live 下的证书路径,
+# 用户很难判断"哪个域名是我对外真正在用的"。把 nginx 站点里的 server_name
+# 也列出来, 选择就直观了 —— 你站点在用的那张, 通常就是该用的那张。
+# 兼容两种部署: 宿主机 nginx (/etc/nginx) 与容器 nginx (/home/web/conf.d)。
+SB_NGINX_SITES=()
+sb_scan_nginx_sites() {
+    SB_NGINX_SITES=()
+    local roots=(/etc/nginx /home/web/conf.d /usr/local/nginx/conf /etc/nginx/conf.d)
+    local d f n
+    for d in "${roots[@]}"; do
+        [[ -d "$d" ]] || continue
+        while read -r n; do
+            [[ -n "$n" ]] && SB_NGINX_SITES+=("$n")
+        done < <(grep -rhoE '^[[:space:]]*server_name[[:space:]]+[^;]+;' "$d" 2>/dev/null \
+                  | sed -E 's/^[[:space:]]*server_name[[:space:]]+//; s/;[[:space:]]*$//' \
+                  | tr ' ' '\n' | grep -v '^_$' | sort -u)
+    done
+    # 去重
+    if (( ${#SB_NGINX_SITES[@]} > 0 )); then
+        local uniq=() seen=" "
+        for n in "${SB_NGINX_SITES[@]}"; do
+            [[ "$seen" == *" $n "* ]] && continue
+            seen+="$n "; uniq+=("$n")
+        done
+        SB_NGINX_SITES=("${uniq[@]}")
+    fi
+    return 0
+}
+
+# 列出"证书 + 站点域名"的对照, 让用户按域名选而不是按文件路径选。
+# 传入 sb_FOUND_CERTS (来自 sb_scan_certs), 打印编号列表, 回车=1。
+pick_trusted_cert_verbose() {
+    if ! sb_scan_certs; then
+        print_warn "未检测到任何证书, 回退到手动输入路径"
+        local f k
+        read -r -p "  crt 路径: " f; read -r -p "  key 路径: " k
+        f=$(clean_input "$f"); k=$(clean_input "$k")
+        if [[ -f "$f" && -f "$k" ]]; then
+            CERT_FILE="$f"; CERT_KEY_FILE_DONE="$k"
+            KEY_FILE="$k"; CERT_DOMAIN=$(extract_cert_domain "$f"); CERT_TRUSTED=true
+            return 0
+        fi
+        print_error "路径无效"; return 1
+    fi
+    sb_scan_nginx_sites
+    # 同一张证书在磁盘上常有两份 (acme.sh 的 certs/x.pem 与 letsencrypt 的
+    # live/x/fullchain.pem), 按路径去重会把它们都列出来, 用户看着像两张证书,
+    # 编号也对不上号。这里按域名去重, 保留第一份路径。
+    local uniq=() seen=" " e crt key dom mark
+    for e in "${sb_FOUND_CERTS[@]}"; do
+        crt="${e%%|*}"; dom=$(extract_cert_domain "$crt")
+        [[ "$seen" == *" ${dom:-?} "* ]] && continue
+        seen+="${dom:-?} "; uniq+=("$e")
+    done
+    local i=1
+    echo "  检测到 ${#uniq[@]} 张证书:" >&2
+    for e in "${uniq[@]}"; do
+        crt="${e%%|*}"; key="${e#*|}"; key="${key%%|*}"
+        dom=$(extract_cert_domain "$crt")
+        mark=""
+        local n
+        for n in "${SB_NGINX_SITES[@]}"; do
+            [[ "$n" == "$dom" || "$n" == "*.$dom" || "$n" == *".$dom" ]] && { mark=" ← nginx 站点在用"; break; }
+        done
+        printf "  %d) %-34s%s\n" "$i" "${dom:-未知域名}" "$mark" >&2
+        i=$((i+1))
+    done
+    if (( ${#SB_NGINX_SITES[@]} > 0 )); then
+        echo -e "  ${MAGENTA}(检测到 ${#SB_NGINX_SITES[@]} 个 nginx 站点域名)${RESET}" >&2
+    fi
+    local c
+    read -r -p "  选哪张 (数字, 回车=1): " c
+    c=$(clean_input "$c"); [[ -z "$c" ]] && c=1
+    [[ "$c" =~ ^[0-9]+$ ]] && (( c >= 1 && c <= ${#uniq[@]} )) || { print_error "无效选择"; return 1; }
+    e="${uniq[$((c-1))]}"
+    crt="${e%%|*}"; key="${e#*|}"; key="${key%%|*}"
+    CERT_FILE="$crt"; KEY_FILE="$key"
+    CERT_DOMAIN=$(extract_cert_domain "$crt")
+    CERT_TRUSTED=true
+    print_ok "已选证书: $CERT_DOMAIN"
+    return 0
+}
+
+# 批量模式下统一用 batch 入口事先选好的证书。
+# 批量下**绝不能** read: 那条应答队列是按顺序喂给各协议的, 协议里多读一次
+# 就会把后面某个协议的答案吃掉。所以这里只读环境变量。
+# 批量指定"使用本机真实证书"时, 把协议自己读到的 TLS 模式改判到真证书分支。
+# 各协议的分菜单编号不统一 (trojan/anytls 是 1, hysteria2/vmess 是 2),
+# 所以把真证书分支编号当参数传进来。
+# 不改的话: 批量下 read 取默认值 -> 各协议默认走自签 -> ③ 选了真证书也没用,
+# 表现就是菜单明明选了真证书, 生成出来还是自签。
+sb_batch_tls_override() { # sb_batch_tls_override <真证书分支编号> <变量名>
+    local n="$1" var="$2"
+    [[ -n "${SB_BATCH:-}" ]] || return 0
+    [[ "${SB_BATCH_CERT:-self}" == "real" ]] || return 0
+    printf -v "$var" '%s' "$n"
+    return 0
+}
+
+sb_apply_batch_cert() {
+    local m="${SB_BATCH_CERT:-self}"
+    if [[ "$m" == "real" ]]; then
+        if [[ -n "${SB_BATCH_CERT_CRT:-}" && -f "${SB_BATCH_CERT_CRT}" ]]; then
+            CERT_FILE="$SB_BATCH_CERT_CRT"
+            KEY_FILE="${SB_BATCH_CERT_KEY:-}"
+            CERT_DOMAIN="${SB_BATCH_CERT_DOMAIN:-$(extract_cert_domain "$CERT_FILE")}"
+            CERT_TRUSTED=true
+            print_info "批量: 真证书 $CERT_DOMAIN"
+            return 0
+        fi
+        print_warn "批量指定的真证书不可用, 改用自签"
+    fi
+    sb_selfgen_cert
+    return 0
+}
+
 pick_trusted_cert() {
     if ! sb_scan_certs; then
         print_warn "未检测到任何证书, 回退到手动输入路径"

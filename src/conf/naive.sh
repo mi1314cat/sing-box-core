@@ -27,6 +27,7 @@ add_config() {
     pass=$(openssl rand -hex 6)
     echo "TLS 证书: 1) 真证书 2) 自签(200天+pin) [默认2]" >&2
     read -r -p "选择: " c; c=$(clean_input "$c"); [[ -z "$c" ]] && c=2
+    sb_batch_tls_override 1 c
     if [[ "$c" == "1" ]]; then
         read -r -p "crt: " CERT_FILE; read -r -p "KEY: " KEY_FILE
         CERT_FILE=$(clean_input "$CERT_FILE"); KEY_FILE=$(clean_input "$KEY_FILE")

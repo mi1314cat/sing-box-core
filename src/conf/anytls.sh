@@ -54,15 +54,17 @@ ask_cert() {  # 输出 CERT_FILE/KEY_FILE/CERT_DOMAIN/CERT_TRUSTED, 或 TLS_TYPE
     local c
     echo "TLS 模式: 1) 真证书  2) 自签(pin)  3) Reality [默认 2]" >&2
     echo "  (选 3 = AnyTLS+REALITY, 仅 sing-box 客户端可用; mihomo/Clash 不支持该组合)" >&2
-    if [[ -n "${SB_BATCH:-}" ]]; then c=2; else
+    local c
+    if [[ -n "${SB_BATCH:-}" ]]; then c=2
+    elif [[ "${SB_FORCE_TLS_REALTY:-}" == "1" ]]; then c=3
+    else
         # 批量生成 Reality 变体时由 batch 显式指定 (见 batch.sh 注释);
         # 只替换交互输入, 复用下方原有 Reality 分支
-        local c
-        if [[ "${SB_FORCE_TLS_REALTY:-}" == "1" ]]; then c=3
-        else
-            read -r -p "选择: " c; c=$(clean_input "$c"); [[ -z "$c" ]] && c=2
-        fi
+        read -r -p "选择: " c; c=$(clean_input "$c"); [[ -z "$c" ]] && c=2
     fi
+    # 覆盖放在 if/else 外面: 之前写在 else 里, 批量路径压根不经过, 于是
+    # ③ 选了真证书, anytls 出来的还是自签。
+    sb_batch_tls_override 1 c
     if [[ "$c" == "3" ]]; then
         local d sid
         d=$(safe_read "Reality 握手目标 (统一 domains.sh)" "$(reality_random_domain)")
@@ -82,10 +84,10 @@ ask_cert() {  # 输出 CERT_FILE/KEY_FILE/CERT_DOMAIN/CERT_TRUSTED, 或 TLS_TYPE
         [[ -f "$CERT_FILE" && -f "$KEY_FILE" ]] || { print_error "证书生成失败"; return 1; }
         CERT_DOMAIN="$d"; CERT_TRUSTED=false; return 0
     fi
-    read -r -p "crt 路径: " CERT_FILE; read -r -p "key 路径: " KEY_FILE
-    CERT_FILE=$(clean_input "$CERT_FILE"); KEY_FILE=$(clean_input "$KEY_FILE")
-    [[ -f "$CERT_FILE" && -f "$KEY_FILE" ]] || { print_error "证书路径无效"; return 1; }
-    CERT_DOMAIN=$(extract_cert_domain "$CERT_FILE"); CERT_TRUSTED=true
+    # 真证书: 批量模式用 batch 入口选好的那张; 交互模式列出本机证书让你选,
+    # 而不是要你手打 crt/key 路径 —— 手打几乎没人填对, 填错了报错还很难看出来。
+    [[ -n "${SB_BATCH:-}" ]] && { sb_apply_batch_cert; return $?; }
+    pick_trusted_cert_verbose
 }
 
 # 证书 DER 的 SHA256 (mihomo 的 fingerprint 语义: 证书指纹, 不是 SPKI 哈希)
