@@ -395,6 +395,29 @@ sb_scan_nginx_sites() {
 
 # 列出"证书 + 站点域名"的对照, 让用户按域名选而不是按文件路径选。
 # 传入 sb_FOUND_CERTS (来自 sb_scan_certs), 打印编号列表, 回车=1。
+# 证书列表按域名去重 —— 供所有证书选择入口共用。
+#
+# 同一张证书在磁盘上通常有两份 (acme.sh 的 certs/x.pem 与 certbot 的
+# live/x/fullchain.pem)。按路径去重没用 (路径确实不同), 用户看到的是同一
+# 个域名出现两次, 编号还和预期对不上, 很容易选错。
+#
+# 之前只有 pick_trusted_cert_verbose 做了这件事, pick_trusted_cert (非
+# verbose 版) 没做 —— 结果同一个服务器上, 走 A 入口看到 2 张、走 B 入口
+# 看到 4 张。抽成函数后才能保证两处行为一致。
+#
+# 保留第一份: sb_scan_certs 的扫描顺序是 /home/web/certs -> /etc/letsencrypt,
+# 先扫到的通常正是现有 nginx 站点正在用的那张。
+sb_dedup_certs_by_domain() {
+    local uniq=() seen=" " e dom
+    for e in "${sb_FOUND_CERTS[@]}"; do
+        dom=$(extract_cert_domain "${e%%|*}")
+        [[ "$seen" == *" ${dom:-?} "* ]] && continue
+        seen+="${dom:-?} "; uniq+=("$e")
+    done
+    SB_UNIQ_CERTS=("${uniq[@]}")
+    return 0
+}
+
 pick_trusted_cert_verbose() {
     if ! sb_scan_certs; then
         print_warn "未检测到任何证书, 回退到手动输入路径"
@@ -412,12 +435,8 @@ pick_trusted_cert_verbose() {
     # 同一张证书在磁盘上常有两份 (acme.sh 的 certs/x.pem 与 letsencrypt 的
     # live/x/fullchain.pem), 按路径去重会把它们都列出来, 用户看着像两张证书,
     # 编号也对不上号。这里按域名去重, 保留第一份路径。
-    local uniq=() seen=" " e crt key dom mark
-    for e in "${sb_FOUND_CERTS[@]}"; do
-        crt="${e%%|*}"; dom=$(extract_cert_domain "$crt")
-        [[ "$seen" == *" ${dom:-?} "* ]] && continue
-        seen+="${dom:-?} "; uniq+=("$e")
-    done
+    local uniq=() e crt key dom mark
+    sb_dedup_certs_by_domain; uniq=("${SB_UNIQ_CERTS[@]}")
     local i=1
     echo "  检测到 ${#uniq[@]} 张证书:" >&2
     for e in "${uniq[@]}"; do
@@ -487,34 +506,30 @@ pick_trusted_cert() {
         read -r -p "  crt 路径: " f; read -r -p "  key 路径: " k
         f=$(clean_input "$f"); k=$(clean_input "$k")
         if [[ -f "$f" && -f "$k" ]]; then
-            CERT_FILE="$f"; KEY_FILE="$k"
-            CERT_DOMAIN=$(extract_cert_domain "$f"); CERT_TRUSTED=true
+            CERT_FILE="$f"; CERT_KEY_FILE_DONE="$k"
+            KEY_FILE="$k"; CERT_DOMAIN=$(extract_cert_domain "$f"); CERT_TRUSTED=true
             return 0
         fi
         print_error "路径无效"; return 1
     fi
 
-    echo "  检测到 ${#sb_FOUND_CERTS[@]} 张证书:" >&2
-    local i=1 e crt key dom
-    for e in "${sb_FOUND_CERTS[@]}"; do
+    local uniq=() e crt key dom i=1 c
+    sb_dedup_certs_by_domain; uniq=("${SB_UNIQ_CERTS[@]}")
+    echo "  检测到 ${#uniq[@]} 张证书:" >&2
+    for e in "${uniq[@]}"; do
         crt="${e%%|*}"; key="${e#*|}"; key="${key%%|*}"
-        dom=$(openssl x509 -in "$crt" -noout -ext subjectAltName 2>/dev/null \
-              | grep -oE 'DNS:[^ ,]+' | head -1 | cut -d: -f2)
-        [[ -z "$dom" ]] && dom=$(extract_cert_domain "$crt")
+        dom=$(extract_cert_domain "$crt")
         printf "  %d) %s  (%s)\n" "$i" "${dom:-未知域名}" "$crt" >&2
         i=$((i+1))
     done
-    local c
     read -r -p "  选哪张 (数字, 回车=1): " c
     c=$(clean_input "$c"); [[ -z "$c" ]] && c=1
-    [[ "$c" =~ ^[0-9]+$ ]] && (( c >= 1 && c <= ${#sb_FOUND_CERTS[@]} )) || { print_error "无效选择"; return 1; }
+    [[ "$c" =~ ^[0-9]+$ ]] && (( c >= 1 && c <= ${#uniq[@]} )) || { print_error "无效选择"; return 1; }
 
-    e="${sb_FOUND_CERTS[$((c-1))]}"
+    e="${uniq[$((c-1))]}"
     crt="${e%%|*}"; key="${e#*|}"; key="${key%%|*}"
     CERT_FILE="$crt"; KEY_FILE="$key"
-    CERT_DOMAIN=$(openssl x509 -in "$crt" -noout -ext subjectAltName 2>/dev/null \
-                  | grep -oE 'DNS:[^ ,]+' | head -1 | cut -d: -f2)
-    [[ -z "$CERT_DOMAIN" ]] && CERT_DOMAIN=$(extract_cert_domain "$crt")
+    CERT_DOMAIN=$(extract_cert_domain "$crt")
     CERT_TRUSTED=true
     print_ok "已选证书: $CERT_DOMAIN"
     return 0
