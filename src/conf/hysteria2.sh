@@ -193,8 +193,14 @@ EOF
 
     # ---- 客户端产物 ----
     local pin="" pin_q=""
+    local pin="" pin_field=""
+    # 真证书 (CERT_TRUSTED=true) 时 pin 是空的, 而 pin_field 也必须**整个省略**:
+    # 写成 "certificate_public_key_sha256": "" 会让 sing-box 拿一个空 pin 去比对,
+    # 报 "unrecognized remote public key" —— 真证书节点直接连不上。
     if [[ "$CERT_TRUSTED" == "false" ]]; then
         pin=$(cert_spki_pin_base64 "$CERT_FILE")
+        pin_field=",
+        \"certificate_public_key_sha256\": \"$pin\""
     fi
     local link="hysteria2://$auth@$server_ip:$listen_port?${hop:+mport=$hop&}sni=$CERT_DOMAIN&obfs=$( [[ $mask != none ]] && echo salamander || echo none )&obfs-password=$( [[ $mask != none ]] && echo $mask )&alpn=h3"
     [[ "$CERT_TRUSTED" == "false" ]] && link="$link&pinSHA256=$pin"
@@ -215,8 +221,7 @@ EOF
       "tls": {
         "enabled": true,
         "server_name": "$CERT_DOMAIN",
-        "alpn": ["h3"],
-        "certificate_public_key_sha256": "$pin"
+        "alpn": ["h3"]$pin_field
       }
     }
   ]

@@ -706,6 +706,328 @@ sb_transport_link_params() { # <type> <path> <svc> <host>
     esac
 }
 
+# ---------- TLS Fragment (客户端侧) ----------
+#
+# 把 ClientHello 切成多段、每段之间插随机延时再发出去, 让按"首包大小"分类的
+# DPI 探针看不出这是个 TLS 握手 (裸 ClientHello 的特征太明显)。
+#
+# 与 record_fragment 的区别 (两者别混):
+#   fragment         —— 切的是 **ClientHello 这条 TLS 记录**本身
+#   record_fragment  —— 切的是之后的**每一条 TLS record**
+# 前者防的是"看到第一个包就是标准 ClientHello", 后者防的是握手之后的流量特征。
+# 本项目的 vless/vmess/trojan 默认只暴露 fragment, 因为它更通用、对服务端
+# 零要求 (record_fragment 对服务端实现有要求)。
+#
+# 为什么默认关闭:
+#   - 每个 ClientHello 多花 10~20ms, 高频新建连接的场景反而更慢
+#   - 部分中间设备对分片 TLS 的处理有 bug, 可能直接断连
+#   - 已经走 REALITY / ECH 的节点不需要它 (那些是更强的手段)
+# 所以做成显式 opt-in, 不塞进默认路径。
+SB_FRAG_DELAY_DEFAULT=10
+
+sb_ask_fragment() { # <tls_mode> -> SB_FRAGMENT / SB_FRAG_DELAY
+    SB_FRAGMENT=""; SB_FRAG_DELAY=0
+    [[ -n "${SB_BATCH:-}" ]] && return 0
+    # reality 节点自己就是"伪装", 再套 fragment 没必要
+    [[ "${1:-}" == "reality" ]] && return 0
+    echo >&2
+    echo -e "${CYAN}  TLS 分片 (fragment)${RESET} ${CYAN}— 切开 ClientHello 并插入随机延时, 抗按首包特征的 DPI${RESET}" >&2
+    echo -e "    ${MAGENTA}代价: 每个 ClientHello 多 10~20ms; 少数中间设备对分片 TLS 处理有 bug。${RESET}" >&2
+    echo -e "    ${MAGENTA}REALITY / ECH 节点不需要它 (那已经是更强的手段)。${RESET}" >&2
+    echo -e "    ${GREEN}1)${RESET} 关闭 (推荐)" >&2
+    echo -e "    ${GREEN}2)${RESET} 开启" >&2
+    local c
+    read -r -p "    请选择 [1-2, 回车=1]: " c || { echo; return 0; }
+    c=$(clean_input "$c"); [[ -z "$c" ]] && c=1
+    [[ "$c" == "2" ]] || return 0
+    SB_FRAGMENT="true"
+    SB_FRAG_DELAY=$(safe_read "首片延时 (毫秒)" "$SB_FRAG_DELAY_DEFAULT")
+    [[ "$SB_FRAG_DELAY" =~ ^[0-9]+$ ]] || SB_FRAG_DELAY=$SB_FRAG_DELAY_DEFAULT
+    print_ok "TLS 分片已开启 (首片延时 ${SB_FRAG_DELAY}ms)"
+    return 0
+}
+
+# 客户端 TLS 片段 (与 ech 一样用 jq 并进去)
+sb_fragment_json_client() {
+    [[ "${SB_FRAGMENT:-}" == "true" ]] || return 0
+    printf '"fragment": true, "fragment_fallback_delay": "%sms"' "${SB_FRAG_DELAY:-$SB_FRAG_DELAY_DEFAULT}"
+}
+
+# 分享链接参数 (mihomo 叫 tls-fragment, sing-box 客户端认 fragment/fallback)
+sb_fragment_link_params() {
+    [[ "${SB_FRAGMENT:-}" == "true" ]] || return 0
+    printf '&fragment=1&fragmentFallbackDelay=%sms' "${SB_FRAG_DELAY:-$SB_FRAG_DELAY_DEFAULT}"
+}
+
+# ---------- ECH (Encrypted Client Hello) ----------
+#
+# ECH 把 ClientHello 里的真实 SNI 加密, 外面套一个"公开名"(public_name,
+# 通常是 Cloudflare 之类的大服务商域名)。中间盒于是只看到公开名, 看不到
+# 你实际连的是哪个域名 —— 这是 sing-box 相比 Xray / mihomo 最实在的一个
+# 差异点: Xray 只有客户端侧的 echConfigList, mihomo 的 ech-key 更是只作用在
+# API server 的 HTTPS 上 (官方文档原文: "Currently only used for https in API"),
+# sing-box 是**真正双向**: 服务端持有自己域名的 ECH 密钥, 客户端持有对应 config。
+#
+# 为什么必须绑定 CDN:
+#   服务端的 ech.key 是**你这个域名**的 ECH 私钥, 而这个域名的 TLS 由
+#   Cloudflare 终止。裸直连场景下 SNI 本来就是自己的域名, 加密它没有收益,
+#   客户端还得多带一份 config, 徒增故障面。所以这里只在 CDN 模式下问,
+#   别的路径一律不生成。
+#
+# 生成: sing-box generate ech-keypair <你的域名>
+#       输出两段 PEM: ECH CONFIGS (发给客户端) / ECH KEYS (服务端自留)
+#       ECH CONFIGS 放进分享链接, 客户端侧 config 指向它。
+sb_ech_supported() {
+    # ACCESS_MODE 的三种取值里, cdn 和 cdn-nginx 都走 Cloudflare。
+    # 只认 "cdn" 会漏掉 cdn-nginx —— 而那恰恰是最常用的那种 (CDN + 自建 nginx)。
+    [[ "${1:-}" == "cdn" || "${1:-}" == "cdn-nginx" ]]
+}
+
+# 生成或复用 <域名> 的 ECH 密钥对。
+# 结果写进全局: SB_ECH_KEY_FILE (ECH KEYS, 服务端) / SB_ECH_CONFIG_FILE (ECH CONFIGS, 客户端)
+sb_ech_generate() { # <域名>
+    local domain="$1" dir="$SB_ROOT/ech"
+    SB_ECH_KEY_FILE="" SB_ECH_CONFIG_FILE=""
+    [[ -n "$domain" ]] || return 1
+    command -v "$SB_BIN" >/dev/null 2>&1 || return 1
+    mkdir -p "$dir" || return 1
+    local safe; safe=$(printf '%s' "$domain" | tr -c 'A-Za-z0-9._-' '_')
+    local kf="$dir/${safe}_ech.key.pem" cf="$dir/${safe}_ech.config.pem"
+    if [[ -s "$kf" && -s "$cf" ]]; then
+        SB_ECH_KEY_FILE="$kf"; SB_ECH_CONFIG_FILE="$cf"; return 0
+    fi
+    local out
+    out=$("$SB_BIN" generate ech-keypair "$domain" 2>/dev/null) || return 1
+    # 输出是两段 PEM, 按 BEGIN 头切成两份
+    printf '%s\n' "$out" | awk '
+        /-----BEGIN ECH CONFIGS-----/ {m="c"} /-----BEGIN ECH KEYS-----/ {m="k"}
+        m=="c" {print > "'"$cf"'"} m=="k" {print > "'"$kf"'"}
+    ' 2>/dev/null || return 1
+    [[ -s "$kf" && -s "$cf" ]] || return 1
+    chmod 600 "$kf"
+    SB_ECH_KEY_FILE="$kf"; SB_ECH_CONFIG_FILE="$cf"; return 0
+}
+
+# CDN 模式下询问是否启用 ECH。结果写进 SB_ECH_ON。
+sb_ask_ech() { # <域名> <ACCESS_MODE>
+    local domain="$1" mode="$2"
+    SB_ECH_ON=0; SB_ECH_KEY_FILE=""; SB_ECH_CONFIG_FILE=""
+    sb_ech_supported "$mode" || return 0
+    if [[ -n "${SB_BATCH:-}" ]]; then
+        [[ "${SB_BATCH_ECH:-0}" == "1" ]] && sb_ech_generate "$domain" && SB_ECH_ON=1
+        return 0
+    fi
+    echo >&2
+    echo -e "${CYAN}  ECH (加密 ClientHello)${RESET} ${CYAN}— 隐藏真实 SNI, 中间盒只看到 Cloudflare 域名${RESET}" >&2
+    echo -e "    ${GREEN}1)${RESET} 关闭 (推荐)" >&2
+    echo -e "    ${GREEN}2)${RESET} 开启" >&2
+    echo -e "    ${MAGENTA}仅 CDN 模式有意义: ECH 密钥属于你这个域名, 而 TLS 由 Cloudflare 终止。${RESET}" >&2
+    echo -e "    ${MAGENTA}直连时 SNI 本就是自己的域名, 加密它没有收益。${RESET}" >&2
+    local c
+    read -r -p "    请选择 [1-2, 回车=1]: " c || { echo; return 0; }
+    c=$(clean_input "$c"); [[ -z "$c" ]] && c=1
+    [[ "$c" == "2" ]] || return 0
+    if sb_ech_generate "$domain"; then
+        SB_ECH_ON=1
+        print_ok "ECH 密钥已生成: $(basename "$SB_ECH_KEY_FILE")"
+    else
+        print_warn "ECH 密钥生成失败, 继续用未加密 SNI (节点不受影响)"
+    fi
+    return 0
+}
+
+# 服务端 TLS 里的 ech 片段 (供各协议嵌进 tls 对象)
+sb_ech_json_server() {
+    [[ "${SB_ECH_ON:-0}" == "1" ]] || return 0
+    printf '"ech": { "enabled": true, "key_path": "%s" }' "$SB_ECH_KEY_FILE"
+}
+
+# 客户端 TLS 里的 ech 片段
+sb_ech_json_client() {
+    [[ "${SB_ECH_ON:-0}" == "1" ]] || return 0
+    printf '"ech": { "enabled": true, "config_path": "%s" }' "$SB_ECH_CONFIG_FILE"
+}
+
+# 分享链接参数: 客户端拿到 ECH CONFIGS
+sb_ech_link_params() {
+    [[ "${SB_ECH_ON:-0}" == "1" && -s "${SB_ECH_CONFIG_FILE:-}" ]] || return 0
+    printf '&ech=%s' "$(tr -d '\n' < "$SB_ECH_CONFIG_FILE" | grep -v -- "-----" )"
+}
+
+# ---------- Multiplex (多路复用) ----------
+#
+# sing-box 只在**四个协议**上支持 multiplex —— VLESS / VMess / Trojan / Shadowsocks
+# (见 option/{vless,vmess,trojan,shadowsocks}.go 里的 Multiplex 字段)。
+# AnyTLS / NaiveProxy / Hysteria2 / TUIC 的 options 结构体里根本没有这个字段,
+# 给它们加就是生成一份 sing-box check 会直接拒绝的配置。所以这里用协议白名单卡死。
+#
+# 两个方向不对称, 容易踩:
+#   出站 (客户端): enabled / protocol / max_connections / min_streams / max_streams
+#                  / padding / brutal        —— **protocol 只在出站有**
+#   入站 (服务端): enabled / padding / brutal —— 服务端**没有 protocol 字段**,
+#                  由 sing-box 自动识别客户端用了哪种。所以"让用户选服务端协议"
+#                  这个需求在 sing-box 上不存在, 别去造。
+#
+# brutal 是 TCP Brutal 拥塞控制: 用一个预估带宽硬压发送速率, 高带宽高延迟链路上
+# 吞吐能明显好于 TCP 常规拥塞控制。代价是**填错就废** —— 填的比实际带宽高会丢包、
+# 重传, 甚至比不开还慢。所以它必须由用户明确给出, 默认关闭。
+SB_MUX_PROTOCOLS=(h2mux yamux smux)
+# 默认按用户口味: 上行 100 Mbps / 下行 200 Mbps
+SB_BRUTAL_UP_DEFAULT=100
+SB_BRUTAL_DOWN_DEFAULT=200
+
+# ---- TCP Brutal 可用性探测 ----
+#
+# brutal 不是纯用户态特性: sing-box 会 setsockopt(TCP_CONGESTION, "brutal"),
+# 要求**内核**装有 tcp_brutal 模块。该模块是 out-of-tree 的 (rimcoding/tcp_brutal),
+# 2023 年已停止维护, 从未合入 Linux 主线 —— Debian/Ubuntu 官方内核不带,
+# apt 源里也没有。
+#
+# 后果很关键: sing-box check **照样通过**, 配置看起来完全正常,
+# 直到第一个真实请求才在运行时炸:
+#   brutal exchange: remote error: enable TCP Brutal: setsockopt IPPROTO_TCP
+#   TCP_CONGESTION brutal: no such file or directory
+# 所以这里必须探测之后再决定要不要给用户这个选项, 不能无条件暴露。
+sb_brutal_available() {
+    grep -qw brutal /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null && return 0
+    modinfo tcp_brutal >/dev/null 2>&1 && return 0
+    return 1
+}
+
+# 该协议是否支持 multiplex
+sb_mux_supported() {
+    case "${1:-}" in vless|vmess|trojan|shadowsocks) return 0 ;; *) return 1 ;; esac
+}
+
+# 交互式询问 multiplex 设置, 结果放进 SB_MUX_* 全局变量。
+# 服务端与客户端各调用一次 (字段不同), 但问的是同一组问题。
+# 批量模式一律关闭: 批量是"一把梭生成全套", 不该替用户做带宽假设。
+sb_ask_multiplex() { # <协议> <server|client>
+    local proto="$1" side="${2:-server}"
+    SB_MUX_ON=0; SB_MUX_PROTO=""; SB_MUX_MAXCONN=0; SB_MUX_MINSTR=0; SB_MUX_MAXSTR=0
+    SB_MUX_PAD=0; SB_MUX_BRUTAL=0; SB_MUX_UP=0; SB_MUX_DOWN=0
+
+    if [[ -n "${SB_BATCH:-}" ]]; then
+        # 批量可显式指定, 默认关闭
+        if [[ "${SB_BATCH_MUX:-0}" == "1" ]]; then
+            SB_MUX_ON=1
+            # 批量也必须探测: 否则批量生成的节点 check 全过, 但一个都连不上
+            SB_MUX_BRUTAL=0
+            sb_brutal_available && [[ "${SB_BATCH_BRUTAL:-1}" == "1" ]] && SB_MUX_BRUTAL=1
+            # brutal 必须给非零带宽: sing-box 客户端会校验 BrutalMinSpeedBPS,
+            # 填 0 会被拒 (服务端侧同样如此)。不指定就用默认口味。
+            SB_MUX_UP="${SB_BATCH_UP_MBPS:-$SB_BRUTAL_UP_DEFAULT}"
+            SB_MUX_DOWN="${SB_BATCH_DOWN_MBPS:-$SB_BRUTAL_DOWN_DEFAULT}"
+            [[ "$SB_MUX_UP"  =~ ^[0-9]+$ && "$SB_MUX_UP"  -gt 0 ]] || SB_MUX_UP=$SB_BRUTAL_UP_DEFAULT
+            [[ "$SB_MUX_DOWN" =~ ^[0-9]+$ && "$SB_MUX_DOWN" -gt 0 ]] || SB_MUX_DOWN=$SB_BRUTAL_DOWN_DEFAULT
+            SB_MUX_PROTO="${SB_BATCH_MUX_PROTO:-h2mux}"
+            SB_MUX_MAXCONN="${SB_BATCH_MUX_MAXCONN:-4}"
+            SB_MUX_MINSTR="${SB_BATCH_MUX_MINSTR:-4}"
+            SB_MUX_MAXSTR="${SB_BATCH_MUX_MAXSTR:-0}"
+        fi
+        return 0
+    fi
+    sb_mux_supported "$proto" || return 0
+
+    echo >&2
+    echo -e "${CYAN}  多路复用 (multiplex)${RESET} ${CYAN}— 多个连接复用一条 TCP, 减少握手并改善高延迟链路${RESET}" >&2
+    echo -e "    ${MAGENTA}(${proto} 支持; 开销: 多一次封装, CPU 略增, 单连接延迟会略升)${RESET}" >&2
+    echo -e "    ${GREEN}1)${RESET} 关闭 (推荐, 单用途节点更省)" >&2
+    echo -e "    ${GREEN}2)${RESET} 开启" >&2
+    local c
+    read -r -p "    请选择 [1-2, 回车=1]: " c || { echo; return 0; }
+    c=$(clean_input "$c"); [[ -z "$c" ]] && c=1
+    [[ "$c" == "2" ]] || return 0
+    SB_MUX_ON=1
+
+    if [[ "$side" == "client" ]]; then
+        # 只有出站有 protocol
+        echo -e "${CYAN}  复用协议${RESET}" >&2
+        echo -e "    ${GREEN}1)${RESET} ${YELLOW}h2mux${RESET}   基于 HTTP/2, 延迟最低, 与传输层无关" >&2
+        echo -e "    ${GREEN}2)${RESET} ${GREEN}yamux${RESET}   通用双工流, 与 HTTP/2 不兼容" >&2
+        echo -e "    ${GREEN}3)${RESET} ${CYAN}smux${RESET}    最省内存, 主要为 kcp-go 设计" >&2
+        local p
+        read -r -p "    请选择 [1-3, 回车=1]: " p || { echo; return 0; }
+        p=$(clean_input "$p"); [[ -z "$p" ]] && p=1
+        case "$p" in
+            2) SB_MUX_PROTO="yamux" ;;
+            3) SB_MUX_PROTO="smux" ;;
+            *) SB_MUX_PROTO="h2mux" ;;
+        esac
+        SB_MUX_MAXCONN=$(safe_read "最大连接数 (1-256, 0=不限)" "4")
+        SB_MUX_MINSTR=$(safe_read "最少复用流数 (过少会退化成独占)" "4")
+        SB_MUX_MAXSTR=$(safe_read "单连接最大流数 (0=不限)" "0")
+    fi
+
+    if [[ "$side" == "server" ]]; then
+        # padding: 只允许未填充的连接会被拒 —— 会打断手动用 curl/浏览器直连节点的场景
+        SB_MUX_PAD=0
+        print_info "服务端不启用 padding (它会拒绝未填充的连接, 只适合纯客户端对纯客户端)"
+    fi
+
+    echo >&2
+    if ! sb_brutal_available; then
+        # 明确告诉用户为什么没有这个选项, 而不是给一个运行时才炸的开关
+        echo -e "${CYAN}  TCP Brutal 拥塞控制${RESET} ${YELLOW}— 当前内核不支持, 已跳过${RESET}" >&2
+        echo -e "    ${MAGENTA}brutal 需要 tcp_brutal 内核模块 (out-of-tree, 2023 年已弃用, 未合入主线)。${RESET}" >&2
+        echo -e "    ${MAGENTA}缺它时 sing-box check 仍会通过, 但第一个请求就会断。${RESET}" >&2
+        echo -e "    ${MAGENTA}本机可用: $(tr '\\n' ' ' < /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null | sed 's/ $//')${RESET}" >&2
+        echo -e "    ${MAGENTA}想要高带宽高延迟链路的收益, 可改用系统级 BBR (本机内核已支持)。${RESET}" >&2
+        return 0
+    fi
+    echo -e "${CYAN}  TCP Brutal 拥塞控制${RESET} ${CYAN}— 按设定带宽硬压发送速率${RESET}" >&2
+    echo -e "    ${MAGENTA}填比实际带宽高会丢包重传, 可能比不开更慢; 建议设为实测带宽的 80%%${RESET}" >&2
+    echo -e "    ${GREEN}1)${RESET} 关闭" >&2
+    echo -e "    ${GREEN}2)${RESET} 开启 (默认 上${SB_BRUTAL_UP_DEFAULT}Mbps / 下${SB_BRUTAL_DOWN_DEFAULT}Mbps)" >&2
+    local b
+    read -r -p "    请选择 [1-2, 回车=1]: " b || { echo; return 0; }
+    b=$(clean_input "$b"); [[ -z "$b" ]] && b=1
+    if [[ "$b" == "2" ]]; then
+        SB_MUX_BRUTAL=1
+        local up dn
+        up=$(safe_read "上行带宽 (Mbps)" "$SB_BRUTAL_UP_DEFAULT")
+        dn=$(safe_read "下行带宽 (Mbps)" "$SB_BRUTAL_DOWN_DEFAULT")
+        [[ "$up" =~ ^[0-9]+$ && "$up" -gt 0 ]] || up=$SB_BRUTAL_UP_DEFAULT
+        [[ "$dn" =~ ^[0-9]+$ && "$dn" -gt 0 ]] || dn=$SB_BRUTAL_DOWN_DEFAULT
+        SB_MUX_UP=$up; SB_MUX_DOWN=$dn
+        print_ok "Brutal: 上 ${up} Mbps / 下 ${dn} Mbps"
+    fi
+    return 0
+}
+
+# 入站 multiplex JSON。服务端没有 protocol 字段, 只有 enabled/padding/brutal。
+sb_mux_json_server() {
+    [[ "${SB_MUX_ON:-0}" == "1" ]] || return 0
+    local b=""
+    if [[ "${SB_MUX_BRUTAL:-0}" == "1" ]]; then
+        # 服务端的 up/down 要与客户端**对调**: 客户端 up=100 是"我发 100",
+        # 服务端视角那就是"我收 100", 落在 down_mbps 上。
+        # router.go 里服务端同样按 SendBPS=up_mbps / ReceiveBPS=down_mbps 处理,
+        # 所以两端写一样的数字, 方向恰好是反的。
+        b=",
+        \"brutal\": { \"enabled\": true, \"up_mbps\": ${SB_MUX_DOWN}, \"down_mbps\": ${SB_MUX_UP} }"
+    fi
+    printf '"multiplex": { "enabled": true%s }' "$b"
+}
+
+# 出站 multiplex JSON。protocol/连接数/流数都在这一侧。
+sb_mux_json_client() {
+    [[ "${SB_MUX_ON:-0}" == "1" ]] || return 0
+    local b=""
+    [[ "${SB_MUX_BRUTAL:-0}" == "1" ]] && b=",
+      \"brutal\": { \"enabled\": true, \"up_mbps\": ${SB_MUX_UP}, \"down_mbps\": ${SB_MUX_DOWN} }"
+    printf '"multiplex": { "enabled": true, "protocol": "%s", "max_connections": %s, "min_streams": %s, "max_streams": %s%s }' \
+        "${SB_MUX_PROTO:-h2mux}" "${SB_MUX_MAXCONN:-4}" "${SB_MUX_MINSTR:-4}" "${SB_MUX_MAXSTR:-0}" "$b"
+}
+
+# mux 相关的分享链接参数。服务端没有 protocol 可选, 因此链接里带的是**客户端**那侧的选择。
+sb_mux_link_params() {
+    [[ "${SB_MUX_ON:-0}" == "1" ]] || return 0
+    local p
+    p="&multiplex=1&muxProtocol=${SB_MUX_PROTO:-h2mux}&muxMaxConnections=${SB_MUX_MAXCONN:-4}&muxMinStreams=${SB_MUX_MINSTR:-4}&muxMaxStreams=${SB_MUX_MAXSTR:-0}"
+    [[ "${SB_MUX_BRUTAL:-0}" == "1" ]] && p="$p&brutal=1&brutalUpMbps=${SB_MUX_UP}&brutalDownMbps=${SB_MUX_DOWN}"
+    printf '%s' "$p"
+}
 # ALPN: ws/httpupgrade 走 http/1.1, grpc/http 必须走 h2。
 # sing-box 的 httpupgrade 在服务端会**禁用 HTTP/2**, 前置层必须用 1.1 回源。
 sb_transport_alpn() {

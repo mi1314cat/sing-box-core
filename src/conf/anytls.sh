@@ -55,8 +55,12 @@ ask_cert() {  # 输出 CERT_FILE/KEY_FILE/CERT_DOMAIN/CERT_TRUSTED, 或 TLS_TYPE
     echo "TLS 模式: 1) 真证书  2) 自签(pin)  3) Reality [默认 2]" >&2
     echo "  (选 3 = AnyTLS+REALITY, 仅 sing-box 客户端可用; mihomo/Clash 不支持该组合)" >&2
     local c
-    if [[ -n "${SB_BATCH:-}" ]]; then c=2
-    elif [[ "${SB_FORCE_TLS_REALTY:-}" == "1" ]]; then c=3
+    # 顺序很重要: SB_FORCE_TLS_REALTY 必须**先于** SB_BATCH 判断。
+    # 原来是 "SB_BATCH 就 c=2" 在前, 于是 batch 补齐 Reality 变体时
+    # (SB_BATCH=1 SB_FORCE_TLS_REALTY=1) 仍然取自签, Reality 变体永远产不出来。
+    # 这也是 batch 的 variant_list 里一直只有 vmess/trojan 的原因。
+    if [[ "${SB_FORCE_TLS_REALTY:-}" == "1" ]]; then c=3
+    elif [[ -n "${SB_BATCH:-}" ]]; then c=2
     else
         # 批量生成 Reality 变体时由 batch 显式指定 (见 batch.sh 注释);
         # 只替换交互输入, 复用下方原有 Reality 分支
@@ -90,6 +94,52 @@ ask_cert() {  # 输出 CERT_FILE/KEY_FILE/CERT_DOMAIN/CERT_TRUSTED, 或 TLS_TYPE
     pick_trusted_cert_verbose
 }
 
+# ---- AnyTLS 专属: padding_scheme ----
+#
+# padding_scheme 决定每种包类型要填充多少字节, 是 AnyTLS 抗**主动探测**的核心:
+# 真实流量带 padding, 探测方发来的畸形包走"短填充"分支, 两者的长度分布不同,
+# 探测方据此就能区分真假客户端。
+# sing-anytls 内置一套默认方案, 没配这个字段时自动使用 (inbound.go 直接取
+# padding.DefaultPaddingScheme) —— 也就是说**不写不等于没防护**, 只是不能自定义。
+AT_PADDING_DEFAULT='stop=8
+0=30-30
+1=100-400
+2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000
+3=9-9,500-1000
+4=500-1000
+5=500-1000
+6=500-1000
+7=500-1000'
+
+ask_anytls_padding() {
+    AT_PADDING=""
+    if [[ -n "${SB_BATCH:-}" ]]; then
+        # 批量: 仅在显式指定时才写。默认留空 = 交给内核默认, 这样以后内核
+        # 调整了默认方案我们的产物会自动跟随, 不会锁死在旧值上。
+        [[ -n "${SB_ANYTLS_PADDING:-}" ]] && AT_PADDING="$SB_ANYTLS_PADDING"
+        return 0
+    fi
+    echo >&2
+    echo -e "${CYAN}  流量填充 (padding_scheme)${RESET} ${CYAN}— 按包类型填充随机字节, 抗主动探测${RESET}" >&2
+    echo -e "    ${GREEN}1)${RESET} ${CYAN}内核默认 (推荐)${RESET}  不写该字段, 由 sing-box 使用自带方案" >&2
+    echo -e "    ${GREEN}2)${RESET} ${CYAN}显式写入默认方案${RESET}  行为与 1 相同, 但配置里看得见" >&2
+    echo -e "    ${GREEN}3)${RESET} ${YELLOW}自定义${RESET}  每行一条规则, 格式见 stop=8 / 0=30-30" >&2
+    local c
+    read -r -p "    请选择 [1-3, 回车=1]: " c || { echo; return 0; }
+    c=$(clean_input "$c"); [[ -z "$c" ]] && c=1
+    case "$c" in
+        2) AT_PADDING="$AT_PADDING_DEFAULT"; print_ok "padding_scheme: 内置默认 (显式写入)" ;;
+        3)
+            local raw
+            raw=$(safe_read "padding_scheme (每行一条)" "$AT_PADDING_DEFAULT")
+            raw="${raw//\"/}"          # 引号会破坏 JSON 字符串, 提前去掉
+            [[ -z "$raw" ]] && { print_warn "内容为空, 改用内核默认"; return 0; }
+            AT_PADDING="$raw"
+            print_ok "padding_scheme: 自定义 ($(printf '%s' "$raw" | grep -c . ) 条规则)" ;;
+        *) print_info "padding_scheme: 交给内核默认" ;;
+    esac
+}
+
 # 证书 DER 的 SHA256 (mihomo 的 fingerprint 语义: 证书指纹, 不是 SPKI 哈希)
 cert_fingerprint_hex() {
     command -v openssl >/dev/null || return 1
@@ -103,11 +153,21 @@ add_config() {
     listen_port=$(safe_read_port)
     password=$(openssl rand -base64 18 | tr -d '/+=\n' | head -c 24)
     ask_cert || return 1
+    ask_anytls_padding || return 1
 
     idx=$(get_next_index "$PROTO"); file="$SB_CONFIG_DIR/$PROTO-$idx.json"; tag="${PROTO}${idx}"
     # 名字体现传输方式: ask_cert 决定 reality 还是 TLS
     [[ "${TLS_TYPE:-}" == "reality" ]] && tag="$tag$(tag_form_suffix reality)" || tag="$tag$(tag_form_suffix tls)"
     local json
+    # padding_scheme 是字符串数组, sing-box 用 \n join -> 每行一个元素
+    # padding_scheme: sing-box 用 "\n" join 数组元素 -> 每个元素必须正好是一行规则,
+    # 所以这里逐行拆成 JSON 数组, 而不是把多行文本塞进一个字符串。
+    local pad_line=""
+    if [[ -n "$AT_PADDING" ]]; then
+        pad_line=$(printf '%s' "$AT_PADDING" | jq -R . | jq -sc . | tr -d "\n")
+        pad_line=",
+      \"padding_scheme\": $pad_line"
+    fi
     if [[ "${TLS_TYPE:-tls}" == "reality" ]]; then
         json=$(cat <<EOF
 {
@@ -117,7 +177,7 @@ add_config() {
       "tag": "$tag",
       "listen": "$listen_ip",
       "listen_port": $listen_port,
-      "users": [ { "name": "user", "password": "$password" } ],
+      "users": [ { "name": "user", "password": "$password" } ]${pad_line},
       "tls": {
         "enabled": true,
         "server_name": "$CERT_DOMAIN",
@@ -142,7 +202,7 @@ EOF
       "tag": "$tag",
       "listen": "$listen_ip",
       "listen_port": $listen_port,
-      "users": [ { "name": "user", "password": "$password" } ],
+      "users": [ { "name": "user", "password": "$password" } ]${pad_line},
       "tls": { "enabled": true, "alpn": ["h2", "http/1.1"], "certificate_path": "$CERT_FILE", "key_path": "$KEY_FILE" }
     }
   ]
@@ -175,10 +235,17 @@ EOF
     fi
 
     local utls_fp; utls_fp=$(ask_utls_fingerprint)
+    # AnyTLS 出站专属的空闲会话治理。服务端开 multiplex 之外还会定期清理
+    # 长时间空闲的会话, 参数不对会让长连接被提前掐断, 或让空闲会话堆积。
+    local isc ist mis
+    isc=$(safe_read "空闲会话检查间隔 (秒, 0=用默认30)" "0")
+    ist=$(safe_read "空闲会话超时 (秒, 0=用默认30)" "0")
+    mis=$(safe_read "最少保留空闲会话数 (0=用默认0)" "0")
     python3 - "$utls_fp" "$SB_OUT_DIR/sb_client-$tag.json" "$tag" "$server_ip" "$listen_port" \
-        "$password" "$CERT_DOMAIN" "$pin" "${TLS_TYPE:-tls}" "${T_RE_PUB-}" "${T_RE_SID-}" <<'PYGEN'
+        "$password" "$CERT_DOMAIN" "$pin" "${TLS_TYPE:-tls}" "${T_RE_PUB-}" "${T_RE_SID-}" \
+        "$isc" "$ist" "$mis" <<'PYGEN'
 import json,sys
-_,fp,ofile,tag,srv,port,pw,sni,pin,mode,pub,sid=sys.argv
+_,fp,ofile,tag,srv,port,pw,sni,pin,mode,pub,sid,isc,ist,mis=sys.argv
 if mode=="reality":
     tls={"enabled":True,"server_name":sni,
          "utls":{"enabled":True,"fingerprint":fp},
@@ -188,6 +255,10 @@ else:
          "utls":{"enabled":True,"fingerprint":fp}}
     if pin: tls["certificate_public_key_sha256"]=pin
 out={"type":"anytls","tag":tag,"server":srv,"server_port":int(port),"password":pw,"tls":tls}
+# 0 = 不写, 交给 sing-box 用它自己的默认值 (30/30/0)
+if isc and int(isc)!=0: out["idle_session_check_interval"]=str(int(isc))+"s"
+if ist and int(ist)!=0: out["idle_session_timeout"]=str(int(ist))+"s"
+if mis and int(mis)!=0: out["min_idle_session"]=int(mis)
 json.dump({"outbounds":[out]},open(ofile,"w"),indent=2)
 PYGEN
 

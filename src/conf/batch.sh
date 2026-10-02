@@ -407,7 +407,9 @@ batch_main() {
     done
 
     # --- Reality 变体补齐 (vmess/trojan 双形态: run2 以 SB_BATCH_ANSWERS 选择 4/3 Reality) ---
-    local -a variant_list=(vmess trojan)
+    # anytls 也在列: 它本来就有 Reality 分支 (anytls.sh ask_cert 的 c=3),
+    # 只是上面那两行的判断顺序让它在批量里永远走不到, 已一并修正。
+    local -a variant_list=(vmess trojan anytls)
     for i in "${!variant_list[@]}"; do
         local vp="${variant_list[$i]}"
         printf "%b• %s 变体%b ... " "$CYAN" "$vp" "$RESET" >&2
