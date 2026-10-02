@@ -34,6 +34,7 @@ service_menu() {
         echo -e "${CYAN}3)${RESET} 重启服务 (restart)"
         echo -e "${CYAN}4)${RESET} 应用配置 (重启, sing-box 无热重载)"
         echo -e "${CYAN}5)${RESET} 状态查看"
+        echo -e "${CYAN}6)${RESET} 清理历史遗留的防火墙规则 (孤儿规则)"
         echo -e "${CYAN}0)${RESET} 返回"
         read -r -p "请选择: " c || { echo; exit 0; }
         case "$c" in
@@ -42,6 +43,7 @@ service_menu() {
             3) sb_restart ;;
             4) sb_restart ;;
             5) sys_status ;;
+            6) sb_fw_purge_orphans ;;
             0) return ;;
             *) echo -e "${RED}无效选项 $c${RESET}" ;;
         esac
@@ -165,7 +167,7 @@ ${GREEN}1.${RESET} 安装 / 内核 (初始化/安装/更新/版本/卸载/脚本
 ${GREEN}2.${RESET} 节点管理
 ${GREEN}3.${RESET} 分享链接管理
 ${GREEN}4.${RESET} 网络 (端口转发/DNS/规则集/出站)
-${GREEN}5.${RESET} 服务管理 (启动/停止/重启/软重载)
+${GREEN}5.${RESET} 服务管理 (启动/停止/重启/应用配置)
 ${GREEN}6.${RESET} 校验配置 + 重载
 ${GREEN}7.${RESET} 查看日志
 ${GREEN}8.${RESET} 列出全部配置文件
@@ -177,7 +179,9 @@ sing-box 服务状态: $([[ "$status_text" == "active" ]] && echo -e "${GREEN}�
 内核版本: ${GREEN}$version_line${RESET}
 节点数:   ${GREEN}$(ls "$SB_CONFIG_DIR"/*.json 2>/dev/null | grep -v 'config/00-' | grep -cv '^-')${RESET}
 ----------------------"
-    read -r -p "请输入选项 [0-9]: " choice || { clear; exit 0; }
+    # 菜单有 1-10 共 10 项, 原来写 [0-9] 会让人以为选不了 10 ——
+    # 而 10 恰好是 CDN/Nginx 前置, 也就是用户最早找不到的那个菜单。
+    read -r -p "请输入选项 [0-10]: " choice || { clear; exit 0; }
     case "$choice" in
         1)  core_menu ;;
         2)  add_node_menu ;;

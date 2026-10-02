@@ -546,6 +546,176 @@ backup_config() { # backup_config config|kernel|all
   # 本面板在 nft 里加的规则一律带这个 comment; 关端口时只认带它的,
   # 绝不碰别的组件 (用户自己的 nftables.sh、fail2ban 等) 落在同一链上的规则。
   SB_NFT_COMMENT="SB_PANEL"
+  # iptables 后端同样要打标记。之前只有 nft 分支带 comment, iptables 分支加的
+  # 规则是光秃秃的 "-p tcp --dport N -j ACCEPT", 和用户自己加的规则**完全无法
+  # 区分** —— 这就是历史上一批规则再也认不出归属、只能留成孤儿的原因。
+  # 有了 comment, 以后任何时候都能精确找出"本面板加的、且现在没在用的"规则。
+  SB_IPT_COMMENT="SB-Panel"
+  # 该内核是否支持 -m comment (需要 xt_comment 模块)
+  sb_iptables_comment_ok() {
+      [[ -n "${SB_IPT_CMT_OK:-}" ]] && { [[ "$SB_IPT_CMT_OK" == "1" ]]; return; }
+      if iptables -C SB_PANEL_PROBE -p tcp -m comment --comment probe -j RETURN 2>/dev/null; then
+          SB_IPT_CMT_OK=1; return 0
+      fi
+      iptables -N SB_PANEL_PROBE 2>/dev/null && {
+          if iptables -A SB_PANEL_PROBE -p tcp -m comment --comment probe -j RETURN 2>/dev/null; then
+              iptables -F SB_PANEL_PROBE 2>/dev/null
+              iptables -X SB_PANEL_PROBE 2>/dev/null
+              SB_IPT_CMT_OK=1; return 0
+          fi
+          iptables -F SB_PANEL_PROBE 2>/dev/null; iptables -X SB_PANEL_PROBE 2>/dev/null
+      }
+      modprobe xt_comment >/dev/null 2>&1
+      iptables -N SB_PANEL_PROBE 2>/dev/null && {
+          if iptables -A SB_PANEL_PROBE -p tcp -m comment --comment probe -j RETURN 2>/dev/null; then
+              iptables -F SB_PANEL_PROBE 2>/dev/null
+              iptables -X SB_PANEL_PROBE 2>/dev/null
+              SB_IPT_CMT_OK=1; return 0
+          fi
+          iptables -F SB_PANEL_PROBE 2>/dev/null; iptables -X SB_PANEL_PROBE 2>/dev/null
+      }
+      SB_IPT_CMT_OK=0; return 1
+  }
+  # 生成 (或空) iptables 的 comment 参数
+  sb_ipt_cmt_args() {
+      if sb_iptables_comment_ok; then
+          printf '%s\n' -m comment --comment "$SB_IPT_COMMENT"
+      fi
+  }
+
+  # ---------- 清理历史遗留的孤儿防火墙规则 ----------
+  #
+  # 为什么需要: 早期版本的 iptables 分支不加 comment, 规则和用户自己加的
+  # 完全无法区分; 卸载时若面板没跑过 / 配置文件先被删掉, 规则就会永久留成孤儿。
+  #
+  # 分两类处理, 安全等级完全不同:
+  #   [A] 带 SB-Panel 标记 —— 100% 确属本面板, 直接删, 无需确认;
+  #   [B] 无标记的疑似遗留 —— 判据是: 规则形态与本面板加的完全一致
+  #       (INPUT 链 + ACCEPT), 且该端口**当前没有任何进程在监听**,
+  #       且不在本面板现在的节点端口表里, 且不是系统常用端口, 也不是 sshd。
+  #       仍然列出完整清单要用户逐条过目, 输入 yes 才删。
+  #
+  # 关键安全阀: 端口正在监听的一律跳过。"正在被别的服务用"意味着有人管着它,
+  # 不是孤儿, 哪怕形态像也得让人自己决定。
+  sb_fw_scan_orphans() {
+      SB_ORPHAN_MARKED=()      # "端口/tcp" 形式, 带标记
+      SB_ORPHAN_LEGACY=()      # "端口/tcp" 形式, 无标记疑似
+      local be; be=$(fw_detect_backend)
+      local in_use="" p proto rule
+      # 当前有进程监听的端口 —— 这些一律不当孤儿
+      in_use=$(ss -Hltn 2>/dev/null | grep -oE ':[0-9]+[[:space:]]' | tr -d ' :' | sort -un)
+      # 提取现有节点正在用的端口。
+      # 注意: 不能用 awk -F'"listen_port"' 再 split($2," ") 取 a[1] ——
+      # 拆出来的是 `: 20176},`, a[1] 是冒号而不是端口号, 结果一个都识别不到,
+      # 现有节点的端口会被当成孤儿。这里直接用正则抓冒号后面的数字。
+      local live_ports
+      live_ports=$(grep -hoE '"listen_port"[[:space:]]*:[[:space:]]*[0-9]+' "$SB_CONFIG_DIR"/*.json 2>/dev/null \
+                   | grep -oE '[0-9]+$' | sort -un)
+      local -A seen=()
+      if [[ "$be" == "iptables" ]]; then
+          # 先把规则全部收进数组再遍历。
+          # 原来写成 `while read -r rule; ... done < <(iptables -S ...)` 时,
+          # 循环体内的 fw_port_is_ssh 里有不带 </dev/null 的 grep -q, 会把循环
+          # 自己的 stdin (也就是还没读的规则) 读干净 —— 结果 390 条规则只处理
+          # 了第 1 条就"结束"了, 只报出 1 条孤儿。数组遍历不受调用方 stdin 影响。
+          local -a rules=()
+          mapfile -t rules < <(iptables -S INPUT 2>/dev/null | grep -- "-j ACCEPT" | grep -E -- "--dport [0-9]+")
+          for rule in ${rules[@]+"${rules[@]}"}; do
+              [[ -n "$rule" ]] || continue
+              proto=$(sed -nE 's/.*-p ([a-z]+).*/\1/p' <<<"$rule")
+              p=$(sed -nE 's/.*--dport ([0-9]+).*/\1/p' <<<"$rule")
+              [[ -n "$proto" && -n "$p" ]] || continue
+              grep -qx "$p" <<<"$live_ports" && continue          # 现有节点在用
+              grep -qx "$p" <<<"$in_use" && continue               # 有进程在监听
+              fw_port_is_ssh "$p" </dev/null && continue             # sshd 碰不得
+              case "$p" in
+                  22|25|53|80|110|143|443|465|587|993|995|1433|1521|2049|3306|5432|6379|11211|27017) continue ;;
+              esac
+              [[ -n "${seen[$p$proto]:-}" ]] && continue
+              seen[$p$proto]=1
+              if grep -q "SB-Panel" <<<"$rule"; then
+                  SB_ORPHAN_MARKED+=("$p/$proto")
+              else
+                  SB_ORPHAN_LEGACY+=("$p/$proto")
+              fi
+          done
+      elif [[ "$be" == "nft" ]]; then
+          while read -r p; do
+              [[ -n "$p" ]] || continue
+              grep -qx "$p" <<<"$live_ports" && continue
+              grep -qx "$p" <<<"$in_use" && continue
+              fw_port_is_ssh "$p" </dev/null && continue
+              SB_ORPHAN_MARKED+=("$p/tcp")
+          done < <(nft -a list chain inet filter input 2>/dev/null \
+                   | grep "$SB_NFT_COMMENT" | grep -oE "dport [0-9]+" | awk '{print $2}' | sort -un)
+      else
+          return 1
+      fi
+      return 0
+  }
+
+  sb_fw_purge_orphans() { # 由菜单调用: 扫描 → 展示 → 确认 → 删除
+      print_title "清理历史遗留的防火墙规则"
+      if ! sb_fw_scan_orphans; then
+          print_warn "未检测到可扫描的防火墙后端"
+          return 1
+      fi
+      if (( ${#SB_ORPHAN_MARKED[@]} == 0 && ${#SB_ORPHAN_LEGACY[@]} == 0 )); then
+          print_ok "没有发现遗留规则, 防火墙是干净的"
+          return 0
+      fi
+      local p x d
+      if (( ${#SB_ORPHAN_MARKED[@]} )); then
+          print_warn "以下 ${#SB_ORPHAN_MARKED[@]} 条带 SB-Panel 标记, 确属本面板:"
+          printf "    %s\n" "${SB_ORPHAN_MARKED[@]}" >&2
+      fi
+      local need_confirm=0
+      if (( ${#SB_ORPHAN_LEGACY[@]} )); then
+          need_confirm=1
+          print_warn "以下 ${#SB_ORPHAN_LEGACY[@]} 条无标记, 形态与本面板早期加的规则一致:"
+          printf "    %s\n" "${SB_ORPHAN_LEGACY[@]}" >&2
+          print_warn "它们来自加注释功能之前的版本。已跳过: 当前节点在用的端口、"
+          print_warn "有进程正在监听的端口、sshd、系统常用端口。"
+          print_warn "仍可能包含你手工加的规则 —— 请对照上面的清单确认后再继续。"
+      fi
+      (( need_confirm )) || { print_ok "无需确认"; }
+      if (( need_confirm )); then
+          read -r -p "确认删除上面列出的全部规则? 输入 yes 继续: " d
+          if [[ "$(echo "$d" | tr A-Z a-z)" != "yes" ]]; then
+              print_warn "已取消, 未修改防火墙"
+              return 0
+          fi
+      fi
+      local be n=0
+      be=$(fw_detect_backend)
+      if [[ "$be" == "iptables" ]]; then
+          for x in ${SB_ORPHAN_MARKED[@]+"${SB_ORPHAN_MARKED[@]}"} ${SB_ORPHAN_LEGACY[@]+"${SB_ORPHAN_LEGACY[@]}"}; do
+              p="${x%/*}"
+              iptables -D INPUT -p "${x##*/}" --dport "$p" -j ACCEPT 2>/dev/null && n=$((n+1))
+          done
+      elif [[ "$be" == "nft" ]]; then
+          local h
+          for p in ${SB_ORPHAN_MARKED[@]+"${SB_ORPHAN_MARKED[@]}"}; do
+              p="${p%/*}"
+              while read -r h; do
+                  [[ "$h" =~ ^[0-9]+$ ]] || continue
+                  nft delete rule inet filter input handle "$h" >/dev/null 2>&1 && n=$((n+1))
+              done < <(nft -a list chain inet filter input 2>/dev/null \
+                        | grep -E "dport ${p}([[:space:]]|$)" \
+                        | grep -v 'UFW_PANEL_SSH' \
+                        | grep -oE "handle [0-9]+" | awk '{print $2}')
+          done
+          fw_persist_nft
+      fi
+      print_ok "已删除 $n 条遗留规则 (后端 $be)"
+      # 登记表里已经没有这些端口了, 顺手对齐, 避免下次 open_port 误判
+      if [[ -f "$SB_ROOT/.fw-ports" ]]; then
+          grep -vxE "$(printf '%s\n' ${SB_ORPHAN_MARKED[@]+"${SB_ORPHAN_MARKED[@]}"} ${SB_ORPHAN_LEGACY[@]+"${SB_ORPHAN_LEGACY[@]}"} | tr '/' ' ' | awk '{print $1}' | sort -un | tr '\n' '|' | sed 's/|$//')" \
+              "$SB_ROOT/.fw-ports" > "$SB_ROOT/.fw-ports.tmp" 2>/dev/null \
+              && mv -f "$SB_ROOT/.fw-ports.tmp" "$SB_ROOT/.fw-ports"
+      fi
+      return 0
+  }
 
   # 生成完走 CDN 的节点后, 自动把 nginx 配好。
   #
@@ -640,9 +810,25 @@ open_port() {
               print_ok "firewalld 已放行 $port (tcp+udp)"
               ;;
           iptables)
-              iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$port" -j ACCEPT
-              iptables -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport "$port" -j ACCEPT
-              print_ok "iptables 已放行 $port (tcp+udp)"
+              # 带上 SB-Panel 标记, 规则才可归属 (见 SB_IPT_COMMENT 处说明)。
+              # 检查时也带上标记, 免得把用户自己加的同名规则误当成已存在。
+              local -a cmt=()
+              mapfile -t cmt < <(sb_ipt_cmt_args)
+              if (( ${#cmt[@]} )); then
+                  iptables -C INPUT -p tcp --dport "$port" "${cmt[@]}" -j ACCEPT 2>/dev/null \
+                      || iptables -I INPUT -p tcp --dport "$port" "${cmt[@]}" -j ACCEPT 2>/dev/null
+                  iptables -C INPUT -p udp --dport "$port" "${cmt[@]}" -j ACCEPT 2>/dev/null \
+                      || iptables -I INPUT -p udp --dport "$port" "${cmt[@]}" -j ACCEPT 2>/dev/null
+              else
+                  iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$port" -j ACCEPT
+                  iptables -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport "$port" -j ACCEPT
+              fi
+              if (( ${#cmt[@]} )); then
+                  print_ok "iptables 已放行 $port (tcp+udp, 已标记 SB-Panel)"
+              else
+                  print_ok "iptables 已放行 $port (tcp+udp)"
+                  print_warn "本机 iptables 不支持 -m comment, 规则无法自动标记"
+              fi
               ;;
           *)
               print_warn "未检测到防火墙工具，请手动放行 $port"
@@ -755,7 +941,7 @@ fw_port_is_ssh() {
       # 进程名在端口**后面**, 所以不能写成 "sshd.*:PORT" —— 那样永远匹配不到,
       # 安全网会形同虚设。必须同一行里既出现该监听端口, 又出现 sshd。
       if command -v ss >/dev/null 2>&1; then
-          ss -Hltnp 2>/dev/null | grep -E "[:.]${port}[[:space:]]" | grep -q "sshd" && return 0
+          ss -Hltnp 2>/dev/null | grep -E "[:.]${port}[[:space:]]" | grep -q "sshd" </dev/null && return 0
       fi
       # 兜底1: sshd 自己的配置
       if [[ -r /etc/ssh/sshd_config ]]; then
@@ -763,7 +949,7 @@ fw_port_is_ssh() {
       fi
       # 兜底2: 防火墙里被标成 SSH 的放行规则 (含原生 nft)
       if command -v nft >/dev/null 2>&1; then
-          nft list ruleset 2>/dev/null | grep -iE "dport ${port} accept" | grep -qi "ssh" && return 0
+          nft list ruleset 2>/dev/null | grep -iE "dport ${port} accept" | grep -qi "ssh" </dev/null && return 0
       fi
       if command -v iptables >/dev/null 2>&1; then
           iptables -S 2>/dev/null | grep -E -- "--dport ${port} " | grep -qi "ssh\|SSH" && return 0
@@ -822,8 +1008,17 @@ close_node_port() { # <端口> <节点tag>  —— 只关"确认属于该节点"
               firewall-cmd --reload >/dev/null 2>&1
               ;;
           iptables)
+              # 带标记的先删(本面板自己加的), 再退回到无标记的老规则。
+              # 老版本加的规则没有 comment, 只能按端口删 —— 之所以敢这么删,
+              # 是因为调用侧已确认该端口在 .fw-ports 登记表里 (确属本面板开的)。
               local proto
+              local -a cmt=()
+              mapfile -t cmt < <(sb_ipt_cmt_args)
               for proto in tcp udp; do
+                  if (( ${#cmt[@]} )); then
+                      iptables -C INPUT -p "$proto" --dport "$port" "${cmt[@]}" -j ACCEPT 2>/dev/null \
+                          && { iptables -D INPUT -p "$proto" --dport "$port" "${cmt[@]}" -j ACCEPT 2>/dev/null && acted=1; continue; }
+                  fi
                   if iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; then
                       iptables -D INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null && acted=1
                   fi
