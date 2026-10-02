@@ -167,6 +167,102 @@ rsync_files() {
     ok "服务端脚本已热更新"
 }
 
+# ==================== 进入面板前的自动更新 ====================
+#
+# 目标: 每次用 `bash <(curl -Ls .../install.sh)` 进面板时自动比对 GitHub,
+#       有新版就静默更新, 不用再手动输 u。
+#
+# 铁律: **任何情况下都不能把人挡在面板外面**。
+#   fetch() 网络失败会 die 直接退出整个脚本 —— 自动更新绝不能走那条路:
+#   GitHub 连不上只是"这次没更新成", 用本地版本继续才是对的。所以这里用
+#   fetch_soft, 它只返回状态码, 从不退出。
+#   状态码: 0=已更新  10=已是最新  2=取不到(网络/仓库)  3=取到了但落地失败
+#
+fetch_soft() {
+    local cur new
+    if [[ -d "$SRC_DIR/.git" ]]; then
+        git -C "$SRC_DIR" fetch -q --depth 1 origin main 2>/dev/null || return 2
+        cur=$(git -C "$SRC_DIR" rev-parse HEAD 2>/dev/null)
+        new=$(git -C "$SRC_DIR" rev-parse FETCH_HEAD 2>/dev/null)
+        [[ -z "$cur" || -z "$new" ]] && return 2
+        [[ "$cur" == "$new" ]] && return 10
+        git -C "$SRC_DIR" reset -q --hard "$new" 2>/dev/null || return 3
+        return 0
+    fi
+    # 没有源码缓存 (tarball 装的老用户): 重新取一份
+    git clone -q --depth 1 "$REPO" "$SRC_DIR" 2>/dev/null \
+      || { curl -fsSL --max-time 90 "$REPO/archive/refs/heads/main.tar.gz" -o /tmp/sbcore.tar.gz 2>/dev/null \
+           && mkdir -p "$SRC_DIR" \
+           && tar -xzf /tmp/sbcore.tar.gz -C "$SRC_DIR" --strip-components=1 2>/dev/null; } \
+      || return 2
+    [[ -f "$SRC_DIR/src/conf/lib.sh" ]] || return 2
+    return 0
+}
+
+# 备份当前脚本, 供更新失败时回滚。静默更新必须留退路 —— 自动改自己的代码,
+# 万一新版有问题, 没有备份就只能靠用户手工抢救了。
+backup_scripts() {
+    local b="$SRV_ROOT/backup/scripts-$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$b" 2>/dev/null || { printf ''; return 1; }
+    cp -rf "$SRV_ROOT/conf" "$b/" 2>/dev/null
+    cp -f  "$SRV_ROOT/sing-box.sh" "$b/" 2>/dev/null
+    printf '%s' "$b"
+}
+
+restore_scripts() {
+    local b="$1"
+    [[ -d "$b" ]] || return 1
+    cp -rf "$b/conf/." "$SRV_ROOT/conf/" 2>/dev/null
+    cp -f  "$b/sing-box.sh" "$SRV_ROOT/" 2>/dev/null
+    chmod +x "$SRV_ROOT/sing-box.sh" "$SRV_ROOT/conf/"*.sh 2>/dev/null
+    return 0
+}
+
+# 更新后的脚本必须全部能通过语法检查, 否则立刻回滚。
+# 语法错误的面板会直接起不来, 而用户此刻正要进面板 —— 那就等于把门锁死了。
+scripts_sane() {
+    local f
+    for f in "$SRV_ROOT"/sing-box.sh "$SRV_ROOT"/conf/*.sh; do
+        [[ -f "$f" ]] || continue
+        bash -n "$f" 2>/dev/null || return 1
+    done
+    if [[ -f "$SRV_ROOT/conf/share_server.py" ]]; then
+        python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" \
+            "$SRV_ROOT/conf/share_server.py" 2>/dev/null || return 1
+    fi
+    return 0
+}
+
+# 自动更新。返回 0=更新了  10=已是最新  其它=没更新成(调用方照常进面板)
+auto_update() {
+    local rc=0 t0=$SECONDS
+    fetch_soft || rc=$?
+    case $rc in
+        10) return 10 ;;
+        2)  warn "暂时连不上 GitHub, 这次跳过更新 (不影响使用)"; return 2 ;;
+        3)  warn "获取新版时出错, 已保留本地版本"; return 1 ;;
+    esac
+
+    local ver; ver=$(git -C "$SRC_DIR" rev-parse --short HEAD 2>/dev/null)
+    local bak; bak=$(backup_scripts)
+    [[ -n "$bak" ]] || warn "备份目录创建失败, 继续更新 (出问题请手动回滚)"
+
+    rsync_files >/dev/null 2>&1
+
+    if ! scripts_sane; then
+        warn "新版脚本没通过语法检查, 已自动回滚"
+        restore_scripts "$bak" && ok "已回滚到更新前的版本"
+        return 1
+    fi
+
+    # 配置检查失败只警告不阻断: 脚本本身没问题, 多半是用户自己的配置需要调整,
+    # 进面板后按提示处理即可, 不该为此拦住更新。
+    config_ok || warn "配置检查未通过, 脚本已更新; 进面板后按提示排查即可"
+    ok "已自动更新到最新版本 (${ver:-未知})  [$((SECONDS - t0))s]"
+    [[ -n "$bak" ]] && info "旧版本备份: $bak"
+    return 0
+}
+
 # server 安装(非交互走一键): 每一步真实验证, 任一失败即停
 do_server() {
     info "正在初始化 Sing-box 服务端..."
@@ -314,18 +410,14 @@ existing() {
     printf "版本:     %s\n" "$(server_ver)"
     printf "节点数:   %s\n" "$(ls "$SRV_ROOT"/config/*.json 2>/dev/null | grep -cv '^-')"
     echo "----------------------"
-    read -r -p "已安装; 回车直接进入管理面板, 输入 u 为更新脚本:" a
-    case "$a" in
-        u|U|更新)
-            local rc=0
-            fetch || rc=$?
-            if [[ $rc -eq 10 ]]; then ok "当前已是最新版本"
-            elif [[ $rc -eq 0 ]]; then
-                rsync_files
-                config_ok && ok "更新通过配置检查" || warn "更新后配置检查失败, 请按面板内 提示 修复"
-            else err "更新失败, 沿用本地版本"; fi ;;
-        *) : ;;
-    esac
+    # 自动比对 GitHub: 有新版就静默更新, 没新版直接进面板。
+    # 原来是问 "输入 u 为更新脚本" —— 但更新这件事本来就不该要人记得去做,
+    # 你往往就是忘了才连不上某个新功能, 还得专门进一次菜单补更新。
+    # 这里不再询问; 失败也不阻断进面板 (见 auto_update 的注释)。
+    local rc=0
+    auto_update || rc=$?
+    [[ $rc -eq 10 ]] && ok "当前已是最新版本"
+    echo
     SB_ROOT="$SRV_ROOT" bash "$SRV_ROOT/sing-box.sh"
 }
 
