@@ -76,7 +76,7 @@ EOF
     cleanup_node_shares "$tag"
     sb_reload || print_warn "请确认服务状态"
 
-    local server_ip; server_ip=$(default_server_ip)
+    local server_ip; server_ip=$(ask_server_addr)
     local link="tuic://$uuid:$password@$server_ip:$listen_port?sni=$CERT_DOMAIN&congestion_control=$congestion&alpn=h3$( [[ "$CERT_TRUSTED" == "false" ]] && echo "&allow_insecure=1" )#$tag"
     cat > "$SB_OUT_DIR/sb_client-$tag.json" <<EOF
 {

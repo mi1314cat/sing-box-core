@@ -30,6 +30,29 @@ meta_file() {
 # 订阅地址里的主机跟着"产物地址族"走: 选了 IPv6 就下发 IPv6, 客户端拿 IPv6 去拉。
 # sb_url_host 负责给 IPv6 加方括号 —— 不加的话 URL 里的端口会被当成地址的一部分,
 # 客户端直接解析失败。
+# 拿分享链接 / 客户端配置时问一次用哪个地址族。
+# 与菜单项 7 (切换) 的区别: 那是"事后改产物", 这个是"发链接前确认",
+# 避免把 IPv4 的链接发给只能用 IPv6 的人。
+ask_addr_family_now() {
+    local a4 a6 cur
+    a4=$(sb_addr4); a6=$(sb_addr6)
+    cur=$(sb_addr_family_get); [[ "$cur" == "v6" ]] && cur=2 || cur=1
+    echo >&2
+    echo -e "${CYAN}  客户端配置里用哪个地址连回服务器?${RESET}" >&2
+    [[ -n "$a4" ]] && echo -e "    ${GREEN}1)${RESET} IPv4  ${CYAN}$a4${RESET}" >&2 || echo -e "    ${MAGENTA}(本机无 IPv4)${RESET}" >&2
+    [[ -n "$a6" ]] && echo -e "    ${GREEN}2)${RESET} IPv6  ${CYAN}$a6${RESET}" >&2 || echo -e "    ${MAGENTA}(本机无 IPv6)${RESET}" >&2
+    echo -e "    ${MAGENTA}服务端需监听 :: (双栈) 才能收 IPv6 连接, 见 添加节点时的监听地址${RESET}" >&2
+    local c=""
+    read -r -p "    请选择 [1-2, 回车=沿用当前]: " c || { echo; return 0; }
+    case "$(clean_input "${c:-}")" in
+        1) sb_switch_addr_family v4 >/dev/null 2>&1 || sb_addr_family_set v4
+           print_ok "本次用 IPv4 $(sb_addr4)" >&2 ;;
+        2) sb_switch_addr_family v6 >/dev/null 2>&1 || { sb_addr_family_set v6; }
+           print_ok "本次用 IPv6 $(sb_addr6)" >&2 ;;
+        *) print_info "沿用当前: $(sb_family_label) $(sb_addr_current)" >&2 ;;
+    esac
+}
+
 share_url_for() {
     local host; host=$(sb_addr_current)
     [[ -z "$host" ]] && host=$(default_server_ip)
@@ -306,10 +329,12 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
                     node_list_banner
                     tag=$(pick_node_tag)
                     [[ -n "$tag" ]] || { print_error "无节点可选 / 无效选择"; continue; }
+                    ask_addr_family_now
                     m=$(safe_read "max_uses (0=不限, 回车=1)" "1")
                     h=$(ttl_prompt)
                     create_share "$tag" "$m" "$h" ;;
                 2)
+                    ask_addr_family_now
                     gen_full_profile >/dev/null 2>&1 || { print_error "聚合生成失败 (没有 sb_client-*.json?)"; continue; }
                     n=$(ls "$SB_OUT_DIR"/sb_client-*.json 2>/dev/null | grep -v all | wc -l)
                     echo "当前共有 $n 个可分享节点, 将全部包含:" >&2

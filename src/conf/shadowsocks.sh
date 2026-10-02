@@ -54,7 +54,7 @@ EOF
     cleanup_node_shares "$tag"
     sb_reload || print_warn "请确认服务状态"
 
-    local server_ip; server_ip=$(default_server_ip)
+    local server_ip; server_ip=$(ask_server_addr)
     local link="ss://$(printf '%s' "$method:$key" | base64 -w0)@$server_ip:$listen_port#$tag"
     cat > "$SB_OUT_DIR/sb_client-$tag.json" <<EOF
 {

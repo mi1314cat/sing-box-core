@@ -1,7 +1,10 @@
 #!/bin/bash
 # ==============================================================
 # batch.sh — 全协议一键生成 (Batch Generator)
-#   * 无重复询问公共参数: 一开始只要一次端口范围, 其余全用各协议自带默认生成逻辑
+#   * 公共参数只问一次: 监听地址 / 客户端对外地址 / 端口范围 / CDN 策略,
+#     其余全用各协议自带默认生成逻辑
+#   * 地址族: SB_LISTEN_ADDR (服务端 bind) 与 SB_SERVER_ADDR (写进客户端配置)
+#     分开设置 —— 可以只让 IPv6 连进来, 但配置里仍然发 IPv4
 #   * 不重新实现协议: 直接调用 conf/<proto>.sh 现有 add_config 流程
 #   * 幂等: 协议已有节点 → 跳过不覆盖
 #   * 原子性: 每协议 write_config + 全目录 sing-box check 失败自动清理自身
@@ -21,6 +24,56 @@ SB_LIB="${SB_LIB:-$SELF_DIR/conf/lib.sh}"
 #   在 mihomo 客户端里也能直接用。
 PROTOS=(reality hysteria2 anytls vless shadowsocks tuic vmess trojan naive shadowtls)
 BATCH_ANSWERS_OVERRIDE=""
+
+# 节点的真实 tag 藏在配置的 outbounds 里, 不能拿文件名去推。
+# 文件名是 vmess-01, 但 tag 是 vmess01-TLS / vmess02-REALITY —— 形态后缀不同,
+# 于是 `rm sb_client-$tag.json` 删的是 sb_client-vmess01.json, 而实际产物叫
+# sb_client-vmess01-TLS.json, 永远删不到。旧节点就这样一天天堆在 out/ 里,
+# 最后全量聚合把它们一起打进了要发给客户端的那份配置。
+node_tags_of() {
+    # 读 inbounds 而不是 outbounds —— 服务器配置里根本没有 outbounds 字段,
+    # 只有 inbounds; 一开始写错成 .outbounds, jq 静默返回空, 于是清理等于没做。
+    jq -r '.inbounds[]?.tag' "$1" 2>/dev/null
+}
+
+# 清掉"已经没有任何节点"的产物文件。
+# 按 tag 逐个删只能保证往后不再堆积, 之前删掉的节点留下的旧文件还在,
+# 它们会被全量聚合一起打进要发给客户端的配置里 —— 客户端拿到一堆连不上的死节点。
+prune_orphan_artifacts() {
+    local live f base tag n=0
+    live=$(mktemp)
+    for f in "$SB_CONFIG_DIR"/*.json; do
+        [[ -f "$f" ]] || continue
+        case "$(basename "$f" .json)" in 00-*) continue;; esac
+        node_tags_of "$f" >> "$live"
+    done
+    sort -u -o "$live" "$live"
+    for f in "$SB_OUT_DIR"/sb_client-*.json "$SB_OUT_DIR"/sb_client-*.yaml; do
+        [[ -f "$f" ]] || continue
+        base=$(basename "$f")
+        [[ "$base" == "sb_client-all."* ]] && continue
+        tag="${base#sb_client-}"
+        # shadowtls 内层 (xxxinner) 没有独立产物, 不参与孤儿判定
+        [[ "$tag" == *.inner ]] && continue
+        tag="${tag%.*}"
+        grep -qxF "$tag" "$live" || { rm -f "$f"; n=$(( n + 1 )); }
+    done
+    rm -f "$live"
+    (( n > 0 )) && print_ok "清理残留产物 $n 个 (节点已不存在, 此前一直混在聚合配置里)"
+    return 0
+}
+
+drop_node_artifacts() { # drop_node_artifacts <tag...>
+    local t
+    for t in "$@"; do
+        [[ -n "$t" ]] || continue
+        rm -f "$SB_OUT_DIR/sb_client-$t.json" "$SB_OUT_DIR/sb_client-$t.yaml" \
+              "$SB_OUT_DIR/sb_client-$t.cdn.json" "$SB_OUT_DIR/sb_client-$t.1.json" \
+              "$SB_OUT_DIR/sb_client-$t.2.json" \
+              "$SB_OUT_DIR/sb_share-$t.txt" "$SB_OUT_DIR/sb_meta-$t.json"
+        cleanup_node_shares "$t"
+    done
+}
 
 latest_file() { ls "$SB_CONFIG_DIR"/${1}-*.json 2>/dev/null | sort | tail -1; }
 tag_of() { basename "$(latest_file "$1")" .json | tr -d '-'; }
@@ -78,15 +131,12 @@ wipe_all_nodes() {
         print_warn "未创建备份目录; 若清空后校验失败将无法自动回滚"
     fi
     backup_config config >/dev/null 2>&1
-    local n=0
+    local n=0 t tags=()
     for f in "${victims[@]}"; do
-        tag=$(basename "$f" .json | tr -d '-')
+        tags=()
+        while read -r t; do [[ -n "$t" ]] && tags+=("$t"); done < <(node_tags_of "$f")
         rm -f "$f"
-        # 客户端产物 + 分享链接文件 (tag 形态与 shadowtls 的双出站都覆盖)
-        rm -f "$SB_OUT_DIR/sb_client-$tag.json" "$SB_OUT_DIR/sb_client-$tag.yaml" \
-              "$SB_OUT_DIR/sb_share-$tag.txt" "$SB_OUT_DIR/sb_meta-$tag.json" \
-              "$SB_OUT_DIR/sb_client-$tag.1.json" "$SB_OUT_DIR/sb_client-$tag.2.json"
-        cleanup_node_shares "$tag"
+        (( ${#tags[@]} )) && drop_node_artifacts "${tags[@]}"
         n=$(( n + 1 ))
     done
     # 兜底: 任何形态的残留产物
@@ -130,15 +180,14 @@ wipe_all_nodes() {
 ########## 覆盖模式: 清掉本协议已有配置 ##########
 wipe_proto() { # wipe_proto <proto> —— 覆盖模式下先删该协议全部配置
     local proto="$1" f n=0
+    local tags=() t
     for f in "$SB_CONFIG_DIR"/${proto}-*.json; do
         [[ -f "$f" ]] || continue
-        tag=$(basename "$f" .json | tr -d '-')
+        while read -r t; do [[ -n "$t" ]] && tags+=("$t"); done < <(node_tags_of "$f")
         rm -f "$f"
-        rm -f "$SB_OUT_DIR/sb_client-$tag.json" "$SB_OUT_DIR/sb_client-$tag.yaml" \
-              "$SB_OUT_DIR/sb_share-$tag.txt" "$SB_OUT_DIR/sb_meta-$tag.json"
-        cleanup_node_shares "$tag"
         n=$(( n + 1 ))
     done
+    (( ${#tags[@]} )) && drop_node_artifacts "${tags[@]}"
     return 0
 }
 
@@ -149,10 +198,64 @@ batch_main() {
 
     echo >&2
     print_title "全协议一键生成"
-    echo -e "${CYAN}唯一交互: 监听端口分配范围. 其余全部沿用各协议默认值.${RESET}" >&2
+    echo -e "${CYAN}交互项: 地址族 → 监听端口范围 → CDN. 其余沿用各协议默认值.${RESET}" >&2
     echo -e "${CYAN}如端口被占用或配置失败, 会自动清理; 收尾统一 check + reload.${RESET}" >&2
 
-    # --- 唯一一次交互 ---
+    # --- 第一次交互: 客户端配置用哪个地址连回来 ---
+    # 这件事以前根本没人问, 批量生成出来的配置一律写 IPv4。可实际用起来经常
+    # 需要 IPv6 (IPv4 线路差 / 客户端只有 IPv6 出口), 结果只能每个节点手动
+    # 重建, 或者事后一条条改。这里先问一次, 决定了后面所有节点:
+    #   监听地址  —— 服务端绑哪个地址 (:: = 双栈, 两种协议都能连)
+    #   对外地址  —— 客户端配置里写哪个 (IPv4 还是 IPv6)
+    # 两者是独立的两件事, 分开问: 可以只让 IPv6 连进来, 但配置里仍发 IPv4。
+    local a4 a6 cur_fam
+    a4=$(sb_addr4); a6=$(sb_addr6)
+    echo >&2
+    echo -e "${CYAN}① 服务端监听地址 —— 决定这个端口收 IPv4、收 IPv6 还是只收本机${RESET}" >&2
+    if [[ -n "$a6" ]]; then
+      echo -e "   ${GREEN}1)${RESET} ${CYAN}::${RESET} IPv4+IPv6 双栈${RESET} (默认) ← 本机 IPv6: $a6" >&2
+    else
+      echo -e "   ${GREEN}1)${RESET} ${CYAN}::${RESET} 双栈${RESET} (默认) ${MAGENTA}—— 本机无 IPv6, 实际只有 IPv4 能连${RESET}" >&2
+    fi
+    echo -e "   ${GREEN}2)${RESET} ${YELLOW}0.0.0.0${RESET} 仅 IPv4${RESET} (IPv6 客户端会被拒绝)" >&2
+    local lch=""
+    read -r -p "   请选择 [1-2, 回车=1]: " lch
+    case "$(clean_input "${lch:-}")" in
+      2) SB_LISTEN_ADDR="0.0.0.0"; print_info "监听 0.0.0.0 (仅 IPv4)" ;;
+      *) SB_LISTEN_ADDR="$SB_LISTEN_DEFAULT"
+         if [[ "$SB_LISTEN_ADDR" == "::" ]]; then
+           if [[ -z "$a6" ]]; then print_warn "本机无可用 IPv6, 双栈监听下只有 IPv4 客户端能连"; fi
+           if [[ "$(cat /proc/sys/net/ipv6/bindv6only 2>/dev/null || echo 0)" == "1" ]]; then
+               print_warn "net.ipv6.bindv6only=1: 监听 :: 只收 IPv6, IPv4 会连不上"
+           fi
+           print_ok "监听 :: (IPv4+IPv6 双栈)"
+         else
+           print_warn "本机内核未启用 IPv6, 已退回 0.0.0.0"
+         fi ;;
+    esac
+    # 注意: 这里不要因为 CDN 就把监听改成 127.0.0.1 —— CDN 是否启用是
+    # 下面第三步才问出来的, 此刻 SB_BATCH_CDN 还没赋值, 写了也是死代码。
+    # 走 CDN 的节点要只听本机, 由 vless.sh/vmess.sh 依据 SB_BATCH_CDN 自行处理。
+
+    echo >&2
+    echo -e "${CYAN}② 客户端配置里写哪个地址 —— 别人拿到配置后连的是这个${RESET}" >&2
+    [[ -n "$a4" ]] && echo -e "   ${GREEN}1)${RESET} IPv4  ${CYAN}$a4${RESET}" >&2 || echo -e "   ${MAGENTA}(无 IPv4)${RESET}" >&2
+    [[ -n "$a6" ]] && echo -e "   ${GREEN}2)${RESET} IPv6  ${CYAN}$a6${RESET}" >&2 || echo -e "   ${MAGENTA}(无 IPv6)${RESET}" >&2
+    echo -e "   ${MAGENTA}选 IPv6 前请确认客户端网络真能出 IPv6 —— 写进去连不上更麻烦${RESET}" >&2
+    cur_fam=$(sb_addr_family_get); [[ "$cur_fam" == "v6" ]] && cur_fam=2 || cur_fam=1
+    local sch=""
+    read -r -p "   请选择 [1-2, 回车=$([[ "$cur_fam" == 2 ]] && echo IPv6 || echo IPv4)]: " sch
+    case "$(clean_input "${sch:-}")" in
+      2) [[ -n "$a6" ]] || print_warn "本机无 IPv6"
+         SB_SERVER_ADDR="$a6"; sb_addr_family_set v6
+         print_ok "客户端配置写入 IPv6 $a6" ;;
+      *) SB_SERVER_ADDR="$a4"; [[ -z "$a4" ]] && SB_SERVER_ADDR="$(default_server_ip)"
+         sb_addr_family_set v4
+         print_ok "客户端配置写入 IPv4 $SB_SERVER_ADDR" ;;
+    esac
+    export SB_LISTEN_ADDR SB_SERVER_ADDR
+
+    # --- 第二次交互: 端口范围 ---
     local r
     if [[ -n "${SB_BATCH_AUTO:-}" ]]; then
         SB_BATCH_PORT_START=$(( 20000 + RANDOM % 10000 ))
@@ -174,7 +277,7 @@ batch_main() {
     fi
     export SB_BATCH_PORT_START SB_BATCH_PORT_END
 
-      # --- CDN 策略 (第二次也是最后一次交互) ---
+      # --- CDN 策略 ---
       # 能走 CDN 的协议: vless / vmess (传输 ws/grpc/http + 真证书)。
       # 其余协议是原生 TCP/UDP 或专用协议, Cloudflare 代理不了, 只能直连。
       # 这里默认开启: 反正只有这两个协议受影响, 开不开都由协议本身决定,
@@ -252,6 +355,7 @@ batch_main() {
         fi
         SB_BATCH=1 SB_NO_RELOAD=1 \
           SB_BATCH_CDN="${SB_BATCH_CDN:-0}" SB_BATCH_CDN_DOMAIN="${SB_BATCH_CDN_DOMAIN:-}" \
+          SB_LISTEN_ADDR="$SB_LISTEN_ADDR" SB_SERVER_ADDR="$SB_SERVER_ADDR" \
         SB_BATCH_PORT_START="$SB_BATCH_PORT_START" SB_BATCH_PORT_END="$SB_BATCH_PORT_END" \
         timeout 240 bash "$SELF_DIR/conf/${proto}.sh" add </dev/null >/tmp/batch-$proto.log 2>&1
         local mod_rc=$?
@@ -355,6 +459,9 @@ batch_main() {
     [[ ${#skip_list[@]} -gt 0 ]] && printf "%b已存在(跳过):%b %s\n" "$YELLOW" "$RESET" "${skip_list[*]}" >&2
     [[ ${#fail_list[@]} -gt 0 ]] && printf "%b失败(需检查):%b %s\n" "$RED" "$RESET" "${fail_list[*]}" >&2 && \
         for p in "${fail_list[@]}"; do echo "  --- $p ---"; tail -3 "/tmp/batch-$p.log" 2>/dev/null; done >&2
+
+    # 先清掉无主的旧产物, 再生成聚合 —— 顺序反了聚合就会把死节点带进去
+    prune_orphan_artifacts
 
     # --- 分享链接统一输出 (复用 share.sh) ---
     echo >&2

@@ -244,6 +244,25 @@ sb_addr_current() {
 }
 
 # ---------- 监听地址选择 ----------
+# 默认双栈 (::)。Linux 上 :: 在 bindv6only=0 时同时收 IPv4 和 IPv6, 不会因为
+# 开了 IPv6 就丢掉 IPv4 —— 所以它比 0.0.0.0 更通用, 没有理由不默认。
+# 唯一要退让的情况: 内核完全没启用 IPv6 (压根没有 :: 可绑), 这时才回 0.0.0.0。
+SB_LISTEN_DEFAULT="::"
+# 判定方式踩过一次坑: 一开始写的是 grep -q "^::" /proc/net/if_inet6, 永远不匹配 ——
+# 那个文件里地址是 32 个十六进制字符 (2001:470::1 存成 2001047000...0001),
+# 压根没有 "::" 这种写法。于是每次都误判成"没 IPv6", 默认值退回 0.0.0.0,
+# 看起来像是功能没生效, 其实是我判断写错了。
+# 改成真的去绑一次: 能绑上就是能用, 绑不上才退回 IPv4。
+if ! python3 -c "
+import socket,sys
+try:
+    s=socket.socket(socket.AF_INET6); s.bind(('::',0)); s.close()
+except Exception:
+    sys.exit(1)
+" 2>/dev/null; then
+    SB_LISTEN_DEFAULT="0.0.0.0"
+fi
+export SB_LISTEN_DEFAULT
 # 原来是 safe_read "监听地址 (0.0.0.0/::)" "0.0.0.0" —— 纯自由输入,
 # 默认值又是 0.0.0.0, 于是"想同时支持 IPv6"这件事没有任何提示, 很容易就建成
 # 只收 IPv4 的节点。改成显式菜单, 并把每一项的后果说清楚。
@@ -253,21 +272,33 @@ ask_listen_addr() {
     [[ -n "$a6" ]] && v6ok="检测到 $a6"
     echo >&2
     echo -e "${CYAN}  监听地址 —— 决定这个节点收 IPv4、收 IPv6、还是只收本机${RESET}" >&2
-    echo -e "    ${GREEN}1)${RESET} ${YELLOW}0.0.0.0${RESET}  仅 IPv4${RESET} (默认, 兼容性最好)" >&2
-    echo -e "    ${GREEN}2)${RESET} ${CYAN}::${RESET}       IPv4+IPv6 双栈${RESET} ← 想两种协议都能连就选这个" >&2
+    echo -e "    ${GREEN}1)${RESET} ${CYAN}::${RESET}       IPv4+IPv6 双栈${RESET} (默认 — 两种协议都能连, 不丢 IPv4)" >&2
     echo -e "       ${MAGENTA}(${v6ok})${RESET}" >&2
+    echo -e "    ${GREEN}2)${RESET} ${YELLOW}0.0.0.0${RESET}  仅 IPv4${RESET} (只给不支持 IPv6 的场景)" >&2
     echo -e "    ${GREEN}3)${RESET} 127.0.0.1 仅本机${RESET} (给 CDN/Nginx 前置用, 外部连不上)" >&2
     local c="" d
+    # 批量模式下绝不能 read: 批量生成靠一条应答队列按顺序喂各协议的提问,
+    # 这里多读一次就把后面某个协议的答案吃掉了 (顺序错位, 而且极难查)。
+    # 批量入口 (batch.sh) 会先问一次用户, 再把结果放进 SB_LISTEN_ADDR。
+    if [[ -n "${SB_BATCH:-}" ]]; then
+        d="${SB_LISTEN_ADDR:-$SB_LISTEN_DEFAULT}"
+        [[ "$d" == "::" ]] && print_ok "批量: 双栈监听 (IPv4+IPv6)"
+        [[ "$d" == "::" ]] || print_info "批量: 监听 $d"
+        printf '%s' "$d"; return 0
+    fi
     read -r -p "    请选择 [1-3, 回车=1]: " c || { echo; return 0; }
     case "${c// /}" in
-        2) d="::" ;;
+        2) d="0.0.0.0" ;;
         3) d="127.0.0.1" ;;
-        "") d="0.0.0.0" ;;
+        "") d="$SB_LISTEN_DEFAULT" ;;
         *) d="$c" ;;
     esac
+    if [[ "$d" == "0.0.0.0" ]]; then
+        print_info "仅 IPv4: IPv6 客户端连这个端口会被拒绝 (Connection refused)"
+    fi
     if [[ "$d" == "::" ]]; then
         if [[ -z "$a6" ]]; then
-            print_warn "本机没有检测到可用的 IPv6 地址, 选双栈可能白选 (确认 ip -6 addr 有全局地址)"
+            print_warn "本机没有可用的 IPv6 地址 —— 双栈仍然能收 IPv4, 但 IPv6 客户端连不上"
         else
             print_ok "双栈监听: IPv4 与 IPv6 客户端都能连这个端口"
         fi
@@ -289,6 +320,15 @@ ask_server_addr() {
     [[ -n "$a4" ]] && echo -e "    ${GREEN}1)${RESET} IPv4   ${CYAN}$a4${RESET}" >&2 || echo -e "    ${MAGENTA}(未检测到 IPv4)${RESET}" >&2
     [[ -n "$a6" ]] && echo -e "    ${GREEN}2)${RESET} IPv6   ${CYAN}$a6${RESET}" >&2 || echo -e "    ${MAGENTA}(未检测到 IPv6)${RESET}" >&2
     echo -e "    ${GREEN}3)${RESET} 手工输入${RESET}" >&2
+    # 同 ask_listen_addr: 批量模式不 read, 由 batch.sh 事先问好放进 SB_SERVER_ADDR
+    if [[ -n "${SB_BATCH:-}" ]]; then
+        local bd="${SB_SERVER_ADDR:-}"
+        [[ -z "$bd" ]] && bd=$(sb_addr_current)
+        [[ -z "$bd" ]] && bd="$a4"
+        [[ "$bd" == *:* ]] && sb_addr_family_set v6 || sb_addr_family_set v4
+        print_info "批量: 客户端配置写入 $([[ "$bd" == *:* ]] && echo IPv6 || echo IPv4) $bd"
+        printf '%s' "$bd"; return 0
+    fi
     local c="" cur
     cur=$(sb_addr_family_get); [[ "$cur" == "v6" ]] && cur=2 || cur=1
     read -r -p "    请选择 [1-3, 回车=$([[ "$cur" == 2 ]] && echo IPv6 || echo IPv4)]: " c || { echo; return 0; }
