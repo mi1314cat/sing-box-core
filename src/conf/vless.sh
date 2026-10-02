@@ -70,6 +70,8 @@ add_config() {
     # 命令替换会让函数里的 read 跑在子 shell 上, stdin 可能已耗尽,
     # 结果是"明明选了 CDN+Nginx 却还在问监听地址"。
     ask_access_mode "$TR_TYPE" "$trusted"
+    # multiplex 仅 VLESS/VMess/Trojan/SS 支持; 服务端侧无 protocol 字段, 由内核自动识别
+    sb_ask_multiplex vless server; mux_json=$(sb_mux_json_server)
     case "$ACCESS_MODE" in
         cdn)        listen_ip="0.0.0.0" ;;
         cdn-nginx)  listen_ip="127.0.0.1" ;;
@@ -78,15 +80,21 @@ add_config() {
 
     idx=$(get_next_index "$PROTO"); file="$SB_CONFIG_DIR/$PROTO-$idx.json"; tag="${PROTO}${idx}"
     tag="$tag$(tag_form_suffix tls)"   # 名字体现传输方式
-    local tls_line alpn tr_json tr_line=""
+    local tls_line alpn tr_json tr_line="" mux_line=""
     alpn=$(sb_transport_alpn "$TR_TYPE")
     tls_line="\"enabled\": true, \"certificate_path\": \"$CERT_FILE\", \"key_path\": \"$KEY_FILE\", \"alpn\": $alpn"
+    # ECH 只在 CDN 模式问 (直连时加密自己的 SNI 没有收益, 还多一份 config 要维护)
+    sb_ask_ech "$CERT_DOMAIN" "${ACCESS_MODE:-direct}"
+    local ech_srv=$(sb_ech_json_server)
+    [[ -n "$ech_srv" ]] && tls_line="$tls_line, $ech_srv"
     # 裸 TCP: sing-box 里不存在 "type":"tcp", 必须**整个省略 transport 字段。
     # 整行一起加/去 —— 只在字段之间插逗号会出现 ",," 这种双逗号。
     tr_json=$(sb_transport_json_server "$TR_TYPE" "$TR_PATH" "$TR_SVC" "$TR_HOST")
     # 注意 sb_transport_json_server 返回的是**值**, "transport" 这个键要在这里补上
     [[ -n "$tr_json" ]] && tr_line="      \"transport\": $tr_json,
 "
+    # tr_line 已经带尾逗号, 所以这里直接接空格, 不再补逗号
+    [[ -n "$mux_json" ]] && mux_line=" $mux_json,"
 
     json=$(cat <<EOF
 {
@@ -97,7 +105,7 @@ add_config() {
       "listen": "$listen_ip",
       "listen_port": $listen_port,
       "users": [ { "name": "user", "uuid": "$uuid" } ],
-$tr_line      "tls": { $tls_line }
+$tr_line$mux_line      "tls": { $tls_line }
     }
   ]
 }
@@ -114,20 +122,27 @@ EOF
     # CDN 只在 443 上提供服务; 沿用源站端口会得到连不通的 域名:源站端口
     sb_node_is_cdn "$file" && listen_port=443
     local link_params utls_fp ctr_json ctr_sep=""
+    sb_ask_multiplex vless client; local muxc=$(sb_mux_json_client)
+    sb_ask_ech "$CERT_DOMAIN" "${ACCESS_MODE:-direct}"; local ech_cli=$(sb_ech_json_client)
+    sb_ask_fragment "${mode_tls:-$TLS_TYPE}"; local frag_cli=$(sb_fragment_json_client)
+    local fr_link; fr_link=$(sb_fragment_link_params)
     link_params=$(sb_transport_link_params "$TR_TYPE" "$TR_PATH" "$TR_SVC" "$TR_HOST")
     # 裸 TCP 客户端同样不能写 "transport":{} —— sing-box 会当成空类型报错
     ctr_json=$(sb_transport_json_client "$TR_TYPE" "$TR_PATH" "$TR_SVC" "$TR_HOST")
     # 同样: 函数返回的是**值**, "transport" 键要在这里补
     [[ -n "$ctr_json" ]] && ctr_sep=",
       \"transport\": $ctr_json"
-    local link="vless://$uuid@$server_ip:$listen_port?encryption=none&security=tls&sni=$CERT_DOMAIN$link_params#$tag"
+    local mux_link ech_link
+    mux_link=$(sb_mux_link_params); ech_link=$(sb_ech_link_params)
+    local link="vless://$uuid@$server_ip:$listen_port?encryption=none&security=tls&sni=$CERT_DOMAIN$link_params$mux_link$ech_link$fr_link#$tag"
     utls_fp=$(ask_utls_fingerprint)
     cat > "$SB_OUT_DIR/sb_client-$tag.json" <<EOF
 {
   "outbounds": [
     { "type": "vless", "tag": "$tag", "server": "$server_ip", "server_port": $listen_port,
       "uuid": "$uuid",
-      "tls": { "enabled": true, "server_name": "$CERT_DOMAIN", "insecure": $( [[ "$CERT_TRUSTED" == "true" ]] && echo false || echo true ), "utls": { "enabled": true, "fingerprint": "$utls_fp" } }$ctr_sep }
+      "tls": { "enabled": true, "server_name": "$CERT_DOMAIN", "insecure": $( [[ "$CERT_TRUSTED" == "true" ]] && echo false || echo true ), "utls": { "enabled": true, "fingerprint": "$utls_fp" }${ech_cli:+, $ech_cli}${frag_cli:+, $frag_cli} }$ctr_sep${muxc:+,
+        $muxc} }
   ]
 }
 EOF

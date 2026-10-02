@@ -33,6 +33,10 @@ add_config() {
     esac
 
     idx=$(get_next_index "$PROTO"); file="$SB_CONFIG_DIR/$PROTO-$idx.json"; tag="${PROTO}${idx}-plain"   # 名字体现传输方式
+    sb_ask_multiplex shadowsocks server; local _mux=$(sb_mux_json_server)
+    local mux_line=""
+    [[ -n "$_mux" ]] && mux_line=",
+      $_mux"
     json=$(cat <<EOF
 {
   "inbounds": [
@@ -42,7 +46,7 @@ add_config() {
       "listen": "$listen_ip",
       "listen_port": $listen_port,
       "method": "$method",
-      "password": "$key"
+      "password": "$key" $mux_line
     }
   ]
 }
@@ -55,12 +59,16 @@ EOF
     sb_reload || print_warn "请确认服务状态"
 
     local server_ip; server_ip=$(ask_server_addr)
+    sb_ask_multiplex shadowsocks client; local mux_json=$(sb_mux_json_client)
+    local mux_sep=""
+    [[ -n "$mux_json" ]] && mux_sep=",
+      $mux_json"
     local link="ss://$(printf '%s' "$method:$key" | base64 -w0)@$server_ip:$listen_port#$tag"
     cat > "$SB_OUT_DIR/sb_client-$tag.json" <<EOF
 {
   "outbounds": [
     { "type": "shadowsocks", "tag": "$tag", "server": "$server_ip", "server_port": $listen_port,
-      "method": "$method", "password": "$key", "udp_over_tcp": true }
+      "method": "$method", "password": "$key", "udp_over_tcp": true$mux_sep }
   ]
 }
 EOF

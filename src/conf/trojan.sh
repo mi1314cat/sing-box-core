@@ -95,6 +95,14 @@ add_config() {
     # ask_cert 已决定: TLS_TYPE=reality 还是 selfsign/real —— 名字体现传输方式
     [[ "${TLS_TYPE:-}" == "reality" ]] && tag="$tag$(tag_form_suffix reality)" || tag="$tag$(tag_form_suffix tls)"
     local json tr_json tr_line=""
+    sb_ask_multiplex trojan server; local _mux=$(sb_mux_json_server)
+    # ECH 只在 CDN 模式问; 两个模板的 tls 行都要插
+    sb_ask_ech "$CERT_DOMAIN" "${ACCESS_MODE:-direct}"
+    local ech_srv=$(sb_ech_json_server)
+    # 这里刻意不把 mux/ech 塞进 heredoc 模板 —— 模板里已经有一个跨行的
+    # tr_line 赋值 (为了给 transport 留尾逗号), 再叠一层跨行变量会让 bash
+    # 在运行时把它们的参数当命令执行, 而且报错位置还会被归到别处, 极难查。
+    # 统一改成 heredoc 出基础结构, 之后用 jq 合并 (和 vmess 同一套路)。
     if [[ "${TLS_TYPE:-}" == "reality" ]]; then
         json=$(cat <<EOF
 {
@@ -142,6 +150,10 @@ $tr_line      "tls": { "enabled": true, "alpn": $(sb_transport_alpn "$TR_TYPE"),
 EOF
 )
     fi
+    # multiplex / ech 统一在这里用 jq 并进去 (片段要补 {} 才是完整 JSON 值)
+    [[ -n "$_mux" ]] && json=$(echo "$json" | jq --argjson mx "{$_mux}" '.inbounds[0] += $mx')
+    [[ -n "$ech_srv" ]] && json=$(echo "$json" | jq --argjson ec "{$ech_srv}" '.inbounds[0].tls += $ec')
+
     backup_config config
     write_config "$file" "$json" || return 1
     if ! sb_check; then rm -f "$file"; print_error "已删除非法配置（现网未受影响）"; return 1; fi
@@ -152,29 +164,38 @@ EOF
     [[ "${TLS_TYPE:-}" == "reality" ]] && mode_tls="reality"
     server_ip=$(ask_server_addr)
     if [[ "$CERT_TRUSTED" == "false" ]]; then pin=$(cert_spki_pin_base64 "$CERT_FILE"); fi
+    # 命令替换提前算好: 放在双引号字符串里出错时归因困难, 串联多个替换时行为也不确定
+    local mux_link ech_link
+    mux_link=$(sb_mux_link_params); ech_link=$(sb_ech_link_params)
     local link
     # CDN 节点只监听 127.0.0.1, 客户端连证书域名而非服务器 IP
     server_ip=$(sb_cdn_finalize "$file" "$server_ip")
     # CDN 只在 443 上提供服务; 沿用源站端口会得到连不通的 域名:源站端口
     sb_node_is_cdn "$file" && listen_port=443
     if [[ "$mode_tls" == "reality" ]]; then
-        link="trojan://$password@$server_ip:$listen_port?sni=$CERT_DOMAIN&security=reality&pbk=$T_RE_PUB&sid=$T_RE_SID&type=tcp#$tag"
+        link="trojan://$password@$server_ip:$listen_port?sni=$CERT_DOMAIN&security=reality&pbk=$T_RE_PUB&sid=$T_RE_SID&type=tcp$mux_link$ech_link$fr_link#$tag"
     else
         # alpn 必须跟着传输走: grpc / http(H2) 要 h2, 写死 http/1.1 会
         # 让客户端在 TLS 握手时与需要 h2 的服务端协商失败。
         local link_alpn; link_alpn=$(sb_transport_alpn "$TR_TYPE" | tr -d '[]"')
-        link="trojan://$password@$server_ip:$listen_port?sni=$CERT_DOMAIN&alpn=$link_alpn${pin:+&pinSHA256=$pin}$(sb_transport_link_params "$TR_TYPE" "$TR_PATH" "$TR_SVC" "$TR_HOST")#$tag"
+        link="trojan://$password@$server_ip:$listen_port?sni=$CERT_DOMAIN&alpn=$link_alpn${pin:+&pinSHA256=$pin}$(sb_transport_link_params "$TR_TYPE" "$TR_PATH" "$TR_SVC" "$TR_HOST")$mux_link$ech_link$fr_link#$tag"
     fi
     local utls_fp; utls_fp=$(ask_utls_fingerprint)
     local ctr_json ctr_sep="" alpn_json
     ctr_json=$(sb_transport_json_client "$TR_TYPE" "$TR_PATH" "$TR_SVC" "$TR_HOST")
     [[ -n "$ctr_json" ]] && ctr_sep=","
     alpn_json=$(sb_transport_alpn "$TR_TYPE")
-    python3 - "$utls_fp" "$SB_OUT_DIR/sb_client-$tag.json" "$tag" "$server_ip" "$listen_port" "$password" "$CERT_DOMAIN" "$pin" "$mode_tls" "${T_RE_PUB-}" "${T_RE_SID-}" "$ctr_json" "$alpn_json" <<'PYGEN'
+    sb_ask_multiplex trojan client; local mux_json=$(sb_mux_json_client)
+    sb_ask_ech "$CERT_DOMAIN" "${ACCESS_MODE:-direct}"; local ech_cli=$(sb_ech_json_client)
+    sb_ask_fragment "$mode_tls"; local frag_cli=$(sb_fragment_json_client)
+    local fr_link; fr_link=$(sb_fragment_link_params)
+    python3 - "$utls_fp" "$SB_OUT_DIR/sb_client-$tag.json" "$tag" "$server_ip" "$listen_port" "$password" "$CERT_DOMAIN" "$pin" "$mode_tls" "${T_RE_PUB-}" "${T_RE_SID-}" "$ctr_json" "$alpn_json" "$mux_json" "$ech_cli" "$frag_cli" <<'PYGEN'
 import json,sys
-_,fp,ofile,tag,srv,port,pw,sni,pin,mtype,pub,sid,tr_json,alpn=sys.argv
+_,fp,ofile,tag,srv,port,pw,sni,pin,mtype,pub,sid,tr_json,alpn,mux,ech,frag=sys.argv
 tls={"enabled":True,"server_name":sni,"alpn":json.loads(alpn),
      "utls":{"enabled":True,"fingerprint":fp}}
+# ECH 片段补 {} 才是完整 JSON 值
+if ech: tls.update(json.loads("{"+ech+"}"))
 if pin: tls["certificate_public_key_sha256"]=pin
 out={"type":"trojan","tag":tag,"server":srv,"server_port":int(port),"password":pw,"tls":tls}
 if pub and sid:
@@ -183,6 +204,11 @@ if pub and sid:
 elif tr_json:
     # 裸 TCP 不加 transport 字段 —— sing-box 里没有 "tcp" 这个类型
     out["transport"]=json.loads(tr_json)
+# multiplex: 出站才有 protocol / 连接数 / 流数
+# mux 是片段 "multiplex": {...}, 补 {} 才是完整 JSON 值
+if mux: out.update(json.loads("{"+mux+"}"))
+# fragment 同样是片段, 补 {}
+if frag: tls.update(json.loads("{"+frag+"}"))
 json.dump({"outbounds":[out]},open(ofile,"w"),indent=2)
 PYGEN
         gen_mihomo_yaml "$tag"

@@ -103,6 +103,102 @@ bash src/conf/anytls.sh add       # AnyTLS (可选 REALITY; sing-box >=1.12)
 - **ALPN 跟着传输走**：grpc / http 自动用 `["h2"]`，其余用 `["http/1.1"]`，
   服务端入站、TLS 块、分享链接三处保持一致。
 
+### 多路复用（Multiplex）
+
+建 VLESS / VMess / Trojan / Shadowsocks 节点时会问是否开启。sing-box 只有这四个协议
+支持 multiplex，AnyTLS / Naive / Hysteria2 / TUIC 内嵌的实现里没有这个选项。
+
+| 菜单项 | sing-box | mihomo |
+|---|---|---|
+| 协议 | `multiplex.protocol` = `h2mux` / `yamux` / `smux` | `smux: { enabled: true }` |
+| 并发上限 | `max_connections` | `max-connections` |
+| 流数量 | `min_streams` / `max_streams` | `min-streams` / `max-streams` |
+
+要点：
+
+- **服务端不写 `protocol` 字段。** sing-box 的入站 multiplex 只有
+  `enabled` / `padding` / `brutal`；`protocol` 出了站才有。服务端写了会 `check` 报错。
+- **brutal 的服务端和客户端数值是镜像的。** 服务端 `up_mbps` 对应客户端的 `down_mbps`，
+  反之亦然（数据方向相反）。所以服务端配置里 `up_mbps` 填的是客户端的下行值。
+
+#### 关于 brutal 限速
+
+菜单里的 brutal 默认 **上行 100 / 下行 200 Mbps**（可改），但先看清楚代价：
+
+> **brutal 需要内核的 `tcp-brutal` 模块，而这个模块基本不存在。**
+> 它是 out-of-tree 的（rimcoding/tcp_brutal），2023 年就被标记归档废弃，从未合进
+> Linux 主线。Debian 13 / 6.12 内核没有，apt 源里也没有包。开启后不是 `sing-box check`
+> 报错，而是**跑到一半才失败**：
+>
+> ```
+> brutal exchange: remote error: enable TCP Brutal: setsockopt IPPROTO_TCP
+> TCP_CONGESTION brutal: no such file or directory
+> ```
+
+所以本项目做了两件事：
+
+1. 菜单里**先探测模块在不在**（`modinfo tcp-brutal`），不在就直接说明原因并跳过 brutal
+   选项，而不是让你配一个注定失败的参数。
+2. 批量生成时同样跳过，并在输出里注明。
+
+想要高 BDP 线路的吞吐，RN 这台机器内核自带 **BBR**（`/proc/sys/net/ipv4/tcp_available_congestion_control`
+里有 `bbr`），系统层开 BBR 就能达到同样的目的，而且没有额外依赖。
+
+批量生成时的 brutal 开关：
+
+```bash
+SB_BATCH_UP_MBPS=100 SB_BATCH_DOWN_MBPS=200 \
+SB_BATCH_MUX_PROTO=h2mux SB_BATCH_MUX_MAXCONN=4 \
+SB_BATCH_MUX_MINSTR=4 SB_BATCH_MUX_MAXSTR=0 \
+bash src/conf/batch.sh
+```
+
+### ECH（Encrypted Client Hello）
+
+**只在走 CDN 时才有意义**，直连节点不会问。原因是 ECH 隐藏的是 SNI（明文里的
+ClientHello），只有经过 CDN 才需要藏；直连时 IP 已经暴露，藏 SNI 收益有限。
+
+生成方法：
+
+```bash
+sing-box generate ech-keypair hxicc.example.dpdns.org
+```
+
+会输出两个 PEM 块：
+
+- `ECH CONFIGS` —— 给**客户端**（`tls.ech.config_path`）
+- `ECH KEYS` —— 给**服务端**（`tls.ech.key_path`，文件权限 600）
+
+本项目会自动生成并分别落盘，CDN 节点建站时服务端和客户端都带上。
+`cdn` 和 `cdn-nginx` 两种模式都会启用；**裸 TCP 不行** —— Cloudflare 不代理裸 TCP，
+那条路径上 `ACCESS_MODE` 会是 `direct`，所以不会问 ECH。
+
+### TLS 分片（fragment）
+
+客户端侧的抗 DPI 选项：把 ClientHello 切成多段、段间插随机延时再发，让按"首包大小"
+分类的探针看不出这是 TLS 握手。
+
+- 默认**关闭**。每个 ClientHello 多花 10~20ms，高频建连反而更慢；少数中间设备对
+  分片 TLS 处理有 bug 会直接断连；已经用 REALITY / ECH 的节点也不需要它。
+- 建 TLS 节点时会问，选"开启"后可以填首片延时（默认 10ms）。
+- REALITY 节点不提供这个选项（REALITY 本身就是更强的手段）。
+- 和 `record_fragment` 不是一回事：`fragment` 切的是 **ClientHello 这条记录**，
+  `record_fragment` 切的是之后的**每一条 TLS record**。这里只暴露前者。
+
+### AnyTLS 指纹伪装
+
+`padding_scheme` 控制填充，让 AnyTLS 的流量形状更接近别的协议。默认值直接取
+sing-anytls 的内置默认值，不自己发明：
+
+| 选项 | 默认 |
+|---|---|
+| 0) 关闭填充 | `stop=8` / `0=30-30` / `1=100-400` / `2=400-500,c,...` / `3=9-9,500-1000` / `4..7=500-1000` |
+| 1) 简单 | `stop=8` |
+| 2) 自定义 | 逐条填写 |
+
+另外 AnyTLS 出站支持 `idle_session_check_interval` / `idle_session_timeout` /
+`min_idle_session`（控制空闲会话的保活与回收），0 表示不写该字段。
+
 ### 走 nginx / CDN 的前置条件
 
 ws / grpc / http / httpupgrade 都能过 Cloudflare + nginx，但 nginx 侧必须满足：

@@ -99,6 +99,8 @@ add_config() {
     [[ "${CERT_MODE:-}" == "real" && -n "$CERT_FILE" ]] && _trusted="yes"
     ACCESS_MODE=""
     ask_access_mode "$ttype" "$_trusted"
+    # multiplex 仅 VMess/Trojan/VLESS/SS 支持; 服务端侧无 protocol 字段
+    sb_ask_multiplex vmess server; local _mux=$(sb_mux_json_server)
     case "$ACCESS_MODE" in
         cdn)        listen_ip="0.0.0.0" ;;
         cdn-nginx)  listen_ip="127.0.0.1" ;;
@@ -145,6 +147,10 @@ EOF
     local _trj; _trj=$(sb_transport_json_server "$ttype" "$tpath" "$svc" "$TR_HOST")
     # 裸 TCP: sing-box 里没有 "type":"tcp", 必须整个省略 transport 字段
     [[ -n "$_trj" ]] && base=$(echo "$base" | jq --argjson tr "$_trj" '.inbounds[0].transport=$tr')
+    # sb_mux_json_server 返回的是**片段** ("multiplex": {...}), jq --argjson
+    # 要求完整 JSON 值, 所以外面补一层 {} 再拆回去。
+    [[ -n "$_mux" ]] && base=$(echo "$base" | jq --argjson mx "{$_mux}" '.inbounds[0] += $mx')
+    # ECH 只在 CDN 模式问; 服务端把 ech 片段并进已有的 tls 对象
 
     case "$CERT_MODE" in
         real)
@@ -158,6 +164,10 @@ EOF
             ;;
     esac
 
+    # ECH 必须放在 CERT_MODE 的 case **之后**: 那个分支是用 jq 整体替换
+    # .inbounds[0].tls 的, 放前面会被冲掉。
+    sb_ask_ech "$CERT_DOMAIN" "${ACCESS_MODE:-direct}"; local _ech=$(sb_ech_json_server)
+    [[ -n "$_ech" ]] && base=$(echo "$base" | jq --argjson ec "{$_ech}" '.inbounds[0].tls += $ec')
     backup_config config
     write_config "$file" "$base" || return 1
     if ! sb_check; then rm -f "$file"; print_error "已删除非法配置（现网未受影响）"; return 1; fi
@@ -188,6 +198,10 @@ EOF
     url="$url#$tag"
     local utls_fp; utls_fp=$(ask_utls_fingerprint)
     export SB_UTLS_FP="$utls_fp"
+    sb_ask_multiplex vmess client; export SB_MUX_JSON=$(sb_mux_json_client)
+    sb_ask_ech "$CERT_DOMAIN" "${ACCESS_MODE:-direct}"; export SB_ECH_JSON=$(sb_ech_json_client)
+    sb_ask_fragment "$CERT_MODE"; export SB_FRAG_JSON=$(sb_fragment_json_client)
+    local fr_link; fr_link=$(sb_fragment_link_params)
     python3 - "$SB_OUT_DIR/sb_client-$tag.json" "$tag" "$server_ip" "$listen_port" "$uuid" "$CERT_MODE" "$CERT_DOMAIN" "$ttype" "$tpath" "$svc" "$secpin" "$REAL_PUB" "$sid" "$CERT_FILE" "$DOM" <<'PYGEN'
 import json,sys,os
 _,ofile,tag,srv,port,uuid,mode,domain,ttype,tpath,svc,pin,pbk,xsid,crt,dom2=sys.argv
@@ -207,6 +221,15 @@ elif mode=="selfsign":
 elif mode=="reality":
     ob["tls"]={"enabled":True,"server_name":dom2,"utls":{"enabled":True,"fingerprint":os.environ.get("SB_UTLS_FP","chrome")},
                "reality":{"enabled":True,"public_key":pbk,"short_id":xsid}}
+# ECH 片段补 {} 才是完整 JSON 值
+ej = os.environ.get("SB_ECH_JSON","")
+if ej: ob["tls"].update(json.loads("{"+ej+"}"))
+fj = os.environ.get("SB_FRAG_JSON","")
+if fj: ob["tls"].update(json.loads("{"+fj+"}"))
+# multiplex: 出站才有 protocol / 连接数 / 流数
+mj = os.environ.get("SB_MUX_JSON","")
+# 片段要补 {} 才是完整 JSON 值, 否则 json.loads 报 "Extra data"
+if mj: ob.update(json.loads("{"+mj+"}"))
 json.dump({"outbounds":[ob]},open(ofile,"w"),indent=2)
 PYGEN
     echo "$url" | tee "$SB_OUT_DIR/sb_share-$tag.txt" | tail -1 >&2
