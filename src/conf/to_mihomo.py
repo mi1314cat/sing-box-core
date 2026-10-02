@@ -141,18 +141,30 @@ def conv(ob, certdir):
                 MISSING_FP.append(tag)
 
     # ---- 传输层 ----
+    # sing-box 的 type -> mihomo 的 network, 两个反直觉的映射:
+    #   sing-box "httpupgrade" -> mihomo **没有** network: httpupgrade 这个键,
+    #     写错会落到 default 分支变成**裸 TCP 静默降级**。正确写法是
+    #     network: ws + ws-opts.v2ray-http-upgrade: true。
+    #   sing-box "http" (HTTP/2) -> mihomo 的键叫 **h2**; mihomo 自己的
+    #     network: http 是另一个 HTTP/1.1 传输, 两者不是一回事。
     if net in ("ws", "websocket"):
         d["network"] = "ws"
         opts = {"path": tr.get("path") or "/"}
         hdr = (tr.get("headers") or {}).get("Host")
         if hdr: opts["headers"] = {"Host": hdr}
         d["ws-opts"] = opts
+    elif net == "httpupgrade":
+        d["network"] = "ws"
+        opts = {"path": tr.get("path") or "/", "v2ray-http-upgrade": True}
+        if tr.get("host"): opts["headers"] = {"Host": tr["host"]}
+        d["ws-opts"] = opts
     elif net == "grpc":
         d["network"] = "grpc"
         d["grpc-opts"] = {"grpc-service-name": tr.get("service_name") or ""}
     elif net == "http":
-        d["network"] = "http"
-        d["http-opts"] = {"path": [tr.get("path") or "/"]}
+        d["network"] = "h2"
+        d["h2-opts"] = {"host": ([tr["host"]] if isinstance(tr.get("host"), str)
+                                 else (tr.get("host") or [])), "path": tr.get("path") or "/"}
     return d, ""
 
 

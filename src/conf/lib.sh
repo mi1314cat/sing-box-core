@@ -265,48 +265,37 @@ fi
 export SB_LISTEN_DEFAULT
 # 原来是 safe_read "监听地址 (0.0.0.0/::)" "0.0.0.0" —— 纯自由输入,
 # 默认值又是 0.0.0.0, 于是"想同时支持 IPv6"这件事没有任何提示, 很容易就建成
-# 只收 IPv4 的节点。改成显式菜单, 并把每一项的后果说清楚。
+# 只收 IPv4 的节点。后来改成显式菜单 —— 但那是**多余的**。
+#
+# 服务端监听地址没有需要用户做选择的空间: :: 在 bindv6only=0 时同时收 IPv4
+# 和 IPv6, 严格优于 0.0.0.0 (只多一个选项而已), 没有任何理由退让。
+# 唯一不能双栈的场合是 CDN 模式, 而那个地址是由**接入方式**决定的
+# (cdn=0.0.0.0 供 Cloudflare 回源, cdn-nginx=127.0.0.1 隐藏源站),
+# 不是用户该选的东西 —— 那种情况下协议脚本直接写死, 根本不走这个函数。
+#
+# 所以: 不问、不提示, 统一双栈。真正需要区分 IPv4/IPv6 的是**客户端产物**
+# 里写哪个地址 (ask_server_addr), 那边保留菜单。
 ask_listen_addr() {
-    local dual="::" v6ok="无"
-    local a6; a6=$(sb_addr6)
-    [[ -n "$a6" ]] && v6ok="检测到 $a6"
-    echo >&2
-    echo -e "${CYAN}  监听地址 —— 决定这个节点收 IPv4、收 IPv6、还是只收本机${RESET}" >&2
-    echo -e "    ${GREEN}1)${RESET} ${CYAN}::${RESET}       IPv4+IPv6 双栈${RESET} (默认 — 两种协议都能连, 不丢 IPv4)" >&2
-    echo -e "       ${MAGENTA}(${v6ok})${RESET}" >&2
-    echo -e "    ${GREEN}2)${RESET} ${YELLOW}0.0.0.0${RESET}  仅 IPv4${RESET} (只给不支持 IPv6 的场景)" >&2
-    echo -e "    ${GREEN}3)${RESET} 127.0.0.1 仅本机${RESET} (给 CDN/Nginx 前置用, 外部连不上)" >&2
-    local c="" d
-    # 批量模式下绝不能 read: 批量生成靠一条应答队列按顺序喂各协议的提问,
-    # 这里多读一次就把后面某个协议的答案吃掉了 (顺序错位, 而且极难查)。
-    # 批量入口 (batch.sh) 会先问一次用户, 再把结果放进 SB_LISTEN_ADDR。
+    local d
+    # 批量入口 (batch.sh) 仍然可以整体指定, 方便一行生成全套
     if [[ -n "${SB_BATCH:-}" ]]; then
         d="${SB_LISTEN_ADDR:-$SB_LISTEN_DEFAULT}"
-        [[ "$d" == "::" ]] && print_ok "批量: 双栈监听 (IPv4+IPv6)"
-        [[ "$d" == "::" ]] || print_info "批量: 监听 $d"
-        printf '%s' "$d"; return 0
-    fi
-    read -r -p "    请选择 [1-3, 回车=1]: " c || { echo; return 0; }
-    case "${c// /}" in
-        2) d="0.0.0.0" ;;
-        3) d="127.0.0.1" ;;
-        "") d="$SB_LISTEN_DEFAULT" ;;
-        *) d="$c" ;;
-    esac
-    if [[ "$d" == "0.0.0.0" ]]; then
-        print_info "仅 IPv4: IPv6 客户端连这个端口会被拒绝 (Connection refused)"
-    fi
-    if [[ "$d" == "::" ]]; then
-        if [[ -z "$a6" ]]; then
-            print_warn "本机没有可用的 IPv6 地址 —— 双栈仍然能收 IPv4, 但 IPv6 客户端连不上"
-        else
-            print_ok "双栈监听: IPv4 与 IPv6 客户端都能连这个端口"
-        fi
-        if [[ "$(cat /proc/sys/net/ipv6/bindv6only 2>/dev/null || echo 0)" == "1" ]]; then
-            print_warn "net.ipv6.bindv6only=1, 监听 :: 只收 IPv6, IPv4 会连不上"
-        fi
+    else
+        d="$SB_LISTEN_DEFAULT"
     fi
     printf '%s' "$d"
+}
+
+# 保留旧的提示文本, 供不需要交互的场景复用 (如菜单说明)。
+sb_listen_addr_hint() {
+    local a6; a6=$(sb_addr6)
+    echo -e "${CYAN}  监听地址${RESET} ${GREEN}::${RESET} ${CYAN}IPv4+IPv6 双栈 (固定)${RESET}" >&2
+    [[ -n "$a6" ]] && echo -e "     ${MAGENTA}(检测到 $a6)${RESET}" >&2
+    if [[ -z "$a6" ]]; then
+        print_warn "本机没有可用的 IPv6 地址 —— 双栈仍能收 IPv4, 但 IPv6 客户端连不上"
+    elif [[ "$(cat /proc/sys/net/ipv6/bindv6only 2>/dev/null || echo 0)" == "1" ]]; then
+        print_warn "net.ipv6.bindv6only=1, 监听 :: 只收 IPv6, IPv4 会连不上"
+    fi
 }
 
 # ---------- 对外地址选择 (写进客户端产物) ----------
@@ -581,6 +570,136 @@ sb_batch_cdn_pick_cert() {
     return 1
 }
 
+# ---------- 传输方式 (Transport) ----------
+# sing-box 1.14 的 HTTP 类传输恰好 4 种: ws / grpc / http / httpupgrade。
+#
+# **裸 TCP 在 sing-box 里没有对应的 transport 类型** —— 不存在 "tcp"/"raw"
+# 这两个值 (那是 Xray 的别名)。transport/v2ray/transport.go 在 Type 为空时
+# 直接返回 nil, 所以裸 TCP 的唯一正确写法是**整个省略 transport 字段**。
+# 写成 "type":"tcp" 会报 unknown transport type。
+#
+# 默认 ws: 客户端覆盖最广 (sing-box/mihomo/Xray/v2rayN 全支持)、Cloudflare
+# 支持最完整、性能最好。
+SB_TRANSPORT_HTTP=(ws grpc http httpupgrade)
+
+sb_transport_is_http() {
+    case "${1:-}" in ws|grpc|http|httpupgrade) return 0 ;; *) return 1 ;; esac
+}
+
+# 询问传输方式。
+# 结果写进全局 (不靠 stdout —— 理由同 ask_access_mode 的注释: 命令替换会让
+# read 跑在子 shell 上, stdin 可能已耗尽, 表现为"明明选了却还在问下一个")。
+#   TR_TYPE  ws|grpc|http|httpupgrade; 裸 TCP 时为空字符串
+#   TR_PATH  ws / http / httpupgrade 的 path
+#   TR_SVC   grpc 的 service_name
+#   TR_HOST  http 的 host —— sing-box 用它做 Host 校验, 不设会退化成
+#           Host: www.example.com 而被自己的服务端拒掉
+sb_ask_transport() {
+    local t
+    TR_TYPE=""; TR_PATH=""; TR_SVC=""; TR_HOST=""
+    # 批量模式必须走显式环境变量而不是应答串: safe_read 在 SB_BATCH 下
+    # 返回默认值且**不消费答案队列**, 用应答串定位会让后面所有提问整体错位
+    # (历史上 4 被当成"传输方式", Reality 变体退化成 plain)。
+    if [[ -n "${SB_BATCH:-}" ]]; then
+        t="${SB_BATCH_TRANSPORT:-ws}"
+    else
+        echo "  传输方式:" >&2
+        echo "    ${CYAN}1)${RESET} ws             ${DIM:-}(默认, 兼容性最好, Cloudflare 全功能)${RESET}" >&2
+        echo "    ${CYAN}2)${RESET} grpc           ${DIM:-}(Cloudflare 面板需开 gRPC 开关)${RESET}" >&2
+        echo "    ${CYAN}3)${RESET} http (HTTP/2)   ${DIM:-}(低优先级: Xray 已移除此传输)${RESET}" >&2
+        echo "    ${CYAN}4)${RESET} httpupgrade    ${DIM:-}(主动探测最难识别, CPU 开销最低)${RESET}" >&2
+        echo "    ${CYAN}5)${RESET} 裸 TCP          ${DIM:-}(不写 transport 字段)${RESET}" >&2
+        t=$(safe_read "选择" "1")
+    fi
+    # 同时接受菜单序号和传输名 —— 批量走的是 SB_BATCH_TRANSPORT=grpc 这种
+    # **名字**, 只认序号的话它会落到 *) 兜底变成 ws, 表现为"传了也没用"。
+    case "$t" in
+        2|grpc)       t="grpc" ;;
+        3|http|h2)    t="http" ;;
+        4|httpupgrade) t="httpupgrade" ;;
+        5|tcp|raw)    t="tcp" ;;
+        *)            t="ws" ;;
+    esac
+    case "$t" in
+        tcp)
+            TR_TYPE=""
+            ;;
+        grpc)
+            TR_TYPE="grpc"
+            # service_name 默认必须**每个节点不同**。所有节点都叫 grpcSvc 时,
+            # cdn.sh 生成的片段会出现多个同路径 location, nginx 直接
+            # "duplicate location" 起不来 —— 一个节点的默认值能连带搞垮
+            # 整份站点配置。
+            TR_SVC=$(safe_read "gRPC service_name" "grpc$(openssl rand -hex 3)")
+            ;;
+        http)
+            TR_TYPE="http"
+            TR_PATH=$(safe_read "HTTP 路径 (以 / 开头)" "/$(openssl rand -hex 4)")
+            ;;
+        httpupgrade)
+            TR_TYPE="httpupgrade"
+            # sing-box 的 httpupgrade **不支持 early data**, 带 ?ed= 会 404
+            TR_PATH=$(safe_read "HTTPUpgrade 路径 (以 / 开头)" "/$(openssl rand -hex 4)")
+            ;;
+        *)
+            TR_TYPE="ws"
+            TR_PATH=$(safe_read "WS 路径 (以 / 开头)" "/$(openssl rand -hex 4)")
+            ;;
+    esac
+    return 0
+}
+
+# 服务端 transport JSON 片段。裸 TCP 返回空串 (调用方不要输出该字段)。
+sb_transport_json_server() { # <type> <path> <svc> <host>
+    case "${1:-}" in
+        "")            printf '' ;;
+        ws)            printf '{"type":"ws","path":"%s","max_early_data":2560,"early_data_header_name":"Sec-WebSocket-Protocol"}' "$2" ;;
+        httpupgrade)   printf '{"type":"httpupgrade","path":"%s"}' "$2" ;;
+        grpc)          printf '{"type":"grpc","service_name":"%s"}' "$3" ;;
+        http)          printf '{"type":"http","path":"%s","host":["%s"]}' "$2" "$4" ;;
+        *)             print_error "未知传输类型: ${1:-<空>}"; return 1 ;;
+    esac
+}
+
+# 客户端 transport JSON 片段。裸 TCP 返回空串。
+# ws 显式带 User-Agent: sing-box 的 ws 默认发 "Go-http-client/1.1", 而这正是
+# Cloudflare 滥用公告里点名的特征 ("WebSocket tunneling abuse - Xray/V2Ray
+# x_padding pattern with Go-http client")。
+sb_transport_json_client() { # <type> <path> <svc> <host> <ua>
+    local ua="${5:-Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36}"
+    case "${1:-}" in
+        "")            printf '' ;;
+        ws)            printf '{"type":"ws","path":"%s","headers":{"Host":"%s","User-Agent":"%s"}}' "$2" "$4" "$ua" ;;
+        httpupgrade)   printf '{"type":"httpupgrade","path":"%s","host":"%s"}' "$2" "$4" ;;
+        grpc)          printf '{"type":"grpc","service_name":"%s"}' "$3" ;;
+        http)          printf '{"type":"http","path":"%s","host":["%s"]}' "$2" "$4" ;;
+        *)             print_error "未知传输类型: ${1:-<空>}"; return 1 ;;
+    esac
+}
+
+# 分享链接的传输参数。裸 TCP 返回空串。
+# httpupgrade **绝不能带 &ed=**: sing-box 不支持 httpupgrade 的 early data,
+# 且路径是精确匹配, 多余参数直接 404。
+sb_transport_link_params() { # <type> <path> <svc> <host>
+    case "${1:-}" in
+        "")            printf '' ;;
+        ws)            printf '&type=ws&path=%s&host=%s' "$2" "$4" ;;
+        grpc)          printf '&type=grpc&serviceName=%s&host=%s' "$3" "$4" ;;
+        http)          printf '&type=http&path=%s&host=%s' "$2" "$4" ;;
+        httpupgrade)   printf '&type=httpupgrade&path=%s&host=%s' "$2" "$4" ;;
+        *)             print_error "未知传输类型: ${1:-<空>}"; return 1 ;;
+    esac
+}
+
+# ALPN: ws/httpupgrade 走 http/1.1, grpc/http 必须走 h2。
+# sing-box 的 httpupgrade 在服务端会**禁用 HTTP/2**, 前置层必须用 1.1 回源。
+sb_transport_alpn() {
+    case "${1:-}" in
+        grpc|http) printf '["h2"]' ;;
+        *)         printf '["http/1.1"]' ;;
+    esac
+}
+
 # ---------- 建节点时询问接入方式 ----------
 # 参照参考脚本 vlessxhttpecn.sh 的 ACCESS_MODE:
 #   1) 直连       监听对外地址, 客户端连 服务器IP:端口   (最简单, 无需 Nginx)
@@ -599,18 +718,18 @@ ask_access_mode() {
     # 写全局变量则始终在当前 shell 的 stdin 上读, 行为可预期。
     local ttype="${1:-tcp}" trusted="${2:-no}"
     local can_cdn="no"
-    # 内联判定传输是否支持 CDN (ws/grpc/http(2)), 不依赖 cdn.sh 是否被加载
-    case "$ttype" in ws|grpc|http) [[ "$trusted" == "yes" ]] && can_cdn="yes" ;; esac
+    # 内联判定传输是否支持 CDN, 不依赖 cdn.sh 是否被加载
+    # (protocol 脚本不一定加载了 cdn.sh, 调不到就等于"不支持" -> CDN 选项被藏)
+    sb_transport_is_http "$ttype" && [[ "$trusted" == "yes" ]] && can_cdn="yes"
 
     if [[ "$can_cdn" != "yes" ]]; then
         echo "  接入方式:" >&2
         echo "    1) 直连 (监听对外地址, 客户端连 服务器IP:端口)" >&2
-        case "$ttype" in
-            ws|grpc|http)
-                echo "    [走 CDN 需要真证书 —— Cloudflare 不接受自签证书]" >&2 ;;
-            *)
-                echo "    [$ttype 传输不能走 CDN —— Cloudflare 只代理 ws/grpc/http(2)]" >&2 ;;
-        esac
+        if [[ "$trusted" != "yes" ]]; then
+            echo "    [走 CDN 需要真证书 —— Cloudflare 不接受自签证书]" >&2
+        else
+            echo "    [$ttype 传输不能走 CDN —— Cloudflare 只代理 ws/grpc/http/httpupgrade]" >&2
+        fi
         local c; c=$(safe_read "选择" "1")
         [[ -z "$c" ]] && c=1
         ACCESS_MODE="direct"
@@ -620,6 +739,16 @@ ask_access_mode() {
     # 批量模式: 直接定成 CDN+Nginx, 不再逐个询问
     if [[ "${SB_BATCH:-}" == "1" && "${SB_BATCH_CDN:-0}" == "1" ]]; then
         ACCESS_MODE="cdn-nginx"
+        return 0
+    fi
+    # 批量但没开 CDN: 必须是**直连**。
+    # 不能掉进下面那个交互菜单 —— 菜单默认是 3 (CDN+Nginx), 而批量下
+    # safe_read 直接返回默认值且不读 stdin, 于是每个"真证书 + HTTP 类传输"
+    # 的节点都会被静默改成只听 127.0.0.1、客户端连 CDN 域名, 可 nginx 里
+    # 根本没有对应 location, 节点彻底连不上。实测批量生成 vless/vmess/
+    # trojan 时全部中招。
+    if [[ "${SB_BATCH:-}" == "1" ]]; then
+        ACCESS_MODE="direct"
         return 0
     fi
 
@@ -652,8 +781,14 @@ sb_cdn_enabled() { # <配置文件> -> 0 表示该节点走 CDN
     # 调不到函数会被当成"返回非 0" -> 真证书 ws 节点也被判成非 CDN ->
     # 产物里写服务器 IP 而不是域名, 客户端连了源站端口, CDN 等于没生效。
     local f="$1" t crt
+    # 用户明确选了"直连"就不是 CDN 节点。
+    # 光看传输+证书会误判: 一个"直连 + 真证书 + ws"的节点完全够得上下面
+    # 的 CDN 判据, 于是 sb_cdn_finalize 把它的 listen 改写成 127.0.0.1、
+    # 客户端地址改写成证书域名, 而 nginx 里根本没有对应 location ——
+    # 表现为"生成成功但永远连不上", 且界面上看不出任何异常。
+    case "${ACCESS_MODE:-}" in direct) return 1 ;; esac
     t=$(jq -r '.inbounds[0].transport.type // "tcp"' "$f" 2>/dev/null)
-    case "$t" in ws|grpc|http) ;; *) return 1 ;; esac
+    case "$t" in ws|grpc|http|httpupgrade) ;; *) return 1 ;; esac
     crt=$(jq -r '.inbounds[0].tls.certificate_path // ""' "$f" 2>/dev/null)
     [[ -n "$crt" && -f "$crt" ]] || return 1
     sb_key_for "$crt" >/dev/null 2>&1 || return 1
@@ -1045,7 +1180,54 @@ backup_config() { # backup_config config|kernel|all
           print_info "如需自动配置 Nginx, 请用菜单 10 → 1"
           return 0
       }
+      sb_cdn_warn_no_http2
       cdn_autosetup
+  }
+
+# ---------- gRPC / http(H2) 走 CDN 的前置条件: 站点必须开 HTTP/2 ----------
+# 这两种传输跑在 HTTP/2 上, 而 nginx 的 listen 必须真的提供 h2。站点写
+# `listen 443 ssl;` 而没有 http2 时, 客户端在 TLS 握手里带 h2、nginx 只答
+# http/1.1, 握手直接失败 (no application protocol), 且 **nginx 自己不报错**
+# —— 节点看着配好了, 却永远连不上。这里如实检出并给出要加的那一行。
+#
+# 只做只读检查并提示, 不替用户改他站点的 server 块: 那等于替他决定
+# 整站要不要开 h2, 属于会影响他正常网站业务的决定。
+sb_cdn_warn_no_http2() {
+    declare -F cdn_config_supported >/dev/null 2>&1 || return 0
+    declare -F sb_cdn_domain >/dev/null 2>&1 || return 0
+    local f t dom=""
+    shopt -s nullglob
+    for f in "$SB_CONFIG_DIR"/*.json; do
+        [[ "$(basename "$f")" =~ ^(00-|01-|02-|03-) ]] && continue
+        cdn_config_supported "$f" || continue
+        t=$(jq -r '.inbounds[0].transport.type // ""' "$f" 2>/dev/null)
+        case "$t" in grpc|http) dom=$(sb_cdn_domain "$f"); break ;; esac
+    done
+    shopt -u nullglob
+    [[ -z "$dom" ]] && return 0
+    # 站点配置在哪: 容器化 nginx 与宿主 nginx 路径不同, 两边都看一眼
+    local -a cfgs=()
+    local site
+    for site in /home/web/conf.d /etc/nginx/conf.d /usr/local/nginx/conf /etc/nginx/sites-enabled; do
+        [[ -d "$site" ]] || continue
+        for f in "$site"/*.conf; do [[ -f "$f" ]] && cfgs+=("$f"); done
+    done
+    [[ ${#cfgs[@]} -eq 0 ]] && return 0
+    local c res
+    for c in "${cfgs[@]}"; do
+        res=$(python3 "$SELF_DIR/conf/cdn_apply.py" --domain "$dom" \
+                --file "$c" --check-http2 2>/dev/null | tr -d '[:space:]')
+        [[ "$res" == "OFF" ]] || continue
+        print_warn "检测到 gRPC / http(H2) 节点走 CDN, 但站点 $dom 没开 HTTP/2"
+        print_warn "  文件: $c"
+        print_warn "  这两种传输跑在 HTTP/2 上。nginx 不提供 h2 时, 客户端带 h2 进来而"
+        print_warn "  nginx 只答 http/1.1, TLS 握手直接失败, 且 nginx 不会报错。"
+        print_warn "  在该 server 块里加一行即可 (nginx >= 1.25.1):"
+        print_warn "      http2 on;"
+        print_warn "  老写法也可以: 把 listen 443 ssl; 改成 listen 443 ssl http2;"
+        return 0
+    done
+    return 0
   }
   
 

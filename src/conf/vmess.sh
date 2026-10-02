@@ -64,15 +64,12 @@ add_config() {
     print_title "新增 VMess 节点 ($PROTO-NN.json)"
     local listen_ip listen_port svc_if
     listen_port=$(safe_read_port)
-    echo "transport: 1) ws 2) grpc 3) http(H2) 4) tcp裸" >&2
-    read -r -p "选择 (默认 ws): " tv; tv=$(clean_input "$tv")
+    # 统一走 lib.sh 的传输抽象 (ws/grpc/http/httpupgrade/裸TCP), 与 VLESS、
+    # Trojan 共用同一份实现 —— 之前 vmess 自带一套菜单, 少 httpupgrade,
+    # 而且 4) tcp裸 靠 ttype="" 隐式表达, 新人很容易读成"应该写 type:tcp"。
     local ttype tpath svc
-    case "$tv" in
-        2) ttype="grpc"; svc=$(safe_read "service_name" "vmSvc") ;;
-        3) ttype="http"; svc="" ;;
-        4) ttype=""; svc="" ;;
-        *) ttype="ws"; tpath=$(safe_read "WS path (默认 /uuid 随机)" "/$(openssl rand -hex 6)") ;;
-    esac
+    sb_ask_transport
+    ttype="$TR_TYPE"; tpath="$TR_PATH"; svc="$TR_SVC"
 
     # 不用 read 解析: batch 模式会重定义 read 并无视 herestring (旧写法导致
     # Reality 变体静默退化成无 TLS)。这里用纯参数展开, 对 read 覆盖免疫。
@@ -80,6 +77,9 @@ add_config() {
     CERT_MODE="${_tls%%|*}"; _tls="${_tls#*|}"
     CERT_FILE="${_tls%%|*}"; _tls="${_tls#*|}"
     KEY_FILE="${_tls%%|*}";  CERT_DOMAIN="${_tls#*|}"
+    # http 传输的 host 用证书域名 —— sing-box 用它做 Host 校验,
+    # 不设会退化成 Host: www.example.com 并被自己的服务端拒掉 (bad host)
+    [[ -z "$TR_HOST" ]] && TR_HOST="$CERT_DOMAIN"
       
     # 接入方式必须在证书与传输都定下来之后问:
     #   - 自签证书 Cloudflare 一定拒绝回源, 问 CDN 没有意义
@@ -140,20 +140,18 @@ add_config() {
 }
 EOF
 )
-    if [[ "$ttype" == "ws" ]]; then
-        base=$(echo "$base" | jq --arg p "$tpath" '.inbounds[0].transport={"type":"ws","path":$p,"max_early_data":2560,"early_data_header_name":"Sec-WebSocket-Protocol"}')
-    elif [[ "$ttype" == "grpc" ]]; then
-        base=$(echo "$base" | jq --arg s "$svc" '.inbounds[0].transport={"type":"grpc","service_name":$s}')
-    elif [[ "$ttype" == "http" ]]; then
-        base=$(echo "$base" | jq '.inbounds[0].transport={"type":"http"}')
-    fi
+    # http 传输必须带 host: sing-box 用它做 Host 校验, 不设会退化成
+    # Host: www.example.com, 被自己的服务端拒掉 (实测 bad host)
+    local _trj; _trj=$(sb_transport_json_server "$ttype" "$tpath" "$svc" "$TR_HOST")
+    # 裸 TCP: sing-box 里没有 "type":"tcp", 必须整个省略 transport 字段
+    [[ -n "$_trj" ]] && base=$(echo "$base" | jq --argjson tr "$_trj" '.inbounds[0].transport=$tr')
 
     case "$CERT_MODE" in
         real)
-            base=$(echo "$base" | jq --arg c "$CERT_FILE" --arg k "$KEY_FILE" --arg d "$CERT_DOMAIN" '.inbounds[0].tls={"enabled":true,"server_name":$d,"alpn":["http/1.1"],"certificate_path":$c,"key_path":$k}')
+            base=$(echo "$base" | jq --arg c "$CERT_FILE" --arg k "$KEY_FILE" --arg d "$CERT_DOMAIN" --argjson a "$(sb_transport_alpn "$ttype")" '.inbounds[0].tls={"enabled":true,"server_name":$d,"alpn":$a,"certificate_path":$c,"key_path":$k}')
             ;;
         selfsign)
-            base=$(echo "$base" | jq --arg c "$CERT_FILE" --arg k "$KEY_FILE" '.inbounds[0].tls={"enabled":true,"alpn":["http/1.1"],"certificate_path":$c,"key_path":$k}')
+            base=$(echo "$base" | jq --arg c "$CERT_FILE" --arg k "$KEY_FILE" --argjson a "$(sb_transport_alpn "$ttype")" '.inbounds[0].tls={"enabled":true,"alpn":$a,"certificate_path":$c,"key_path":$k}')
             ;;
         reality)
             base=$(echo "$base" | jq --arg d "$rnd" --arg pk "$REAL_PRIV" --arg sid "$sid" '.inbounds[0].tls={"enabled":true,"server_name":$d,"reality":{"enabled":true,"handshake":{"server":$d,"server_port":443},"private_key":$pk,"short_id":[$sid]}}')
@@ -178,8 +176,7 @@ EOF
     if [[ "$CERT_MODE" == "reality" ]]; then
         pbk="$REAL_PUB"
         url="vless://$uuid@$server_ip:$listen_port?encryption=aes-128-gcm&security=reality&sni=$rnd&fp=chrome&pbk=$pbk&sid=$sid"
-        [[ "$ttype" == "ws" ]] && url="$url&type=ws&path=$tpath"
-        [[ "$ttype" == "grpc" ]] && url="$url&type=grpc&serviceName=$svc"
+        url="$url$(sb_transport_link_params "$ttype" "$tpath" "$svc" "$TR_HOST")"
     else
         url="vmess://$(json_base64="$uuid" ; printf '{\"add\":\"%s\",\"port\":\"%s\",\"uuid\":\"%s\",\"aid\":\"0\",\"net\":\"%s\",\"path\":\"%s\",\"security\":\"none\",\"tls\":\"\"}' "$server_ip" "$listen_port" "$uuid" "${ttype:-tcp}" "$tpath" | base64 -w0)"
     fi
@@ -195,9 +192,11 @@ EOF
 import json,sys,os
 _,ofile,tag,srv,port,uuid,mode,domain,ttype,tpath,svc,pin,pbk,xsid,crt,dom2=sys.argv
 ob={"type":"vmess","tag":tag,"server":srv,"server_port":int(port),"uuid":uuid,"alter_id":0}
-if ttype=="ws": ob["transport"]={"type":"ws","path":tpath}
+# 裸 TCP 不写 transport —— sing-box 里没有 "tcp" 这个类型
+if ttype=="ws": ob["transport"]={"type":"ws","path":tpath,"headers":{"Host":dom2,"User-Agent":os.environ.get("SB_UA","Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")}}
 if ttype=="grpc": ob["transport"]={"type":"grpc","service_name":svc}
-if ttype=="http": ob["transport"]={"type":"http"}
+if ttype=="http": ob["transport"]={"type":"http","path":tpath,"host":[dom2]}
+if ttype=="httpupgrade": ob["transport"]={"type":"httpupgrade","path":tpath,"host":dom2}
 if mode=="real":
     sn = os.popen(f'openssl x509 -in {crt} -noout -ext subjectAltName 2>/dev/null | grep -oE "DNS:[^,]+" | head -1 | cut -d: -f2').read().strip()
     ob["tls"]={"enabled":True,"insecure":True,"server_name": sn or domain,"utls":{"enabled":True,"fingerprint":os.environ.get("SB_UTLS_FP","chrome")}}

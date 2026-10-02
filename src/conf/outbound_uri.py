@@ -219,6 +219,8 @@ def build_transport(net, host, path, service_name, ctx):
         t["path"] = path or "/"
         return t
     if net == "httpupgrade":
+        # 绝不带 early_data: sing-box 的 httpupgrade 不支持, 且路径精确匹配,
+        # 多余的 ?ed= 参数直接 404。
         t = {"type": "httpupgrade"}
         if host:
             t["host"] = host

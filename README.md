@@ -70,7 +70,7 @@ bash src/conf/anytls.sh add       # AnyTLS (可选 REALITY; sing-box >=1.12)
 | 组合 | sing-box | mihomo | xray |
 |---|:--:|:--:|:--:|
 | Reality（VLESS+REALITY，vision/grpc/http） | ✓ | ✓ | ✓ |
-| VLESS / WS+TLS | ✓ | ✓ | ✓ |
+| VLESS / WS+TLS、VLESS / 裸TCP+TLS | ✓ | ✓ | ✓ |
 | Trojan / TLS | ✓ | ✓ | ✓ |
 | AnyTLS / TLS | ✓ | ✓ | ✗ |
 | AnyTLS / Reality | ✓ | ✗ | ✗ |
@@ -80,6 +80,66 @@ bash src/conf/anytls.sh add       # AnyTLS (可选 REALITY; sing-box >=1.12)
 | Shadowsocks / SS-2022 | ✓ | ✓ | ✓ |
 | ShadowTLS（内层 SS-2022） | ✓ | ✗ | ✗ |
 | NaiveProxy | ✗ | ✗ | ✗ |
+
+### 传输方式（VLESS / VMess / Trojan）
+
+这三个协议建节点时可选传输方式，默认 **WebSocket**：
+
+| 菜单项 | sing-box `transport.type` | mihomo | xray |
+|---|---|---|---|
+| 1) ws（默认） | `ws` | `network: ws` + `ws-opts` | `ws` |
+| 2) grpc | `grpc` | `network: grpc` + `grpc-service-name` | `grpc` |
+| 3) http (HTTP/2) | `http` | `network: h2` + `h2-opts` | `http` |
+| 4) httpupgrade | `httpupgrade` | `network: ws` + `ws-opts.v2ray-http-upgrade: true` | `httpupgrade` |
+| 5) 裸 TCP | **不写 `transport` 字段** | 不写 `network` | `tcp` |
+
+几点必须知道的：
+
+- **裸 TCP 是"省略字段"，不是 `"type":"tcp"`。** sing-box 的传输类型里没有 `tcp`
+  这个值，写上去会直接 `sing-box check` 报错。
+- **mihomo 没有 `httpupgrade` 这个 network 值**，必须写成 `network: ws` 加
+  `v2ray-http-upgrade: true`；只写 `network: ws` 会被静默降级成裸 TCP（表现为
+  配置看着对、却连不上）。
+- **ALPN 跟着传输走**：grpc / http 自动用 `["h2"]`，其余用 `["http/1.1"]`，
+  服务端入站、TLS 块、分享链接三处保持一致。
+
+### 走 nginx / CDN 的前置条件
+
+ws / grpc / http / httpupgrade 都能过 Cloudflare + nginx，但 nginx 侧必须满足：
+
+```nginx
+server {
+    listen 443 ssl;
+    http2 on;                      # 缺这行 grpc 和 http(H2) 全废
+    location /yourpath {
+        grpc_pass grpcs://127.0.0.1:PORT;   # grpc / http(H2) 用 grpc_pass
+        grpc_set_header Host $host;         # 不写 sing-box 会报 bad host
+    }
+    location /yourpath2 {
+        proxy_pass https://127.0.0.1:PORT;   # ws / httpupgrade 用 proxy_pass
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+    }
+}
+```
+
+- `http2 on;` 必须写。只写 `listen 443 ssl;` 时 ALPN 会退回 http/1.1，
+  grpc 和 http(H2) 的客户端握手直接失败。
+- 节点开着 TLS 时 `grpc_pass` 必须用 `grpcs://`；用 `grpc://` 会 502
+  （`recv() failed: Connection reset by peer`）。
+- 别用 `proxy_http_version 2`：nginx 低于 1.29.4 会直接
+  `[emerg] invalid value "2"`。
+- 面板会只读检查你的 server 块并提示是否缺 `http2 on;`，但**不会替你改**。
+
+### 服务端监听地址
+
+服务端监听**固定双栈 `::`**，不询问。`::` 在 `bindv6only=0` 时同时收 IPv4 和
+IPv6，严格优于只收 IPv4 的 `0.0.0.0`，没有理由让你为一个更差的选项做选择。
+只有走 CDN 时地址由接入方式决定（Cloudflare 直连 = `0.0.0.0`，
+经 nginx = `127.0.0.1`），那是接入方式的结果，不是需要你选的东西。
+
+需要区分 IPv4 / IPv6 的是**客户端产物里写哪个地址**（菜单里的"对外地址"），那边保留选择。
 
 不支持的组合不会产出对应文件，并打印原因：
 

@@ -20,7 +20,17 @@
 # REALITY / AnyTLS / Hysteria2 / TUIC / SS / naive / ShadowTLS 是原生 TCP/UDP
 # 或专用协议, Cloudflare 代理不了, 必须直连。
 
-SB_CDN_TRANSPORTS=(ws grpc http)
+SB_CDN_TRANSPORTS=(ws grpc http httpupgrade)
+
+# ---------- h2 类传输的前置条件 ----------
+# gRPC / http(H2) 跑在 HTTP/2 上, nginx 的 listen 必须真的提供 h2, 否则
+# 客户端在 TLS 握手里带 h2、nginx 只答 http/1.1, 直接:
+#   SSL_do_handshake() failed (SSL: error:0A0000EB:SSL routines::no application protocol)
+# 很多站点写的是 `listen 443 ssl;` 而**没有** http2 —— 这就是这两种传输
+# 经 CDN 连不上的最常见原因, 而且 nginx 不会报错, 只是静默不通。
+cdn_transport_needs_http2() {
+    case "${1:-}" in grpc|http) return 0 ;; *) return 1 ;; esac
+}
 
 # ---------- 判断某传输是否支持 CDN ----------
 cdn_transport_supported() {
@@ -94,6 +104,15 @@ cdn_cert_domain() {
 # 终止 WebSocket, 回源时不带 Upgrade 头, $http_upgrade 取到空值。
 # 但 sing-box 需要看到 Upgrade 才会接受 —— 这里的正确做法是依赖
 # map $http_upgrade $connection_upgrade (你的 map.conf 已有)。
+# 整份配置内已用过的 location 路径 (跨节点去重的全局表)。
+# 重复路径会让 nginx 直接 "duplicate location" 启动失败 —— 那意味着同一份
+# 配置里**所有**节点全部不可用, 而不只是重复的那一个。宁可少几个节点,
+# 也不能给出一份加载不了的片段。gRPC 的默认 service_name 曾是固定值
+# "grpcSvc", 建两个 gRPC 节点必然撞车, 所以默认值已改成随机, 这里再加兜底。
+# 必须是全局变量: cdn_render_location 每节点调用一次, 用 local 的话每个
+# 节点都从空表开始, 跨节点根本去不了重。
+SB_CDN_SEEN_LOC=" "
+
 cdn_render_location() {
     local f="$1" tag port path svc ttype
     tag=$(jq -r '.inbounds[0].tag' "$f")
@@ -104,27 +123,50 @@ cdn_render_location() {
 
     printf '    # ---- %s  (回源 TLS → 127.0.0.1:%s, %s) ----\n' "$tag" "$port" "$ttype"
     case "$ttype" in
-        grpc)
-            printf '    location /%s {\n' "$svc"
-            printf '        proxy_ssl_server_name on;\n'
-            printf '        proxy_ssl_verify off;\n'
-            printf '        proxy_pass https://127.0.0.1:%s;\n' "$port"
-            printf '        proxy_http_version 2;\n'
-            printf '        proxy_set_header Host $host;\n'
-            printf '        proxy_set_header X-Real-IP $remote_addr;\n'
-            printf '        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n'
-            printf '        proxy_read_timeout 600s;\n'
-            printf '        proxy_send_timeout 600s;\n'
+        grpc|http)
+            # location 路径要**恰好一个**前导斜杠:
+            #   grpc 的 service_name 不带斜杠 (grpcSvc) -> 补一个
+            #   http 的 path 本身就带斜杠 (/abc)        -> 不能再补
+            # 直接写 location /%s 的话 http 会变成 //abc, 匹配不到。
+            local loc="${svc:-$path}"
+            [[ "$loc" != /* ]] && loc="/$loc"
+            #
+            # 实测定位 (RN, sing-box 1.14.2, nginx 1.26.3):
+            #   proxy_pass https:// + proxy_http_version 2  -> 请求发不出去,
+            #     而且 proxy_http_version 2 在 nginx < 1.29.4 直接
+            #     [emerg] invalid value "2", 整份配置起不来。
+            #   grpc_pass grpc:// 指向**开了 TLS** 的节点 -> 502,
+            #     nginx 报 recv() failed (Connection reset by peer)。
+            #   正确写法: grpc_pass grpcs:// (节点开 TLS 时)。
+            #
+            # grpc_set_header Host 这行也不能少: grpc_pass 默认把上游地址
+            # 当 Host 发出去, 而 sing-box 的 http 传输会拿 Host 做白名单校验,
+            # 少了它服务端直接 "bad host: 127.0.0.1:26002" 拒收 (gRPC 不校验,
+            # 所以只有 http 传输会踩这个坑)。
+            if [[ "$SB_CDN_SEEN_LOC" == *" $loc "* ]]; then
+                print_warn "路径重复, 已跳过: location $loc ($b) —— 同名 location 会让 nginx 起不来"
+            else
+                SB_CDN_SEEN_LOC+="$loc "
+            printf '    location %s {\n' "$loc"
+            printf '        grpc_pass grpcs://127.0.0.1:%s;       # 节点开着 TLS, 必须 grpcs://\n' "$port"
+            printf '        grpc_set_header Host $host;          # 不写这行 sing-box 会判 bad host\n'
+            printf '        grpc_set_header X-Real-IP $remote_addr;\n'
+            printf '        grpc_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n'
             printf '        grpc_read_timeout 600s;\n'
             printf '        grpc_send_timeout 600s;\n'
             printf '    }\n\n'
+            fi
             ;;
         *)
+            if [[ "$SB_CDN_SEEN_LOC" == *" $path "* ]]; then
+                print_warn "路径重复, 已跳过: location $path ($b) —— 同名 location 会让 nginx 起不来"
+            else
+                SB_CDN_SEEN_LOC+="$path "
             printf '    location %s {\n' "$path"
             printf '        proxy_ssl_server_name on;              # 回源 TLS SNI\n'
             printf '        proxy_ssl_verify off;                   # Origin CA 不在系统信任库\n'
             printf '        proxy_pass https://127.0.0.1:%s;         # https:// —— 必须是 TLS\n' "$port"
-            printf '        proxy_http_version 1.1;\n'
+            printf '        proxy_http_version 1.1;                # ws / httpupgrade 都是 1.1 升级\n'
             printf '        proxy_set_header Upgrade $http_upgrade;         # WebSocket 升级\n'
             printf '        proxy_set_header Connection $connection_upgrade;\n'
             printf '        proxy_set_header Host $host;\n'
@@ -134,6 +176,7 @@ cdn_render_location() {
             printf '        proxy_read_timeout 600s;\n'
             printf '        proxy_send_timeout 600s;\n'
             printf '    }\n\n'
+            fi
             ;;
     esac
 }
@@ -142,9 +185,13 @@ cdn_render_location() {
 # 只生成文本, 不写你的 Nginx 目录。
 cdn_gen_nginx_conf() {
     local out="${1:-$SB_OUT_DIR/sb_cdn-nginx-location.conf}"
+    SB_CDN_SEEN_LOC=" "   # 每次重新生成时清空路径表, 否则第二次生成会全部被判重复
     local f crt d key found
     local -A by_dom=()
     local -a NODES=()
+    # location 路径去重用。重复路径会让 nginx 直接 "duplicate location"
+    # 启动失败 —— 那意味着同一份配置里**所有**节点全部不可用, 而不只是
+    # 重复的那一个。宁可少几个节点, 也不能给出一份加载不了的片段。
 
     shopt -s nullglob
     for f in "$SB_CONFIG_DIR"/*.json; do

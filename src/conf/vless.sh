@@ -47,17 +47,20 @@ ask_cert() {
 }
 
 add_config() {
-    print_title "新增 VLESS-WS-TLS 节点 ($PROTO-NN.json)"
-    local server_ip listen_ip listen_port uuid path idx file tag json
+    print_title "新增 VLESS 节点 ($PROTO-NN.json)"
+    local server_ip listen_ip listen_port uuid idx file tag json
     server_ip=$(ask_server_addr)
     listen_port=$(safe_read_port)
     uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen)
-    path=$(safe_read "WS 路径 (以 / 开头)" "/$(openssl rand -hex 4)")
+    # 传输先问: ws/grpc/http/httpupgrade 四种 HTTP 类传输都能走 CDN, 裸 TCP 不能。
+    sb_ask_transport
     ask_cert || return 1
+    # http 传输的 host 用证书域名 —— sing-box 会拿它做 Host 校验
+    [[ -z "$TR_HOST" ]] && TR_HOST="$CERT_DOMAIN"
 
-    # 接入方式在证书选定之后询问: 只有"真证书 + ws/grpc/http"才有 CDN 可选。
+    # 接入方式在证书选定之后询问: 只有"真证书 + HTTP 类传输"才有 CDN 可选。
     # 监听地址由它决定 (CDN+Nginx 必须只听 127.0.0.1), 所以放到这一步问。
-    local ttype="ws" trusted="no"
+    local trusted="no"
     # 判定"是否真证书"必须用 lib.sh 里已有的能力, 不能调 cdn.sh 的函数
     # (protocol 脚本不一定加载了 cdn.sh, 调不到就等于"不是真证书" -> CDN 选项被藏)
     sb_key_for "$CERT_FILE" >/dev/null 2>&1 && \
@@ -66,7 +69,7 @@ add_config() {
     # ask_access_mode 把结果写进全局 ACCESS_MODE (不靠 stdout):
     # 命令替换会让函数里的 read 跑在子 shell 上, stdin 可能已耗尽,
     # 结果是"明明选了 CDN+Nginx 却还在问监听地址"。
-    ask_access_mode "$ttype" "$trusted"
+    ask_access_mode "$TR_TYPE" "$trusted"
     case "$ACCESS_MODE" in
         cdn)        listen_ip="0.0.0.0" ;;
         cdn-nginx)  listen_ip="127.0.0.1" ;;
@@ -75,8 +78,15 @@ add_config() {
 
     idx=$(get_next_index "$PROTO"); file="$SB_CONFIG_DIR/$PROTO-$idx.json"; tag="${PROTO}${idx}"
     tag="$tag$(tag_form_suffix tls)"   # 名字体现传输方式
-    local tls_line
-    tls_line="\"enabled\": true, \"certificate_path\": \"$CERT_FILE\", \"key_path\": \"$KEY_FILE\", \"alpn\": [\"http/1.1\"]"
+    local tls_line alpn tr_json tr_line=""
+    alpn=$(sb_transport_alpn "$TR_TYPE")
+    tls_line="\"enabled\": true, \"certificate_path\": \"$CERT_FILE\", \"key_path\": \"$KEY_FILE\", \"alpn\": $alpn"
+    # 裸 TCP: sing-box 里不存在 "type":"tcp", 必须**整个省略 transport 字段。
+    # 整行一起加/去 —— 只在字段之间插逗号会出现 ",," 这种双逗号。
+    tr_json=$(sb_transport_json_server "$TR_TYPE" "$TR_PATH" "$TR_SVC" "$TR_HOST")
+    # 注意 sb_transport_json_server 返回的是**值**, "transport" 这个键要在这里补上
+    [[ -n "$tr_json" ]] && tr_line="      \"transport\": $tr_json,
+"
 
     json=$(cat <<EOF
 {
@@ -87,8 +97,7 @@ add_config() {
       "listen": "$listen_ip",
       "listen_port": $listen_port,
       "users": [ { "name": "user", "uuid": "$uuid" } ],
-      "transport": { "type": "ws", "path": "$path", "early_data_header_name": "Sec-WebSocket-Protocol" },
-      "tls": { $tls_line }
+$tr_line      "tls": { $tls_line }
     }
   ]
 }
@@ -104,15 +113,21 @@ EOF
     server_ip=$(sb_cdn_finalize "$file" "$server_ip")
     # CDN 只在 443 上提供服务; 沿用源站端口会得到连不通的 域名:源站端口
     sb_node_is_cdn "$file" && listen_port=443
-    local link="vless://$uuid@$server_ip:$listen_port?encryption=none&security=tls&sni=$CERT_DOMAIN&type=ws&host=$CERT_DOMAIN&path=$path#$tag"
-    local utls_fp; utls_fp=$(ask_utls_fingerprint)
+    local link_params utls_fp ctr_json ctr_sep=""
+    link_params=$(sb_transport_link_params "$TR_TYPE" "$TR_PATH" "$TR_SVC" "$TR_HOST")
+    # 裸 TCP 客户端同样不能写 "transport":{} —— sing-box 会当成空类型报错
+    ctr_json=$(sb_transport_json_client "$TR_TYPE" "$TR_PATH" "$TR_SVC" "$TR_HOST")
+    # 同样: 函数返回的是**值**, "transport" 键要在这里补
+    [[ -n "$ctr_json" ]] && ctr_sep=",
+      \"transport\": $ctr_json"
+    local link="vless://$uuid@$server_ip:$listen_port?encryption=none&security=tls&sni=$CERT_DOMAIN$link_params#$tag"
+    utls_fp=$(ask_utls_fingerprint)
     cat > "$SB_OUT_DIR/sb_client-$tag.json" <<EOF
 {
   "outbounds": [
     { "type": "vless", "tag": "$tag", "server": "$server_ip", "server_port": $listen_port,
       "uuid": "$uuid",
-      "tls": { "enabled": true, "server_name": "$CERT_DOMAIN", "insecure": $( [[ "$CERT_TRUSTED" == "true" ]] && echo false || echo true ), "utls": { "enabled": true, "fingerprint": "$utls_fp" } },
-      "transport": { "type": "ws", "path": "$path" } }
+      "tls": { "enabled": true, "server_name": "$CERT_DOMAIN", "insecure": $( [[ "$CERT_TRUSTED" == "true" ]] && echo false || echo true ), "utls": { "enabled": true, "fingerprint": "$utls_fp" } }$ctr_sep }
   ]
 }
 EOF
@@ -140,19 +155,27 @@ EOF
       # 走 CDN 的节点, 客户端连的是域名:443, nginx 里必须有对应的 location。
       # 之前单协议路径**什么都不提示**, 节点看着生成成功, 却因为 nginx 没配而
       # 连不上, 用户完全无从查起。这里直接自动配好。
-      [[ "${ACCESS_MODE:-}" == cdn* ]] && sb_cdn_autosetup
+      #
+      # 必须写成 if 而不是 [[ ... ]] && ...: 后者条件不成立时整条语句返回 1,
+      # 而它又是本函数的最后一句, 于是 add_config 的退出码变成 1 —— 批量生成
+      # 里表现为"vless 失败", 但配置其实早就写好了, 极具迷惑性。
+      if [[ "${ACCESS_MODE:-}" == cdn* ]]; then sb_cdn_autosetup; fi
+      return 0
 }
 
 list_configs() {
     print_title "$PROTO 配置列表"
     for f in "$SB_CONFIG_DIR"/$PROTO-*.json; do
         [[ -f "$f" ]] || continue
-        local idx tag port uuid path
+        local idx tag port uuid ttype detail
         idx=$(basename "$f" .json | cut -d'-' -f2); tag="${PROTO}${idx}"
         port=$(jq -r '.inbounds[0].listen_port' "$f")
         uuid=$(jq -r '.inbounds[0].users[0].uuid' "$f")
-        path=$(jq -r '.inbounds[0].transport.path' "$f")
-        printf "%s) 端口:%s  WS路径:%s  UUID:%s\n" "$idx" "$port" "$path" "$uuid" >&2
+        # 裸 TCP 没有 transport 字段, .transport.path 取到 null —— 显示成
+        # "tcp" 而不是 "null", 否则用户会以为节点坏了
+        ttype=$(jq -r '.inbounds[0].transport.type // "tcp"' "$f")
+        detail=$(jq -r '.inbounds[0].transport.path // .inbounds[0].transport.service_name // "-"' "$f")
+        printf "%s) 端口:%s  传输:%s  %s  UUID:%s\n" "$idx" "$port" "$ttype" "$detail" "$uuid" >&2
     done
 }
 

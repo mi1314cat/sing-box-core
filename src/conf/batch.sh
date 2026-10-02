@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==============================================================
 # batch.sh — 全协议一键生成 (Batch Generator)
-#   * 公共参数只问一次: 监听地址 / 对外地址 / 证书方案 / 端口范围 / CDN 策略,
+#   * 公共参数只问一次: 对外地址 / 证书方案 / 端口范围 / CDN 策略,
 #     其余全用各协议自带默认生成逻辑
 #   * 证书: SB_BATCH_CERT=real|self 配 SB_BATCH_CERT_CRT/KEY/DOMAIN 下发;
 #     选真证书时 CDN 自动沿用同一张, 选自签时 CDN 需另选一张可信证书
@@ -200,47 +200,29 @@ batch_main() {
 
     echo >&2
     print_title "全协议一键生成"
-    echo -e "${CYAN}交互项: 监听地址 → 对外地址 → 证书方案 → 端口范围 → CDN. 其余沿用各协议默认值.${RESET}" >&2
+    echo -e "${CYAN}交互项: 对外地址 → 证书方案 → 端口范围 → CDN. 其余沿用各协议默认值.${RESET}" >&2
     echo -e "${CYAN}如端口被占用或配置失败, 会自动清理; 收尾统一 check + reload.${RESET}" >&2
 
-    # --- 第一次交互: 客户端配置用哪个地址连回来 ---
-    # 这件事以前根本没人问, 批量生成出来的配置一律写 IPv4。可实际用起来经常
-    # 需要 IPv6 (IPv4 线路差 / 客户端只有 IPv6 出口), 结果只能每个节点手动
-    # 重建, 或者事后一条条改。这里先问一次, 决定了后面所有节点:
-    #   监听地址  —— 服务端绑哪个地址 (:: = 双栈, 两种协议都能连)
-    #   对外地址  —— 客户端配置里写哪个 (IPv4 还是 IPv6)
-    # 两者是独立的两件事, 分开问: 可以只让 IPv6 连进来, 但配置里仍发 IPv4。
-    local a4 a6 cur_fam
+    # --- 服务端监听: 不问, 统一双栈 ---
+    # :: 在 bindv6only=0 时同时收 IPv4 和 IPv6, 严格优于 0.0.0.0, 没有理由
+    # 让用户为一个更差的选项做选择。走 CDN 的节点要只听本机, 那是**接入
+    # 方式**决定的, 由各协议脚本在 ACCESS_MODE 出来后自行写死。
+    # 真正需要区分 IPv4/IPv6 的是下面第二问: 客户端配置里写哪个地址。
+    local a4 a6
     a4=$(sb_addr4); a6=$(sb_addr6)
+    SB_LISTEN_ADDR="$SB_LISTEN_DEFAULT"
     echo >&2
-    echo -e "${CYAN}① 服务端监听地址 —— 决定这个端口收 IPv4、收 IPv6 还是只收本机${RESET}" >&2
-    if [[ -n "$a6" ]]; then
-      echo -e "   ${GREEN}1)${RESET} ${CYAN}::${RESET} IPv4+IPv6 双栈${RESET} (默认) ← 本机 IPv6: $a6" >&2
+    if [[ "$SB_LISTEN_ADDR" == "::" ]]; then
+        print_ok "服务端监听: :: (IPv4+IPv6 双栈, 无需选择)"
+        [[ -z "$a6" ]] && print_warn "本机无可用 IPv6, 双栈监听下只有 IPv4 客户端能连"
+        [[ "$(cat /proc/sys/net/ipv6/bindv6only 2>/dev/null || echo 0)" == "1" ]] && \
+            print_warn "net.ipv6.bindv6only=1: 监听 :: 只收 IPv6, IPv4 会连不上"
     else
-      echo -e "   ${GREEN}1)${RESET} ${CYAN}::${RESET} 双栈${RESET} (默认) ${MAGENTA}—— 本机无 IPv6, 实际只有 IPv4 能连${RESET}" >&2
+        print_warn "本机内核未启用 IPv6, 已退回 0.0.0.0 (仅 IPv4)"
     fi
-    echo -e "   ${GREEN}2)${RESET} ${YELLOW}0.0.0.0${RESET} 仅 IPv4${RESET} (IPv6 客户端会被拒绝)" >&2
-    local lch=""
-    read -r -p "   请选择 [1-2, 回车=1]: " lch
-    case "$(clean_input "${lch:-}")" in
-      2) SB_LISTEN_ADDR="0.0.0.0"; print_info "监听 0.0.0.0 (仅 IPv4)" ;;
-      *) SB_LISTEN_ADDR="$SB_LISTEN_DEFAULT"
-         if [[ "$SB_LISTEN_ADDR" == "::" ]]; then
-           if [[ -z "$a6" ]]; then print_warn "本机无可用 IPv6, 双栈监听下只有 IPv4 客户端能连"; fi
-           if [[ "$(cat /proc/sys/net/ipv6/bindv6only 2>/dev/null || echo 0)" == "1" ]]; then
-               print_warn "net.ipv6.bindv6only=1: 监听 :: 只收 IPv6, IPv4 会连不上"
-           fi
-           print_ok "监听 :: (IPv4+IPv6 双栈)"
-         else
-           print_warn "本机内核未启用 IPv6, 已退回 0.0.0.0"
-         fi ;;
-    esac
-    # 注意: 这里不要因为 CDN 就把监听改成 127.0.0.1 —— CDN 是否启用是
-    # 下面第三步才问出来的, 此刻 SB_BATCH_CDN 还没赋值, 写了也是死代码。
-    # 走 CDN 的节点要只听本机, 由 vless.sh/vmess.sh 依据 SB_BATCH_CDN 自行处理。
 
     echo >&2
-    echo -e "${CYAN}② 客户端配置里写哪个地址 —— 别人拿到配置后连的是这个${RESET}" >&2
+    echo -e "${CYAN}① 客户端配置里写哪个地址 —— 别人拿到配置后连的是这个${RESET}" >&2
     [[ -n "$a4" ]] && echo -e "   ${GREEN}1)${RESET} IPv4  ${CYAN}$a4${RESET}" >&2 || echo -e "   ${MAGENTA}(无 IPv4)${RESET}" >&2
     [[ -n "$a6" ]] && echo -e "   ${GREEN}2)${RESET} IPv6  ${CYAN}$a6${RESET}" >&2 || echo -e "   ${MAGENTA}(无 IPv6)${RESET}" >&2
     echo -e "   ${MAGENTA}选 IPv6 前请确认客户端网络真能出 IPv6 —— 写进去连不上更麻烦${RESET}" >&2
@@ -267,7 +249,7 @@ batch_main() {
     sb_scan_certs >/dev/null 2>&1 && ncert=${#sb_FOUND_CERTS[@]}
     sb_scan_nginx_sites
     echo >&2
-    echo -e "${CYAN}③ 证书方案 —— 节点用什么证书对外服务${RESET}" >&2
+    echo -e "${CYAN}② 证书方案 —— 节点用什么证书对外服务${RESET}" >&2
     if (( ncert > 0 )); then
         echo -e "   ${GREEN}1)${RESET} ${CYAN}使用本机真实证书${RESET} (检测到 ${ncert} 张 CA 可信证书)" >&2
     else
@@ -291,7 +273,7 @@ batch_main() {
     esac
     export SB_BATCH_CERT SB_BATCH_CERT_CRT SB_BATCH_CERT_KEY SB_BATCH_CERT_DOMAIN
 
-    # --- 第四次交互: 端口范围 ---
+    # --- 第三次交互: 端口范围 ---
     local r
     if [[ -n "${SB_BATCH_AUTO:-}" ]]; then
         SB_BATCH_PORT_START=$(( 20000 + RANDOM % 10000 ))
@@ -313,8 +295,8 @@ batch_main() {
     fi
     export SB_BATCH_PORT_START SB_BATCH_PORT_END
 
-      # --- CDN 策略 ---
-      # 能走 CDN 的协议: vless / vmess (传输 ws/grpc/http + 真证书)。
+      # --- 第四次交互: CDN 策略 ---
+      # 能走 CDN 的协议: vless / vmess / trojan (传输 ws/grpc/http/httpupgrade + 真证书)。
       # 其余协议是原生 TCP/UDP 或专用协议, Cloudflare 代理不了, 只能直连。
       # 这里默认开启: 反正只有这两个协议受影响, 开不开都由协议本身决定,
       # 不需要为"不支持 CDN 的协议"单独做任何事。
@@ -330,12 +312,12 @@ batch_main() {
           rc=$(clean_input "${rc:-}")
           [[ "$rc" == "2" ]] || { SB_BATCH_CDN=1; SB_BATCH_CDN_DOMAIN="$cdn_dom"; }
           if (( SB_BATCH_CDN )); then
-              # ③ 选了真证书 -> CDN 直接沿用同一张, 不必再问
+              # ② 选了真证书 -> CDN 直接沿用同一张, 不必再问
               if [[ "$SB_BATCH_CERT" == "real" && -n "$SB_BATCH_CERT_DOMAIN" ]]; then
                   SB_BATCH_CDN_DOMAIN="$SB_BATCH_CERT_DOMAIN"
-                  print_ok "已启用 CDN: 沿用③选的证书 $SB_BATCH_CDN_DOMAIN"
+                  print_ok "已启用 CDN: 沿用②选的证书 $SB_BATCH_CDN_DOMAIN"
               else
-                  # ③ 选了自签 -> 自签证书 Cloudflare 一律拒绝回源,
+                  # ② 选了自签 -> 自签证书 Cloudflare 一律拒绝回源,
                   # 必须单独挑一张 CA 可信证书, 这里列出来让用户选
                   echo >&2
                   print_info "③ 选了自签证书, Cloudflare 不接受自签回源 —— 请为 CDN 单独选一张真证书:"
@@ -412,6 +394,7 @@ batch_main() {
           SB_BATCH_CERT="$SB_BATCH_CERT" SB_BATCH_CERT_CRT="$SB_BATCH_CERT_CRT" \
           SB_BATCH_CERT_KEY="$SB_BATCH_CERT_KEY" SB_BATCH_CERT_DOMAIN="$SB_BATCH_CERT_DOMAIN" \
         SB_BATCH_PORT_START="$SB_BATCH_PORT_START" SB_BATCH_PORT_END="$SB_BATCH_PORT_END" \
+        SB_BATCH_TRANSPORT="${SB_BATCH_TRANSPORT:-ws}" \
         timeout 240 bash "$SELF_DIR/conf/${proto}.sh" add </dev/null >/tmp/batch-$proto.log 2>&1
         local mod_rc=$?
         if [[ $mod_rc -eq 0 ]]; then
@@ -440,6 +423,7 @@ batch_main() {
           SB_BATCH_CDN=0 \
         SB_BATCH=1 SB_NO_RELOAD=1 SB_FORCE_TLS_REALTY=1 \
         SB_BATCH_PORT_START="$SB_BATCH_PORT_START" SB_BATCH_PORT_END="$SB_BATCH_PORT_END" \
+        SB_BATCH_TRANSPORT="${SB_BATCH_TRANSPORT:-ws}" \
         timeout 240 bash "$SELF_DIR/conf/${vp}.sh" add </dev/null >/tmp/batch-$vp-v.log 2>&1
         if [[ $? -eq 0 ]]; then
             printf "%b[生成]%b Reality 变体\n" "$GREEN" "$RESET" >&2

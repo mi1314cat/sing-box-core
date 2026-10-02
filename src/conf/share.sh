@@ -41,7 +41,7 @@ ask_addr_family_now() {
     echo -e "${CYAN}  客户端配置里用哪个地址连回服务器?${RESET}" >&2
     [[ -n "$a4" ]] && echo -e "    ${GREEN}1)${RESET} IPv4  ${CYAN}$a4${RESET}" >&2 || echo -e "    ${MAGENTA}(本机无 IPv4)${RESET}" >&2
     [[ -n "$a6" ]] && echo -e "    ${GREEN}2)${RESET} IPv6  ${CYAN}$a6${RESET}" >&2 || echo -e "    ${MAGENTA}(本机无 IPv6)${RESET}" >&2
-    echo -e "    ${MAGENTA}服务端需监听 :: (双栈) 才能收 IPv6 连接, 见 添加节点时的监听地址${RESET}" >&2
+    echo -e "    ${MAGENTA}服务端固定监听 :: (双栈), IPv4 与 IPv6 客户端都能连${RESET}" >&2
     local c=""
     read -r -p "    请选择 [1-2, 回车=沿用当前]: " c || { echo; return 0; }
     case "$(clean_input "${c:-}")" in

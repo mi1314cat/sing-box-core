@@ -89,9 +89,30 @@ def main():
     ap.add_argument("--nginx", default="auto",
                     help="docker:<容器名> | systemd | none (跳过语法校验)")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--check-http2", action="store_true",
+                    help="只检查该 server 块有无 HTTP/2 (gRPC/http 的前提), 不写入")
     args = ap.parse_args()
 
     path = args.file
+    if args.check_http2:
+        # gRPC / http(H2) 跑在 HTTP/2 上。nginx 的 listen 不提供 h2 时,
+        # 客户端带 h2 进来而 nginx 只答 http/1.1, TLS 握手直接失败
+        # (no application protocol) —— nginx 自身不报错, 只是静默不通。
+        # 这里只做只读检查如实回报, 绝不替用户改他站点的 server 块。
+        if not os.path.isfile(path):
+            print("MISSING"); return 3
+        with open(path, "rb") as fh:
+            lines = decode(fh.read()).splitlines()
+        start, end = find_server_block_span(lines, args.domain)
+        if start < 0:
+            print("NOBLOCK"); return 3
+        body = "\n".join(lines[start:end + 1])
+        # 两种写法都算开: 老写法 listen 443 ssl http2;
+        # nginx >= 1.25.1 的新写法 http2 on;
+        has_new = re.search(r"^\s*http2\s+on\s*;", body, re.M) is not None
+        has_old = re.search(r"listen[^;]*\bhttp2\b", body, re.I) is not None
+        print("ON" if (has_new or has_old) else "OFF")
+        return 0
     # 片段过期检测。
     # 本脚本只负责"把片段贴进去", 不负责生成片段 —— 所以完全可能拿着上一次
     # 生成的旧片段来执行, 结果插进去的 proxy_pass 指向已经不存在的端口,

@@ -66,15 +66,35 @@ ask_cert() {  # 输出三种: CERT_FILE+KEY_FILE (TLS) / REALITY_ENV (Reality = 
 add_config() {
     print_title "新增 Trojan 节点 ($PROTO-NN.json)"
     local listen_ip listen_port password file tag idx
-    listen_ip=$(ask_listen_addr)
     listen_port=$(safe_read_port)
     password=$(openssl rand -base64 18 | tr -d '/+=' | head -c 20)
+    # Trojan 与 VLESS/VMess 一样带 transport 字段 (只有这两个协议和三者的
+    # 兄弟 VMess 有), 之前完全没做传输选项, 等于把这一个维度整个漏掉了。
+    sb_ask_transport
     ask_cert || return 1
+    [[ -z "$TR_HOST" ]] && TR_HOST="$CERT_DOMAIN"
+
+    # REALITY 与 CDN 互斥: REALITY 走的是端到端握手, Cloudflare 在边缘就终止
+    # 了 TLS, 中间插一层代理必然失败。所以 Reality 变体强制直连。
+    local trusted="no" ACCESS_MODE="direct"
+    if [[ "${TLS_TYPE:-}" != "reality" ]]; then
+        sb_key_for "$CERT_FILE" >/dev/null 2>&1 && \
+            cert_not_expired "$CERT_FILE" && \
+            sb_cert_is_real_issuer "$CERT_FILE" && trusted="yes"
+        ask_access_mode "$TR_TYPE" "$trusted"
+        case "$ACCESS_MODE" in
+            cdn)        listen_ip="0.0.0.0" ;;
+            cdn-nginx)  listen_ip="127.0.0.1" ;;
+            *)          listen_ip=$(ask_listen_addr) ;;
+        esac
+    fi
+    # REALITY 变体没被上面覆盖到 —— 它强制直连, 监听地址仍需询问
+    [[ -n "$listen_ip" ]] || listen_ip=$(ask_listen_addr)
 
     idx=$(get_next_index "$PROTO"); file="$SB_CONFIG_DIR/$PROTO-$idx.json"; tag="${PROTO}${idx}"
     # ask_cert 已决定: TLS_TYPE=reality 还是 selfsign/real —— 名字体现传输方式
     [[ "${TLS_TYPE:-}" == "reality" ]] && tag="$tag$(tag_form_suffix reality)" || tag="$tag$(tag_form_suffix tls)"
-    local json
+    local json tr_json tr_line=""
     if [[ "${TLS_TYPE:-}" == "reality" ]]; then
         json=$(cat <<EOF
 {
@@ -101,6 +121,11 @@ add_config() {
 EOF
 )
     else
+    # 裸 TCP: sing-box 里没有 "type":"tcp", 必须整个省略 transport 字段
+    tr_json=$(sb_transport_json_server "$TR_TYPE" "$TR_PATH" "$TR_SVC" "$TR_HOST")
+    # 注意 sb_transport_json_server 返回的是**值**, "transport" 这个键要在这里补上
+    [[ -n "$tr_json" ]] && tr_line="      \"transport\": $tr_json,
+"
     json=$(cat <<EOF
 {
   "inbounds": [
@@ -110,7 +135,7 @@ EOF
       "listen": "$listen_ip",
       "listen_port": $listen_port,
       "users": [ { "name": "user", "password": "$password" } ],
-      "tls": { "enabled": true, "alpn": ["http/1.1"], "certificate_path": "$CERT_FILE", "key_path": "$KEY_FILE" }
+$tr_line      "tls": { "enabled": true, "alpn": $(sb_transport_alpn "$TR_TYPE"), "certificate_path": "$CERT_FILE", "key_path": "$KEY_FILE" }
     }
   ]
 }
@@ -135,19 +160,29 @@ EOF
     if [[ "$mode_tls" == "reality" ]]; then
         link="trojan://$password@$server_ip:$listen_port?sni=$CERT_DOMAIN&security=reality&pbk=$T_RE_PUB&sid=$T_RE_SID&type=tcp#$tag"
     else
-        link="trojan://$password@$server_ip:$listen_port?sni=$CERT_DOMAIN&alpn=http/1.1${pin:+&pinSHA256=$pin}#$tag"
+        # alpn 必须跟着传输走: grpc / http(H2) 要 h2, 写死 http/1.1 会
+        # 让客户端在 TLS 握手时与需要 h2 的服务端协商失败。
+        local link_alpn; link_alpn=$(sb_transport_alpn "$TR_TYPE" | tr -d '[]"')
+        link="trojan://$password@$server_ip:$listen_port?sni=$CERT_DOMAIN&alpn=$link_alpn${pin:+&pinSHA256=$pin}$(sb_transport_link_params "$TR_TYPE" "$TR_PATH" "$TR_SVC" "$TR_HOST")#$tag"
     fi
     local utls_fp; utls_fp=$(ask_utls_fingerprint)
-    python3 - "$utls_fp" "$SB_OUT_DIR/sb_client-$tag.json" "$tag" "$server_ip" "$listen_port" "$password" "$CERT_DOMAIN" "$pin" "$mode_tls" "${T_RE_PUB-}" "${T_RE_SID-}" <<'PYGEN'
+    local ctr_json ctr_sep="" alpn_json
+    ctr_json=$(sb_transport_json_client "$TR_TYPE" "$TR_PATH" "$TR_SVC" "$TR_HOST")
+    [[ -n "$ctr_json" ]] && ctr_sep=","
+    alpn_json=$(sb_transport_alpn "$TR_TYPE")
+    python3 - "$utls_fp" "$SB_OUT_DIR/sb_client-$tag.json" "$tag" "$server_ip" "$listen_port" "$password" "$CERT_DOMAIN" "$pin" "$mode_tls" "${T_RE_PUB-}" "${T_RE_SID-}" "$ctr_json" "$alpn_json" <<'PYGEN'
 import json,sys
-_,fp,ofile,tag,srv,port,pw,sni,pin,mtype,pub,sid=sys.argv
-tls={"enabled":True,"server_name":sni,
+_,fp,ofile,tag,srv,port,pw,sni,pin,mtype,pub,sid,tr_json,alpn=sys.argv
+tls={"enabled":True,"server_name":sni,"alpn":json.loads(alpn),
      "utls":{"enabled":True,"fingerprint":fp}}
 if pin: tls["certificate_public_key_sha256"]=pin
 out={"type":"trojan","tag":tag,"server":srv,"server_port":int(port),"password":pw,"tls":tls}
 if pub and sid:
     # reality: 不需要 certificate, 信任来自 REALITY 密钥对 (sing-box 1.14 OutboundRealityOptions)
     out["tls"]["reality"]={"enabled":True,"public_key":pub,"short_id":sid}
+elif tr_json:
+    # 裸 TCP 不加 transport 字段 —— sing-box 里没有 "tcp" 这个类型
+    out["transport"]=json.loads(tr_json)
 json.dump({"outbounds":[out]},open(ofile,"w"),indent=2)
 PYGEN
         gen_mihomo_yaml "$tag"
@@ -172,11 +207,14 @@ list_configs() {
     print_title "$PROTO 配置"
     for f in "$SB_CONFIG_DIR"/$PROTO-*.json; do
         [[ -f "$f" ]] || continue
-        local idx tag port pw
+        local idx tag port pw ttype detail
         idx=$(basename "$f" .json | cut -d'-' -f2); tag="${PROTO}${idx}"
         port=$(jq -r '.inbounds[0].listen_port' "$f")
         pw=$(jq -r '.inbounds[0].users[0].password' "$f")
-        printf "%s) 端口:%s\n" "$idx" "$port" >&2
+        # 裸 TCP 没有 transport 字段, .transport.path 取到 null —— 显示 "tcp"
+        ttype=$(jq -r '.inbounds[0].transport.type // "tcp"' "$f")
+        detail=$(jq -r '.inbounds[0].transport.path // .inbounds[0].transport.service_name // "-"' "$f")
+        printf "%s) 端口:%s  传输:%s  %s\n" "$idx" "$port" "$ttype" "$detail" >&2
     done
 }
 
