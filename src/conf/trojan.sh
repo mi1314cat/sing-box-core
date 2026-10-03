@@ -24,7 +24,7 @@ ask_cert() {  # 输出三种: CERT_FILE+KEY_FILE (TLS) / REALITY_ENV (Reality = 
     local c
     # 预置方案指定 Reality 时默认落在 3, 一路回车才是真正的一键生成。
     local def=2 def_hint=""
-    if [[ -n "${SB_PRESET_TR:-}" || -n "${SB_PRESET_FLOW:-}" ]]; then def=3; def_hint=" (预置方案指定 Reality)"; fi
+    if [[ "${SB_PRESET_CERT:-}" == "reality" ]]; then def=3; def_hint=" (预置方案指定 Reality)"; fi
     if [[ "${SB_FORCE_TLS_REALTY:-}" == "1" ]]; then c=3
     else
         echo -e "    ${MAGENTA}${def_hint}${RESET}" >&2
@@ -74,12 +74,14 @@ add_config() {
     password=$(openssl rand -base64 18 | tr -d '/+=' | head -c 20)
     # Trojan 与 VLESS/VMess 一样带 transport 字段 (只有这两个协议和三者的
     # 兄弟 VMess 有), 之前完全没做传输选项, 等于把这一个维度整个漏掉了。
-    # Reality 预置方案: 同时决定传输层与流控, 排在传输提问之前,
+    # 预置方案: 同时决定传输层/流控/证书, 排在传输提问之前,
     # 后面的默认值和互斥拦截才拿得到决定权。
-    SB_PRESET_PROTO="trojan"; sb_ask_reality_preset
+    sb_ask_preset trojan "Reality 预置方案"
     SB_PRESET_TR_HINT=$(sb_preset_transport_hint)
     sb_ask_transport
+    sb_warn_reality_transport "$TR_TYPE"
     ask_cert || return 1
+    sb_warn_reality_transport "$TR_TYPE" "${TLS_TYPE:-}"
     [[ -z "$TR_HOST" ]] && TR_HOST="$CERT_DOMAIN"
 
     # REALITY 与 CDN 互斥: REALITY 走的是端到端握手, Cloudflare 在边缘就终止

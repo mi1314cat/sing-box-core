@@ -64,7 +64,10 @@ ask_cert() {  # 输出 CERT_FILE/KEY_FILE/CERT_DOMAIN/CERT_TRUSTED, 或 TLS_TYPE
     else
         # 批量生成 Reality 变体时由 batch 显式指定 (见 batch.sh 注释);
         # 只替换交互输入, 复用下方原有 Reality 分支
-        read -r -p "选择: " c; c=$(clean_input "$c"); [[ -z "$c" ]] && c=2
+        local adef=2 ahint=""
+        if [[ "${SB_PRESET_CERT:-}" == "reality" ]]; then adef=3; ahint=" (预置方案指定 Reality)"; fi
+        [[ -n "$ahint" ]] && echo -e "    ${MAGENTA}${ahint}${RESET}" >&2
+        read -r -p "选择 (回车=${adef}): " c; c=$(clean_input "$c"); [[ -z "$c" ]] && c=$adef
     fi
     # 覆盖放在 if/else 外面: 之前写在 else 里, 批量路径压根不经过, 于是
     # ③ 选了真证书, anytls 出来的还是自签。
@@ -153,6 +156,7 @@ add_config() {
     local listen_ip listen_port password file tag idx server_ip pin=""
     listen_ip=$(ask_listen_addr)
     listen_port=$(safe_read_port)
+    sb_ask_preset anytls "TLS 预置方案"
     password=$(openssl rand -base64 18 | tr -d '/+=\n' | head -c 24)
     ask_cert || return 1
     ask_anytls_padding || return 1

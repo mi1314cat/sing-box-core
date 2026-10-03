@@ -118,7 +118,22 @@ def conv(ob, certdir):
     need_tls = bool(tls.get("enabled"))
     if need_tls:
         d["tls"] = True
-        if sni: d["sni"] = sni   # mihomo 的字段是 sni (servername 是 sing-box 的叫法)
+        if sni:
+            if reality.get("enabled"):
+                # Reality 节点两个字段都要写, 各协议认的不一样 (实测矩阵,
+                # 同一批 sing-box 服务端节点, 同一套凭据, 只换字段名):
+                #            sni   servername   sni+servername
+                #   vless    ✗        ✓ 3/3         ✓ 3/3
+                #   vmess    ✗        ✓ 3/3         ✓ 3/3
+                #   trojan   ✓ 3/3    ✗            ✓ 3/3
+                # mihomo 的 vless/vmess Reality 只读 servername: 只给 sni 时它
+                # 当普通 TLS 直连, Reality 握手压根不发, 服务端收到一个不带
+                # SNI 的 ClientHello, 回 TLS alert unrecognized_name。
+                # trojan 那边反过来, 只认 sni。写全最省事, 副作用为零。
+                d["sni"] = sni
+                d["servername"] = sni
+            else:
+                d["sni"] = sni
         if alpn: d["alpn"] = list(alpn)
         if tls.get("insecure"): d["skip-cert-verify"] = True
         if fp: d["client-fingerprint"] = fp
