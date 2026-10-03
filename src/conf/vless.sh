@@ -32,9 +32,10 @@ ask_cert() {
     # 预置方案本身就叫 "Reality 预置", 所以默认落在 3 而不是自签 ——
     # 一路回车才是名副其实的"一键生成"。
     local cert_def=2 cert_hint=""
-    if [[ "${SB_PRESET_CERT:-}" == "reality" ]]; then
-        cert_def=3; cert_hint=" (预置方案指定 Reality)"
-    fi
+    case "${SB_PRESET_CERT:-}" in
+        reality)  cert_def=3; cert_hint=" (预置方案指定 Reality)" ;;
+        selfsign) cert_def=2; cert_hint=" (预置方案指定自签 + ECH)" ;;
+    esac
     [[ -n "$cert_hint" ]] && echo -e "    ${MAGENTA}${cert_hint}${RESET}" >&2
     read -r -p "  选择 (回车=${cert_def}): " c
     c=$(clean_input "$c"); [[ -z "$c" ]] && c=$cert_def
@@ -135,9 +136,9 @@ add_config() {
     # Reality 变体的名字要带 -REALITY —— tag 会写进 inbound 和客户端产物,
     # 名字里能一眼看出这个节点是 Reality 才不会在管理界面里混淆。
     if [[ "${CERT_MODE:-}" == "reality" ]]; then
-        tag="$tag$(tag_form_suffix reality)"
+        tag="$tag$(tag_form_suffix reality "${SB_PRESET_TAG:-}")"
     else
-        tag="$tag$(tag_form_suffix tls)"
+        tag="$tag$(tag_form_suffix tls "${SB_PRESET_TAG:-}")"
     fi
     local tls_line alpn tr_json tr_line="" mux_line="" user_flow=""
     alpn=$(sb_transport_alpn "$TR_TYPE")

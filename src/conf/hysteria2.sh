@@ -154,7 +154,7 @@ add_config() {
 
     local idx file tag json
     idx=$(get_next_index "$PROTO")
-    file="$SB_CONFIG_DIR/$PROTO-$idx.json"; tag="${PROTO}${idx}-TLS"   # 名字体现传输方式
+    file="$SB_CONFIG_DIR/$PROTO-$idx.json"; tag="${PROTO}${idx}$(tag_form_suffix tls "${SB_PRESET_TAG:-}")"   # 名字体现方案
 
     local cert_paths_line
     cert_paths_line="\"certificate_path\": \"$CERT_FILE\", \"key_path\": \"$KEY_FILE\""

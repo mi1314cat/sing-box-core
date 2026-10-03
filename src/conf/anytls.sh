@@ -65,7 +65,10 @@ ask_cert() {  # 输出 CERT_FILE/KEY_FILE/CERT_DOMAIN/CERT_TRUSTED, 或 TLS_TYPE
         # 批量生成 Reality 变体时由 batch 显式指定 (见 batch.sh 注释);
         # 只替换交互输入, 复用下方原有 Reality 分支
         local adef=2 ahint=""
-        if [[ "${SB_PRESET_CERT:-}" == "reality" ]]; then adef=3; ahint=" (预置方案指定 Reality)"; fi
+        case "${SB_PRESET_CERT:-}" in
+            reality)  adef=3; ahint=" (预置方案指定 Reality)" ;;
+            selfsign) adef=2; ahint=" (预置方案指定自签 + ECH)" ;;
+        esac
         [[ -n "$ahint" ]] && echo -e "    ${MAGENTA}${ahint}${RESET}" >&2
         read -r -p "选择 (回车=${adef}): " c; c=$(clean_input "$c"); [[ -z "$c" ]] && c=$adef
     fi
@@ -128,8 +131,12 @@ ask_anytls_padding() {
     echo -e "    ${GREEN}2)${RESET} ${CYAN}显式写入默认方案${RESET}  行为与 1 相同, 但配置里看得见" >&2
     echo -e "    ${GREEN}3)${RESET} ${YELLOW}自定义${RESET}  每行一条规则, 格式见 stop=8 / 0=30-30" >&2
     local c
-    read -r -p "    请选择 [1-3, 回车=1]: " c || { echo; return 0; }
-    c=$(clean_input "$c"); [[ -z "$c" ]] && c=1
+    # 预置方案点名要 padding 时默认落在 2 (显式写入内置默认方案),
+    # 与传输/证书的处理方式一致: 只改默认值, 不绕过菜单。
+    local pdef=1
+    [[ "${SB_PRESET_PAD:-0}" == "1" ]] && pdef=2
+    read -r -p "    请选择 [1-3, 回车=${pdef}]: " c || { echo; return 0; }
+    c=$(clean_input "$c"); [[ -z "$c" ]] && c=$pdef
     case "$c" in
         2) AT_PADDING="$AT_PADDING_DEFAULT"; print_ok "padding_scheme: 内置默认 (显式写入)" ;;
         3)
@@ -163,7 +170,7 @@ add_config() {
 
     idx=$(get_next_index "$PROTO"); file="$SB_CONFIG_DIR/$PROTO-$idx.json"; tag="${PROTO}${idx}"
     # 名字体现传输方式: ask_cert 决定 reality 还是 TLS
-    [[ "${TLS_TYPE:-}" == "reality" ]] && tag="$tag$(tag_form_suffix reality)" || tag="$tag$(tag_form_suffix tls)"
+    [[ "${TLS_TYPE:-}" == "reality" ]] && tag="$tag$(tag_form_suffix reality "${SB_PRESET_TAG:-}")" || tag="$tag$(tag_form_suffix tls "${SB_PRESET_TAG:-}")"
     local json
     # padding_scheme 是字符串数组, sing-box 用 \n join -> 每行一个元素
     # padding_scheme: sing-box 用 "\n" join 数组元素 -> 每个元素必须正好是一行规则,
