@@ -34,13 +34,24 @@ add_config() {
         selfsign)    cdef=2; chint=" (预置方案指定自签 + 伪装域名)" ;;
     esac
     [[ -n "$chint" ]] && echo -e "    ${MAGENTA}${chint}${RESET}" >&2
-    read -r -p "选择 (回车=${cdef}): " c; c=$(clean_input "$c"); [[ -z "$c" ]] && c=$cdef
+    read -r -p "选择 (回车=${cdef}): " c; c=$(clean_input "$c"); [[ -z "$c" ]] && c="$cdef"
     sb_batch_tls_override 1 c
     if [[ "$c" == "1" ]]; then
-        read -r -p "crt: " CERT_FILE; read -r -p "KEY: " KEY_FILE
-        CERT_FILE=$(clean_input "$CERT_FILE"); KEY_FILE=$(clean_input "$KEY_FILE")
-        [[ -f "$CERT_FILE" && -f "$KEY_FILE" ]] || { print_error "路径无效"; return 1; }
-        CERT_DOMAIN=$(extract_cert_domain "$CERT_FILE"); CERT_TRUSTED=true
+        # 批量时证书路径由 batch 的②统一选好了 (SB_BATCH_CERT_CRT/KEY/DOMAIN),
+        # 必须从这里读 —— 下面那两行 read 在批量下读到的是空值, 于是必然
+        # "[Error] 路径无效"。这个分支以前只调了 sb_batch_tls_override (把 c
+        # 改成 1) 却没调 sb_apply_batch_cert, 于是"批量选真证书 -> naive 建不出
+        # 来", 而其他协议 (vless/vmess/trojan/tuic/hysteria2/anytls) 都调了。
+        # sb_apply_batch_cert 在指定证书不可用时会自己退回自签并填好 CERT_*。
+        if [[ -n "${SB_BATCH:-}" ]]; then
+            sb_apply_batch_cert || { print_error "证书不可用, naive 节点未创建"; return 1; }
+            [[ -f "$CERT_FILE" && -f "$KEY_FILE" ]] || { print_error "证书不可用, naive 节点未创建"; return 1; }
+        else
+            read -r -p "crt: " CERT_FILE; read -r -p "KEY: " KEY_FILE
+            CERT_FILE=$(clean_input "$CERT_FILE"); KEY_FILE=$(clean_input "$KEY_FILE")
+            [[ -f "$CERT_FILE" && -f "$KEY_FILE" ]] || { print_error "路径无效"; return 1; }
+            CERT_DOMAIN=$(extract_cert_domain "$CERT_FILE"); CERT_TRUSTED=true
+        fi
     else
         local d; d=$(safe_read "自签伪装域名 (domains.sh)" "$(random_domain)")
         mkdir -p "$CERT_DIR"
