@@ -49,6 +49,7 @@ add_config() {
     listen_port=$(safe_read_port "8443")
     uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen)
     password=$(openssl rand -hex 16)
+    sb_ask_preset tuic "推荐配置"
     ask_cert || return 1
     local congestion
     congestion=$(safe_read "拥塞控制 (bbr/cubic/new-reno)" "bbr")

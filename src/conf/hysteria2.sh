@@ -142,6 +142,7 @@ add_config() {
         fi
     fi
 
+    sb_ask_preset hysteria2 "推荐配置"
     ask_cert || return 1
     local password="" mask="none"
     read -r -p "是否启用 obfs 混淆? [y/N]: " oyn

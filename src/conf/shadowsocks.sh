@@ -12,6 +12,7 @@ add_config() {
     local listen_ip listen_port idx file tag json method key
     listen_ip=$(ask_listen_addr)
     listen_port=$(safe_read_port)
+    sb_ask_preset shadowsocks "multiplex 预置方案"
     # 默认算法按 CPU 架构自动选最优: x86/AMD64 AES-NI -> aes-128-gcm; ARM 无 AES 硬件 -> chacha20
     local arch; arch=armv6
     [[ "x86" == "$arch" ]] && true

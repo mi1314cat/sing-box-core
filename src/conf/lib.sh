@@ -1249,60 +1249,135 @@ sb_flow_json_user() { # 服务端 inbound users[] 需要 flow
 #
 # 优先级: 隐蔽性 > 兼容性。默认项绝对不能是 CDN/ECH 相关的, 那些要在
 # 完整菜单里自己选。
-SB_REALITY_PRESETS=(
-    "vision|① 隐匿优先|tcp|off|xtls-rprx-vision|抗 DPI 最强, 无任何 Web 特征; 大流量最快"
-    "vision+ws|② 隐匿+伪装流量|ws|video||套一层正常 WS 流量, 需要与网页同形时用"
-    "ws+mux|③ 伪装+高并发|ws|download||多路复用扛并发, 适合爬虫/大量小请求"
-    "grpc+mux|④ gRPC 伪装|grpc|download||需要后端 gRPC 网关, Cloudflare 面板要开开关"
+# ══════════════ 全协议预置方案 ══════════════
+# 一条一行, 字段顺序固定:
+#   <协议>|<id>|<显示名>|<传输>|<mux档位>|<flow>|<证书模式>|<说明>
+#   - 传输 写 tcp 表示"裸TCP"(不是空 —— 空会和"没选预设"分不开)
+#   - mux档位 写 off 表示不��多路复用; 档位用**英文 id**, 因为
+#     SB_MUX_TIER_ORDER / sb_mux_tier_get 都以英文 id 为键
+#   - flow 只有 vless 有 (sing-box 的 trojan/vmess outbound 里没有 flow 字段)
+#   - 证书模式 reality = 该预置强制走 Reality
+#
+# 传输的选型不是拍脑袋, 是按"两个内核都实测跑通"挑的。mihomo 跑
+# sing-box 服务端的 Reality 时, 传输层兼容性实测 (同批节点, 同套凭据):
+#   裸TCP ✓ 3/3    gRPC ✓ 3/3    HTTP/2 ✓ 3/3    WebSocket ✗ 0/3
+# WebSocket 那条是 mihomo 侧的问题 —— sing-box 客户端连同一个节点 3/3 全通,
+# mihomo 稳定回 404/400。所以 Reality 预置里一律不排 ws。
+# (fscarmen 脚本的 Reality 节点表也是 h2 和 grpc, 从来不用 ws。)
+SB_PRESETS=(
+    # ── vless: 唯一能上 XTLS Vision 的协议 ──
+    "vless|tcp-vision|① 隐匿优先 (抗 DPI 最强)|tcp|off|xtls-rprx-vision|reality|裸TCP + XTLS Vision; 无任何 Web 特征, 大流量最快"
+    "vless|grpc-video|② gRPC 伪装 (通用)|grpc|video||reality|gRPC 套一层正常 HTTP/2 流量; 两个内核都验证过"
+    "vless|grpc-dl|③ gRPC + 高并发|grpc|download||reality|多路复用扛并发, 适合爬虫/大量小请求"
+    "vless|h2-video|④ HTTP/2 伪装|h2|video||reality|HTTP/2 传输, 对 CDN 面板最友好的形状"
+    # ── vmess / trojan: 与 vless 同构, 只是没有 flow ──
+    "vmess|tcp-video|① 隐匿优先 (抗 DPI 最强)|tcp|video||reality|裸TCP, 不带任何 Web 特征"
+    "vmess|grpc-video|② gRPC 伪装 (通用)|grpc|video||reality|gRPC 套一层正常 HTTP/2 流量"
+    "vmess|grpc-dl|③ gRPC + 高并发|grpc|download||reality|多路复用扛并发"
+    "vmess|h2-video|④ HTTP/2 伪装|h2|video||reality|HTTP/2 传输"
+    "trojan|tcp-video|① 隐匿优先 (抗 DPI 最强)|tcp|video||reality|裸TCP, 不带任何 Web 特征"
+    "trojan|grpc-video|② gRPC 伪装 (通用)|grpc|video||reality|gRPC 套一层正常 HTTP/2 流量"
+    "trojan|grpc-dl|③ gRPC + 高并发|grpc|download||reality|多路复用扛并发"
+    "trojan|h2-video|④ HTTP/2 伪装|h2|video||reality|HTTP/2 传输"
+    # ── anytls: 无传输层/无 mux, 只有 TLS 模式可选 ──
+    "anytls|reality|① Reality 直连|无|无||reality|Reality 免证书; AnyTLS 本身已带一层 TLS 伪装"
+    "anytls|reality-pad|② Reality + 内核默认 padding|无|无|pad|reality|开 padding; AnyTLS 的 idle 三项是客户端专用, 服务端侧只有 padding"
+    # ── shadowsocks: 无 TLS/无传输, 只有一个 mux 档位可选 ──
+    "shadowsocks|ss-web|① 网页党 (省资源)|无|web||无|网页浏览; 单连接流数压到 1, 内存占用最低"
+    "shadowsocks|ss-video|② 视频党 (均衡)|无|video||无|默认档; 看视频 + 日常网页都够用"
+    "shadowsocks|ss-dl|③ 下载党 (高吞吐)|无|download||无|大文件/长连接; 单连接多流并行"
+    # ── hysteria2 / tuic: 本身已是 UDP + 自带拥塞控制, 没有可选配 ──
+    "hysteria2|h2-default|① 推荐默认|无|无||真证书|Hysteria2 参数已是最优默认 (BBR + Salamander), 无需选配"
+    "tuic|tuic-default|① 推荐默认|无|无||真证书|TUIC 参数已是最优默认 (BBR + Salamander), 无需选配"
 )
 
-sb_reality_preset_get() { # <preset id> -> stdout: "<传输> <mux档位> <flow>"
-    local want="$1" row rest
-    for row in "${SB_REALITY_PRESETS[@]}"; do
+# <协议> 的预置行数
+sb_preset_count() {
+    local p="$1" n=0 row
+    for row in "${SB_PRESETS[@]}"; do [[ "${row%%|*}" == "$p" ]] && ((n++)); done
+    printf '%s' "$n"
+}
+
+# <协议> <第几行(1起)> -> stdout: "<传输> <mux档位> <flow> <证书模式>"
+sb_preset_get() {
+    local want="$1" idx="$2" i=1 row rest
+    for row in "${SB_PRESETS[@]}"; do
         [[ "${row%%|*}" == "$want" ]] || continue
-        rest="${row#*|}"; rest="${rest#*|}"
-        printf '%s' "$rest" | cut -d'|' -f1,2,3 | tr '|' ' '
-        return 0
+        if (( i == idx )); then
+            # 逐列剥: 协议|id|显示名|传输|mux|flow|证书|说明
+            rest="${row#*|}"; rest="${rest#*|}"; rest="${rest#*|}"
+            printf '%s' "$rest" | cut -d'|' -f1-4 | tr '|' ' '
+            return 0
+        fi
+        ((i++))
     done
     return 1
 }
 
-# 一键套用预置方案。设 SB_PRESET_TR / SB_PRESET_MUX / SB_PRESET_FLOW,
-# 由各协议脚本在正常提问流程里读取 —— 不绕过菜单, 只是把答案预填上,
-# 用户仍然可以在后续提示里改回来。
-sb_ask_reality_preset() {
-    if [[ -n "${SB_BATCH:-}" ]]; then
-        SB_PRESET_TR=""; SB_PRESET_MUX=""; SB_PRESET_FLOW=""
-        return 0
-    fi
-    print_title "Reality 预置方案 (不想选就一路回车, 逐项自己配)"
+# 预置方案菜单。不绕过提问 —— 只是把答案预填成默认值, 用户在后续
+# 每一步仍能改回去。设 SB_PRESET_TR / SB_PRESET_MUX / SB_PRESET_FLOW /
+# SB_PRESET_CERT, 各协议脚本在正常流程里读取。
+sb_ask_preset() { # <协议> [菜单标题]
+    local proto="$1" title="${2:-预置方案}"
+    SB_PRESET_TR=""; SB_PRESET_MUX=""; SB_PRESET_FLOW=""; SB_PRESET_CERT=""
+    if [[ -n "${SB_BATCH:-}" ]]; then return 0; fi
+    local n; n=$(sb_preset_count "$proto")
+    (( n == 0 )) && return 0
+    print_title "${title} (不想选就一路回车, 逐项自己配)"
     local i=1 row
-    for row in "${SB_REALITY_PRESETS[@]}"; do
-        printf '    %s%s)%s %-22s %s\n' \
-            "$CYAN" "$i" "$RESET" "$(echo "$row" | cut -d'|' -f2)" \
-            "$(echo "$row" | cut -d'|' -f6)" >&2
+    for row in "${SB_PRESETS[@]}"; do
+        [[ "${row%%|*}" == "$proto" ]] || continue
+        printf '    %s%s)%s %-26s %s\n' "$CYAN" "$i" "$RESET" \
+            "$(echo "$row" | cut -d'|' -f3)" "$(echo "$row" | cut -d'|' -f8)" >&2
         ((i++))
     done
     printf '    %s%s)%s 不用预设, 我自己逐项配%s\n' "$CYAN" "$((i))" "$RESET" \
         "${DIM:-}(回答每一个问题)${RESET}" >&2
     local c; c=$(safe_read "选择" "1")
-    SB_PRESET_TR=""; SB_PRESET_MUX=""; SB_PRESET_FLOW=""
-    if [[ "$c" =~ ^[0-9]+$ ]] && (( c >= 1 && c <= ${#SB_REALITY_PRESETS[@]} )); then
-        local pid; pid=$(echo "${SB_REALITY_PRESETS[$((c-1))]}" | cut -d'|' -f1)
-        local tr mux flow
-        read -r tr mux flow <<< "$(sb_reality_preset_get "$pid")"
-        # 裸 TCP 必须留成显式的 "tcp" 而不是清空 —— 清空后与"用户没选预设"
+    if [[ "$c" =~ ^[0-9]+$ ]] && (( c >= 1 && c <= n )); then
+        local tr mux flow cert row_get
+        # 不能用 read 拆: 表里空字段是 "| |" 这种连续分隔符, 而 read 按 IFS
+        # 折叠连续空白 —— 空列会被整个吞掉, 后面所有字段左移一位
+        # (曾导致 vmess/trojan/anytls 把 "reality" 读成 flow, CERT 永远空,
+        #  于是证书菜单回落到自签)。逐列按位置取最稳。
+        row_get=$(sb_preset_get "$proto" "$c")
+        tr=$(printf '%s' "$row_get"   | cut -d' ' -f1)
+        mux=$(printf '%s' "$row_get"  | cut -d' ' -f2)
+        flow=$(printf '%s' "$row_get" | cut -d' ' -f3)
+        cert=$(printf '%s' "$row_get" | cut -d' ' -f4)
+        SB_PRESET_TR=""; SB_PRESET_MUX=""; SB_PRESET_FLOW=""; SB_PRESET_CERT=""
+        # "无" 是占位符, 表示该协议没有这个维度
+        [[ "$tr"  == "无" ]] && tr=""
+        [[ "$flow" == "无" ]] && flow=""
+        [[ "$cert" == "无" ]] && cert=""
+        [[ "$mux"  == "无" ]] && mux=""
+        # 裸 TCP 留成显式的 "tcp" 而不是清空 —— 清空后与"用户没选预设"
         # 无法区分, 于是传输菜单回落到默认 ws, 预置①的抗 DPI 定位就没了。
-        [[ "$tr" == "裸TCP" ]] && tr="tcp"
-        # vision 是 VLESS 独有 —— 非 vless 协议直接剥掉, 不让用户以为
-        # 选了①就一定带流控。传输和 mux 两项所有 Reality 协议通用。
-        [[ -n "${SB_PRESET_PROTO:-}" && "${SB_PRESET_PROTO}" != "vless" ]] && flow=""
-        SB_PRESET_TR="$tr"; SB_PRESET_MUX="$mux"; SB_PRESET_FLOW="$flow"
+        SB_PRESET_TR="$tr"; SB_PRESET_MUX="$mux"; SB_PRESET_FLOW="$flow"; SB_PRESET_CERT="$cert"
         [[ "$mux" == "off" ]] && SB_PRESET_MUX=""
-        print_ok "预置方案: $(echo "${SB_REALITY_PRESETS[$((c-1))]}" | cut -d'|' -f2,6 | tr '|' ' ')"
+        print_ok "预置方案: $(echo "${SB_PRESETS[@]}" | grep "^${proto}|" | sed -n "${c}p" | cut -d'|' -f3)"
         print_info "下面仍会逐项确认, 想改直接选别的即可"
     fi
     return 0
+}
+
+# Reality + WebSocket 在 mihomo 上跑不通 (见 SB_PRESETS 上方实测表),
+# 用户手工选到这个组合时提醒一句, 免得建完才发现 M 内核用不了。
+# 传输提问排在证书提问**前面** (传输层的选项里有 ws/grpc/http/httpupgrade,
+# 裸TCP 不走 CDN), 所以这里不能读 CERT_MODE, 只能按"预置或后续大概率会选
+# Reality"来判断: 预置里出现了 reality 就提醒; 非预置场景留到 cert 之后
+# 由调用方用 CERT_MODE 再确认一次。
+sb_warn_reality_transport() { # <传输类型> [是否已确定走 Reality]
+    local tr="$1" reality="${2:-}"
+    if [[ -z "$reality" ]]; then
+        [[ "${SB_PRESET_CERT:-}" == "reality" ]] || return 0
+    else
+        [[ "$reality" == "reality" ]] || return 0
+    fi
+    case "$tr" in
+        ws|1) print_warn "Reality + WebSocket 在 mihomo 上连不通 (实测 0/3, sing-box 客户端 3/3 正常)"
+              print_info "要用 M 内核请改选 gRPC 或 HTTP/2, 这两个实测都能通" ;;
+    esac
 }
 
 # 预置方案 → sb_ask_transport 的答案。空表示用默认。

@@ -32,7 +32,7 @@ ask_tls() { # 输出: CERT_MODE|cert_file|key_file|cert_domain|trusted(0|1) 到 
     local c
     # 预置方案指定 Reality 时默认落在 4, 一路回车才是真正的一键生成。
     local def=1 def_hint=""
-    if [[ -n "${SB_PRESET_TR:-}" || -n "${SB_PRESET_FLOW:-}" ]]; then def=4; def_hint=" (预置方案指定 Reality)"; fi
+    if [[ "${SB_PRESET_CERT:-}" == "reality" ]]; then def=4; def_hint=" (预置方案指定 Reality)"; fi
     if [[ "${SB_FORCE_TLS_REALTY:-}" == "1" ]]; then c=4
     else
         echo -e "    ${MAGENTA}${def_hint}${RESET}" >&2
@@ -72,11 +72,12 @@ add_config() {
     # Trojan 共用同一份实现 —— 之前 vmess 自带一套菜单, 少 httpupgrade,
     # 而且 4) tcp裸 靠 ttype="" 隐式表达, 新人很容易读成"应该写 type:tcp"。
     local ttype tpath svc
-    # Reality 预置方案: 同时决定传输层与流控, 排在传输提问之前,
+    # 预置方案: 同时决定传输层/流控/证书, 排在传输提问之前,
     # 后面的默认值和互斥拦截才拿得到决定权。
-    SB_PRESET_PROTO="vmess"; sb_ask_reality_preset
+    sb_ask_preset vmess "Reality 预置方案"
     SB_PRESET_TR_HINT=$(sb_preset_transport_hint)
     sb_ask_transport
+    sb_warn_reality_transport "$TR_TYPE"
     ttype="$TR_TYPE"; tpath="$TR_PATH"; svc="$TR_SVC"
 
     # 不用 read 解析: batch 模式会重定义 read 并无视 herestring (旧写法导致
@@ -85,6 +86,7 @@ add_config() {
     CERT_MODE="${_tls%%|*}"; _tls="${_tls#*|}"
     CERT_FILE="${_tls%%|*}"; _tls="${_tls#*|}"
     KEY_FILE="${_tls%%|*}";  CERT_DOMAIN="${_tls#*|}"
+    sb_warn_reality_transport "$TR_TYPE" "$CERT_MODE"
     # http 传输的 host 用证书域名 —— sing-box 用它做 Host 校验,
     # 不设会退化成 Host: www.example.com 并被自己的服务端拒掉 (bad host)
     [[ -z "$TR_HOST" ]] && TR_HOST="$CERT_DOMAIN"

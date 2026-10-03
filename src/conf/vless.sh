@@ -32,7 +32,7 @@ ask_cert() {
     # 预置方案本身就叫 "Reality 预置", 所以默认落在 3 而不是自签 ——
     # 一路回车才是名副其实的"一键生成"。
     local cert_def=2 cert_hint=""
-    if [[ -n "${SB_PRESET_TR:-}" || -n "${SB_PRESET_FLOW:-}" ]]; then
+    if [[ "${SB_PRESET_CERT:-}" == "reality" ]]; then
         cert_def=3; cert_hint=" (预置方案指定 Reality)"
     fi
     [[ -n "$cert_hint" ]] && echo -e "    ${MAGENTA}${cert_hint}${RESET}" >&2
@@ -84,13 +84,15 @@ add_config() {
     server_ip=$(ask_server_addr)
     listen_port=$(safe_read_port)
     uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen)
-    # Reality 预置方案放在最前面: 它同时决定传输层和流控, 先问它, 后面
+    # 预置方案放在最前面: 它同时决定传输层/流控/证书, 先问它, 后面
     # 每一步才能给出正确的默认值 / 正确地关掉互斥项。
-    SB_PRESET_PROTO="vless"; sb_ask_reality_preset
+    sb_ask_preset vless "Reality 预置方案"
     # 传输先问: ws/grpc/http/httpupgrade 四种 HTTP 类传输都能走 CDN, 裸 TCP 不能。
     SB_PRESET_TR_HINT=$(sb_preset_transport_hint)
     sb_ask_transport
+    sb_warn_reality_transport "$TR_TYPE"
     ask_cert || return 1
+    sb_warn_reality_transport "${TR_TYPE:-}" "${CERT_MODE:-${TLS_TYPE:-}}"
     # http 传输的 host 用证书域名 —— sing-box 会拿它做 Host 校验
     [[ -z "$TR_HOST" ]] && TR_HOST="$CERT_DOMAIN"
 
@@ -217,7 +219,7 @@ EOF
         tls_cli="\"enabled\": true, \"server_name\": \"$CERT_DOMAIN\", \"utls\": { \"enabled\": true, \"fingerprint\": \"$utls_fp\" }, \"reality\": { \"enabled\": true, \"public_key\": \"$REAL_PUB\", \"short_id\": \"$REAL_SID\" }${frag_cli:+, $frag_cli}"
         link="vless://$uuid@$server_ip:$listen_port?encryption=none&security=reality&sni=$CERT_DOMAIN&fp=$utls_fp&pbk=$REAL_PUB&sid=$REAL_SID$link_params$flow_link$fr_link#$tag"
     else
-        tls_cli="\"enabled\": true, \"server_name\": \"$CERT_DOMAIN\", \"insecure\": $( [[ "$CERT_TRUSTED" == "true" ]] && echo false || echo true ), \"utls\": { \"enabled\": true, \"fingerprint\": \"$utls_fp\" }${ech_cli:+, $ech_cli}${frag_cli:+, $frag_cli} }"
+        tls_cli="\"enabled\": true, \"server_name\": \"$CERT_DOMAIN\", \"insecure\": $( [[ "$CERT_TRUSTED" == "true" ]] && echo false || echo true ), \"utls\": { \"enabled\": true, \"fingerprint\": \"$utls_fp\" }${ech_cli:+, $ech_cli}${frag_cli:+, $frag_cli}"
         link="vless://$uuid@$server_ip:$listen_port?encryption=none&security=tls&sni=$CERT_DOMAIN$link_params$mux_link$ech_link$fr_link#$tag"
     fi
     cat > "$SB_OUT_DIR/sb_client-$tag.json" <<EOF
