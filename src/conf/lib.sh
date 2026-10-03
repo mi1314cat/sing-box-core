@@ -814,6 +814,34 @@ sb_read_lines_json() { # <提示> -> stdout
 #     → 服务端 ech.key_path + 客户端 ech.config_path, 成对使用。
 #
 # 下面两个函数分别实现这两条路, 由 sb_ask_ech 按 ACCESS_MODE 分流。
+# URL 编码 (分享链接的 ech= 参数要用)
+sb_urlencode() {
+    local s="$1" i c out=""
+    for ((i = 0; i < ${#s}; i++)); do
+        c="${s:i:1}"
+        case "$c" in
+            [a-zA-Z0-9_.~-]) out+="$c" ;;
+            *) printf -v hex '%%%02X' "'$c"; out+="$hex" ;;
+        esac
+    done
+    printf '%s' "$out"
+}
+
+# CDN 模式 ECH 的分享链接参数 —— DNS 查询形式。
+#
+# 格式: <public_name>+<ECHConfigList 的 DNS 上游>
+# v2rayN / v2rayNG / edgetunnel 通用: 客户端看到这个参数就知道该去哪个 DNS
+# 查 HTTPS(65) 记录里的 ech= 字段, 用哪个 public_name 去伪装外层 SNI。
+# 之所以要带 public_name 显式声明: 客户端不能假设一定是 cloudflare-ech.com,
+# 换 CDN 厂商就是另一个名字。
+#
+# 注意这**不是**往链接里塞 base64 的 ECHCONFIGS —— 那种形式只有拿到我们
+# 自签密钥的场景才成立, CDN 模式下 Cloudflare 解不开, 塞进去反而会让
+# 支持该字段的客户端优先用它而失败。
+SB_ECH_PUBLIC_NAME="cloudflare-ech.com"
+SB_ECH_DNS_UPSTREAM="https://dns.alidns.com/dns-query"
+SB_ECH_QUERY_PARAM="${SB_ECH_PUBLIC_NAME}+${SB_ECH_DNS_UPSTREAM}"
+
 sb_ech_supported() {
     # 直连也支持了: 自己就是 TLS 终点, ECH 密钥由本机 sing-box 持有。
     # cdn / cdn-nginx → CDN ECH; direct → 直连 ECH。
@@ -947,12 +975,21 @@ sb_ech_json_client() {
     esac
 }
 
-# 分享链接参数。CDN 模式不需要带 ECHCONFIGS —— 客户端从 DNS 自己取,
-# 往链接里塞一大坨 base64 反而会让部分客户端解析失败。
+# 分享链接参数
+#   CDN 模式: 走 DNS 查询形式 (&ech=public_name+DNS上游), 客户端自取 Cloudflare 的 ECHConfigList
+#   直连模式: 带本机生成的 ECHCONFIGS (客户端无 DNS 可依赖时仍可用)
 sb_ech_link_params() {
-    [[ "${SB_ECH_ON:-0}" == "1" && "${SB_ECH_MODE:-}" == "direct" ]] || return 0
-    [[ -s "${SB_ECH_CONFIG_FILE:-}" ]] || return 0
-    printf '&ech=%s' "$(tr -d '\n' < "$SB_ECH_CONFIG_FILE" | grep -v -- "-----" )"
+    [[ "${SB_ECH_ON:-0}" == "1" ]] || return 0
+    case "${SB_ECH_MODE:-}" in
+        cdn)
+            [[ -n "${SB_ECH_DOMAIN:-}" ]] || return 0
+            printf '&ech=%s' "$(sb_urlencode "$SB_ECH_QUERY_PARAM")"
+            ;;
+        direct)
+            [[ -s "${SB_ECH_CONFIG_FILE:-}" ]] || return 0
+            printf '&ech=%s' "$(tr -d '\n' < "$SB_ECH_CONFIG_FILE" | grep -v -- "-----")"
+            ;;
+    esac
 }
 
 # ---------- CDN 站点片段清理 ----------
@@ -1091,6 +1128,58 @@ sb_brutal_available() {
 }
 
 # 该协议是否支持 multiplex
+# 多路复用档位 (web / video / download)
+#
+# 三个参数是内核的决策输入, 直接让用户填等于把内核逻辑丢给用户, 所以按
+# 使用场景给预设。数值语义 (引自内核 client.go 的 offer 逻辑):
+#   max_connections : 物理连接数上限
+#   min_streams     : 新建连接的流数门槛 (活跃流数 < 此值时复用, 不新建)
+#   max_streams     : 单连接流数容量 (max_connections>0 时不参与连接决策)
+#
+# 每行格式: <id>|<显示名>|<连接数>|<流起>|<单连接流数>|<说明>
+# id 用英文: 它同时是 SB_MUX_TIER_DEFAULT 和 SB_BATCH_MUX_PROFILE 的取值,
+# 显示名是中文 —— 两边混用会导致按 id 查档位永远查不到。
+SB_MUX_TIERS=(
+    "web|网页党|1|1|32|复用最大化, 单条连接扛住所有并发, 最省内存"
+    "video|视频党|2|2|16|多一条并行通道, 兼顾视频 + 网页"
+    "download|下载党|4|4|64|多物理连接, 为高吞吐和大文件"
+)
+
+# 默认档位: video (2/2/16)。单用途节点够用, 又不像网页档那样一条连接
+# 顶所有并发, 也不像下载档那样平白多占三条物理连接。
+SB_MUX_TIER_DEFAULT="video"
+
+# 复用协议: 三个档位统一用 h2mux。
+# mihomo 的 smux 块只支持 protocol: smux (内核限制), 这里不存在该约束,
+# h2mux 基于 HTTP/2 流, 在 sing-box 里延迟最低, 与 ws/grpc 这类 CDN 传输
+# 也最合拍; 要换 yamux/smux 走「自定义」。
+SB_MUX_TIER_PROTO="h2mux"
+
+# 菜单展示顺序 (英文 id)
+SB_MUX_TIER_ORDER=(web video download)
+
+sb_mux_tier_get() { # <档位id> -> stdout: "maxconn minstreams maxstreams"
+    local want="$1" row rest
+    for row in "${SB_MUX_TIERS[@]}"; do
+        [[ "${row%%|*}" == "$want" ]] || continue
+        # 剥掉 id 和显示名, 只留 连接数|流起|单连接流数
+        rest="${row#*|}"; rest="${rest#*|}"
+        printf '%s' "$rest" | cut -d'|' -f1,2,3 | tr '|' ' '
+        return 0
+    done
+    return 1
+}
+
+sb_mux_tier_name() { # <档位id> -> stdout: 中文显示名
+    local want="$1" row
+    for row in "${SB_MUX_TIERS[@]}"; do
+        [[ "${row%%|*}" == "$want" ]] || continue
+        printf '%s' "$row" | cut -d'|' -f2
+        return 0
+    done
+    return 1
+}
+
 sb_mux_supported() {
     case "${1:-}" in vless|vmess|trojan|shadowsocks) return 0 ;; *) return 1 ;; esac
 }
@@ -1116,43 +1205,70 @@ sb_ask_multiplex() { # <协议> <server|client>
             SB_MUX_DOWN="${SB_BATCH_DOWN_MBPS:-$SB_BRUTAL_DOWN_DEFAULT}"
             [[ "$SB_MUX_UP"  =~ ^[0-9]+$ && "$SB_MUX_UP"  -gt 0 ]] || SB_MUX_UP=$SB_BRUTAL_UP_DEFAULT
             [[ "$SB_MUX_DOWN" =~ ^[0-9]+$ && "$SB_MUX_DOWN" -gt 0 ]] || SB_MUX_DOWN=$SB_BRUTAL_DOWN_DEFAULT
-            SB_MUX_PROTO="${SB_BATCH_MUX_PROTO:-h2mux}"
-            SB_MUX_MAXCONN="${SB_BATCH_MUX_MAXCONN:-4}"
-            SB_MUX_MINSTR="${SB_BATCH_MUX_MINSTR:-4}"
-            SB_MUX_MAXSTR="${SB_BATCH_MUX_MAXSTR:-0}"
+            # 批量同样走档位, 默认与交互一致 (video)
+            local _mc _mn _ms
+            read -r _mc _mn _ms <<< "$(sb_mux_tier_get "${SB_BATCH_MUX_PROFILE:-$SB_MUX_TIER_DEFAULT}")"
+            SB_MUX_PROTO="${SB_BATCH_MUX_PROTO:-$SB_MUX_TIER_PROTO}"
+            SB_MUX_MAXCONN="${SB_BATCH_MUX_MAXCONN:-$_mc}"
+            SB_MUX_MINSTR="${SB_BATCH_MUX_MINSTR:-$_mn}"
+            SB_MUX_MAXSTR="${SB_BATCH_MUX_MAXSTR:-$_ms}"
         fi
         return 0
     fi
     sb_mux_supported "$proto" || return 0
 
-    echo >&2
+echo >&2
     echo -e "${CYAN}  多路复用 (multiplex)${RESET} ${CYAN}— 多个连接复用一条 TCP, 减少握手并改善高延迟链路${RESET}" >&2
     echo -e "    ${MAGENTA}(${proto} 支持; 开销: 多一次封装, CPU 略增, 单连接延迟会略升)${RESET}" >&2
-    echo -e "    ${GREEN}1)${RESET} 关闭 (推荐, 单用途节点更省)" >&2
-    echo -e "    ${GREEN}2)${RESET} 开启" >&2
-    local c
-    read -r -p "    请选择 [1-2, 回车=1]: " c || { echo; return 0; }
-    c=$(clean_input "$c"); [[ -z "$c" ]] && c=1
-    [[ "$c" == "2" ]] || return 0
+    local row i=1 tid tname mc mn ms note
+    for row in "${SB_MUX_TIERS[@]}"; do
+        IFS='|' read -r tid tname mc mn ms note <<< "$row"
+        printf "    ${GREEN}%d)${RESET} %s ${DIM}连接 %s / %s 流起 / 单连接 %s 流${RESET}  %s\n" \
+            "$((i+1))" "$tname" "$mc" "$mn" "$ms" "$note" >&2
+        i=$((i+1))
+    done
+    local custom_idx=$(( i + 1 ))
+    echo -e "    ${GREEN}${custom_idx})${RESET} 自定义  (自己选复用协议和三个参数)" >&2
+    # 默认档位跟随 SB_MUX_TIER_DEFAULT (video), 而不是"关闭" —— 用户明确要了
+    # 这个默认。提示里直接把它标出来, 免得看不出回车会发生什么。
+    local c default_idx default_pos default_name
+    # 菜单里档位从 2 开始编号 (1 是"关闭"), 所以菜单序号 = ORDER 位置 + 1
+    default_pos=$(printf '%s\n' "${SB_MUX_TIER_ORDER[@]}" | grep -n "^${SB_MUX_TIER_DEFAULT}$" | cut -d: -f1)
+    [[ -n "$default_pos" ]] || default_pos=2
+    default_idx=$(( default_pos + 1 ))
+    default_name=$(sb_mux_tier_name "$SB_MUX_TIER_DEFAULT")
+    read -r -p "    请选择 [1-${custom_idx}, 回车=${default_idx} (${default_name})]: " c || { echo; return 0; }
+    c=$(clean_input "$c"); [[ -z "$c" ]] && c="$default_idx"
+    [[ "$c" == "1" ]] && { print_info "multiplex: 关闭"; return 0; }
     SB_MUX_ON=1
 
-    if [[ "$side" == "client" ]]; then
-        # 只有出站有 protocol
-        echo -e "${CYAN}  复用协议${RESET}" >&2
-        echo -e "    ${GREEN}1)${RESET} ${YELLOW}h2mux${RESET}   基于 HTTP/2, 延迟最低, 与传输层无关" >&2
-        echo -e "    ${GREEN}2)${RESET} ${GREEN}yamux${RESET}   通用双工流, 与 HTTP/2 不兼容" >&2
-        echo -e "    ${GREEN}3)${RESET} ${CYAN}smux${RESET}    最省内存, 主要为 kcp-go 设计" >&2
-        local p
-        read -r -p "    请选择 [1-3, 回车=1]: " p || { echo; return 0; }
-        p=$(clean_input "$p"); [[ -z "$p" ]] && p=1
-        case "$p" in
-            2) SB_MUX_PROTO="yamux" ;;
-            3) SB_MUX_PROTO="smux" ;;
-            *) SB_MUX_PROTO="h2mux" ;;
-        esac
-        SB_MUX_MAXCONN=$(safe_read "最大连接数 (1-256, 0=不限)" "4")
-        SB_MUX_MINSTR=$(safe_read "最少复用流数 (过少会退化成独占)" "4")
-        SB_MUX_MAXSTR=$(safe_read "单连接最大流数 (0=不限)" "0")
+    if [[ "$c" == "$custom_idx" ]]; then
+        # 自定义: 沿用逐项询问
+        if [[ "$side" == "client" ]]; then
+            # 只有出站有 protocol
+            echo -e "${CYAN}  复用协议${RESET}" >&2
+            echo -e "    ${GREEN}1)${RESET} ${YELLOW}h2mux${RESET}   基于 HTTP/2, 延迟最低, 与传输无关" >&2
+            echo -e "    ${GREEN}2)${RESET} ${GREEN}yamux${RESET}   通用双工流, 与 HTTP/2 不兼容" >&2
+            echo -e "    ${GREEN}3)${RESET} ${CYAN}smux${RESET}    最省内存, 主要为 kcp-go 设计" >&2
+            local p
+            read -r -p "    请选择 [1-3, 回车=1]: " p || { print_warn "读取中断, 按 h2mux + 视频档继续"; p=1; }
+            p=$(clean_input "$p"); [[ -z "$p" ]] && p=1
+            case "$p" in
+                2) SB_MUX_PROTO="yamux" ;;
+                3) SB_MUX_PROTO="smux" ;;
+                *) SB_MUX_PROTO="h2mux" ;;
+            esac
+            SB_MUX_MAXCONN=$(safe_read "最大连接数 (1-256, 0=不限)" "4")
+            SB_MUX_MINSTR=$(safe_read "最少复用流数 (过少会退化成独占)" "4")
+            SB_MUX_MAXSTR=$(safe_read "单连接最大流数 (0=不限)" "0")
+        fi
+    else
+        # 档位: 三个参数一次填好, 用户不需要理解内核的门槛语义
+        local tid_sel tname
+        IFS='|' read -r tid_sel tname _ _ _ <<< "${SB_MUX_TIERS[$((c-2))]}"
+        read -r SB_MUX_MAXCONN SB_MUX_MINSTR SB_MUX_MAXSTR <<< "$(sb_mux_tier_get "$tid_sel")"
+        [[ "$side" == "client" ]] && SB_MUX_PROTO="$SB_MUX_TIER_PROTO"
+        print_ok "multiplex: ${tname} (${SB_MUX_PROTO:-$SB_MUX_TIER_PROTO} · ${SB_MUX_MAXCONN} 连接 / ${SB_MUX_MINSTR} 流起 / 单连接 ${SB_MUX_MAXSTR} 流)"
     fi
 
     if [[ "$side" == "server" ]]; then
