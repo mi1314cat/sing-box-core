@@ -32,7 +32,10 @@ ask_tls() { # 输出: CERT_MODE|cert_file|key_file|cert_domain|trusted(0|1) 到 
     local c
     # 预置方案指定 Reality 时默认落在 4, 一路回车才是真正的一键生成。
     local def=1 def_hint=""
-    if [[ "${SB_PRESET_CERT:-}" == "reality" ]]; then def=4; def_hint=" (预置方案指定 Reality)"; fi
+    case "${SB_PRESET_CERT:-}" in
+        reality)  def=4; def_hint=" (预置方案指定 Reality)" ;;
+        selfsign) def=3; def_hint=" (预置方案指定自签 + ECH)" ;;
+    esac
     if [[ "${SB_FORCE_TLS_REALTY:-}" == "1" ]]; then c=4
     else
         echo -e "    ${MAGENTA}${def_hint}${RESET}" >&2
@@ -140,9 +143,9 @@ add_config() {
     idx=$(get_next_index "$PROTO"); file="$SB_CONFIG_DIR/$PROTO-$idx.json"; tag="${PROTO}${idx}"
     # 名字体现传输方式: ask_tls 决定 reality / selfsign / real / none
     case "${CERT_MODE:-none}" in
-        reality)       tag="$tag$(tag_form_suffix reality)" ;;
-        selfsign|real) tag="$tag$(tag_form_suffix tls)" ;;
-        *)             tag="$tag$(tag_form_suffix plain)" ;;
+        reality)       tag="$tag$(tag_form_suffix reality "${SB_PRESET_TAG:-}")" ;;
+        selfsign|real) tag="$tag$(tag_form_suffix tls "${SB_PRESET_TAG:-}")" ;;
+        *)             tag="$tag$(tag_form_suffix plain "${SB_PRESET_TAG:-}")" ;;
     esac
 
     local base

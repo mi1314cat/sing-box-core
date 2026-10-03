@@ -24,7 +24,10 @@ ask_cert() {  # 输出三种: CERT_FILE+KEY_FILE (TLS) / REALITY_ENV (Reality = 
     local c
     # 预置方案指定 Reality 时默认落在 3, 一路回车才是真正的一键生成。
     local def=2 def_hint=""
-    if [[ "${SB_PRESET_CERT:-}" == "reality" ]]; then def=3; def_hint=" (预置方案指定 Reality)"; fi
+    case "${SB_PRESET_CERT:-}" in
+        reality)  def=3; def_hint=" (预置方案指定 Reality)" ;;
+        selfsign) def=2; def_hint=" (预置方案指定自签 + ECH)" ;;
+    esac
     if [[ "${SB_FORCE_TLS_REALTY:-}" == "1" ]]; then c=3
     else
         echo -e "    ${MAGENTA}${def_hint}${RESET}" >&2
@@ -103,7 +106,7 @@ add_config() {
 
     idx=$(get_next_index "$PROTO"); file="$SB_CONFIG_DIR/$PROTO-$idx.json"; tag="${PROTO}${idx}"
     # ask_cert 已决定: TLS_TYPE=reality 还是 selfsign/real —— 名字体现传输方式
-    [[ "${TLS_TYPE:-}" == "reality" ]] && tag="$tag$(tag_form_suffix reality)" || tag="$tag$(tag_form_suffix tls)"
+    [[ "${TLS_TYPE:-}" == "reality" ]] && tag="$tag$(tag_form_suffix reality "${SB_PRESET_TAG:-}")" || tag="$tag$(tag_form_suffix tls "${SB_PRESET_TAG:-}")"
     local json tr_json tr_line=""
     # flow (XTLS Vision) 是 VLESS 独有: sing-box 的 Trojan/VMess
     # outbound 选项里没有 flow 字段, 写了内核会直接报 unknown field。
@@ -227,7 +230,11 @@ out={"type":"trojan","tag":tag,"server":srv,"server_port":int(port),"password":p
 if pub and sid:
     # reality: 不需要 certificate, 信任来自 REALITY 密钥对 (sing-box 1.14 OutboundRealityOptions)
     out["tls"]["reality"]={"enabled":True,"public_key":pub,"short_id":sid}
-elif tr_json:
+# transport 与 reality **互不排斥**, 原来写成 elif 是错的:
+# gRPC + Reality 的节点 (预置②③④) 全都只写了 reality 不写 transport,
+# 客户端退化成裸 TCP 直连, 连不上 (实测 0/2)。
+# sing-box 的 reality 只是换掉了证书校验方式, 传输层照走不误。
+if tr_json:
     # 裸 TCP 不加 transport 字段 —— sing-box 里没有 "tcp" 这个类型
     out["transport"]=json.loads(tr_json)
 # multiplex: 出站才有 protocol / 连接数 / 流数

@@ -928,6 +928,9 @@ sb_ask_ech() { # <域名> <ACCESS_MODE>
         return 0
     fi
 
+    # 预置方案点名要 ECH 时把默认值落到"开启", 菜单照样打印, 用户想改仍能改
+    local pdef=1
+    [[ "${SB_PRESET_ECH:-0}" == "1" ]] && pdef=2
     echo >&2
     if [[ "$mode" == "direct" ]]; then
         echo -e "${CYAN}  ECH (加密 ClientHello)${RESET} ${CYAN}— 隐藏真实 SNI${RESET}" >&2
@@ -941,8 +944,8 @@ sb_ask_ech() { # <域名> <ACCESS_MODE>
         echo -e "    ${MAGENTA}密钥在 Cloudflare 手里, 客户端从 DNS 自动取; 源站不需要任何配置。${RESET}" >&2
     fi
     local c
-    read -r -p "    请选择 [1-2, 回车=1]: " c || { echo; return 0; }
-    c=$(clean_input "$c"); [[ -z "$c" ]] && c=1
+    read -r -p "    请选择 [1-2, 回车=${pdef}]: " c || { echo; return 0; }
+    c=$(clean_input "$c"); [[ -z "$c" ]] && c=$pdef
     [[ "$c" == "2" ]] || return 0
 
     if [[ "$mode" == "direct" ]]; then
@@ -986,7 +989,20 @@ sb_ech_json_client() {
             ;;
         direct)
             [[ -s "${SB_ECH_CONFIG_FILE:-}" ]] || return 0
-            printf '"ech": { "enabled": true, "config_path": "%s" }' "$SB_ECH_CONFIG_FILE"
+            # 必须内联 configs, 不能给 config_path —— 那是**服务端**机器上的
+            # 绝对路径, 写进客户端产物后客户端当然打不开 (实测 ECH 节点在
+            # 客户端 0/3, 报 open /root/catmi/sing-box/ech/... no such file)。
+            # sing-box 客户端的 ECHConfigs 有内联字段, 直接把 PEM 正文塞进去。
+            # 必须内联完整 PEM (含 BEGIN/END ECH CONFIGS 头尾行) —— sing-box
+            # 客户端的 ech.config 字段要的是 PEM 文本, 只给 base64 正文会报
+            # "invalid ECH configs pem"。
+            #   ech.config_path   = 本地文件路径 (服务端机器上的绝对路径,
+            #                       写进客户端产物客户端必然打不开)
+            #   ech.config        = 内联 PEM  ← 用这个
+            #   ech.configs       = 内核 1.14 不认 (unknown field)
+            local cf; cf=$(jq -Rs . < "$SB_ECH_CONFIG_FILE")
+            [[ "$cf" != '""' ]] || return 0
+            printf '"ech": { "enabled": true, "config": %s }' "$cf"
             ;;
     esac
 }
@@ -1251,44 +1267,51 @@ sb_flow_json_user() { # 服务端 inbound users[] 需要 flow
 # 完整菜单里自己选。
 # ══════════════ 全协议预置方案 ══════════════
 # 一条一行, 字段顺序固定:
-#   <协议>|<id>|<显示名>|<传输>|<mux档位>|<flow>|<证书模式>|<说明>
-#   - 传输 写 tcp 表示"裸TCP"(不是空 —— 空会和"没选预设"分不开)
-#   - mux档位 写 off 表示不��多路复用; 档位用**英文 id**, 因为
+#   <协议>|<id>|<显示名>|<传输>|<mux档位>|<flow>|<证书>|<说明>|<标签>|<额外>
+#   - 传输 写 tcp 表示"裸TCP"; 空表示该协议没有传输层
+#   - mux档位 写 off 表示不跑多路复用; 档位用**英文 id**, 因为
 #     SB_MUX_TIER_ORDER / sb_mux_tier_get 都以英文 id 为键
 #   - flow 只有 vless 有 (sing-box 的 trojan/vmess outbound 里没有 flow 字段)
-#   - 证书模式 reality = 该预置强制走 Reality
+#   - 证书 reality = 强制 Reality; selfsign = 强制自签 (ECH 前提)
+#   - 标签 = 写进**节点名**的标识, 用户在客户端列表里一眼认出方案
+#   - 额外 ech = 该方案开 ECH; pad = 该方案开 anytls padding; 空 = 都不开
 #
 # 传输的选型不是拍脑袋, 是按"两个内核都实测跑通"挑的。mihomo 跑
 # sing-box 服务端的 Reality 时, 传输层兼容性实测 (同批节点, 同套凭据):
 #   裸TCP ✓ 3/3    gRPC ✓ 3/3    HTTP/2 ✓ 3/3    WebSocket ✗ 0/3
-# WebSocket 那条是 mihomo 侧的问题 —— sing-box 客户端连同一个节点 3/3 全通,
+# WebSocket 那条是 mihomo 侧的问题 —— sing-box 客户端连同一节点 3/3 全通,
 # mihomo 稳定回 404/400。所以 Reality 预置里一律不排 ws。
 # (fscarmen 脚本的 Reality 节点表也是 h2 和 grpc, 从来不用 ws。)
+#
+# ECH 与 Reality 是两套不同的藏 SNI 手段, 不叠加:
+#   Reality = 借用真实站点的证书, 本来就没有"自己的 SNI" 可藏
+#   ECH     = 把 ClientHello 里的真实 SNI 用公钥加密, 外层只留 public_name
+# 所以 ECH 方案走自签证书 + insecure/pin, 与 Reality 方案互斥。
 SB_PRESETS=(
-    # ── vless: 唯一能上 XTLS Vision 的协议 ──
-    "vless|tcp-vision|① 隐匿优先 (抗 DPI 最强)|tcp|off|xtls-rprx-vision|reality|裸TCP + XTLS Vision; 无任何 Web 特征, 大流量最快"
-    "vless|grpc-video|② gRPC 伪装 (通用)|grpc|video||reality|gRPC 套一层正常 HTTP/2 流量; 两个内核都验证过"
-    "vless|grpc-dl|③ gRPC + 高并发|grpc|download||reality|多路复用扛并发, 适合爬虫/大量小请求"
-    "vless|h2-video|④ HTTP/2 伪装|h2|video||reality|HTTP/2 传输, 对 CDN 面板最友好的形状"
-    # ── vmess / trojan: 与 vless 同构, 只是没有 flow ──
-    "vmess|tcp-video|① 隐匿优先 (抗 DPI 最强)|tcp|video||reality|裸TCP, 不带任何 Web 特征"
-    "vmess|grpc-video|② gRPC 伪装 (通用)|grpc|video||reality|gRPC 套一层正常 HTTP/2 流量"
-    "vmess|grpc-dl|③ gRPC + 高并发|grpc|download||reality|多路复用扛并发"
-    "vmess|h2-video|④ HTTP/2 伪装|h2|video||reality|HTTP/2 传输"
-    "trojan|tcp-video|① 隐匿优先 (抗 DPI 最强)|tcp|video||reality|裸TCP, 不带任何 Web 特征"
-    "trojan|grpc-video|② gRPC 伪装 (通用)|grpc|video||reality|gRPC 套一层正常 HTTP/2 流量"
-    "trojan|grpc-dl|③ gRPC + 高并发|grpc|download||reality|多路复用扛并发"
-    "trojan|h2-video|④ HTTP/2 伪装|h2|video||reality|HTTP/2 传输"
-    # ── anytls: 无传输层/无 mux, 只有 TLS 模式可选 ──
-    "anytls|reality|① Reality 直连|无|无||reality|Reality 免证书; AnyTLS 本身已带一层 TLS 伪装"
-    "anytls|reality-pad|② Reality + 内核默认 padding|无|无|pad|reality|开 padding; AnyTLS 的 idle 三项是客户端专用, 服务端侧只有 padding"
-    # ── shadowsocks: 无 TLS/无传输, 只有一个 mux 档位可选 ──
-    "shadowsocks|ss-web|① 网页党 (省资源)|无|web||无|网页浏览; 单连接流数压到 1, 内存占用最低"
-    "shadowsocks|ss-video|② 视频党 (均衡)|无|video||无|默认档; 看视频 + 日常网页都够用"
-    "shadowsocks|ss-dl|③ 下载党 (高吞吐)|无|download||无|大文件/长连接; 单连接多流并行"
-    # ── hysteria2 / tuic: 本身已是 UDP + 自带拥塞控制, 没有可选配 ──
-    "hysteria2|h2-default|① 推荐默认|无|无||真证书|Hysteria2 参数已是最优默认 (BBR + Salamander), 无需选配"
-    "tuic|tuic-default|① 推荐默认|无|无||真证书|TUIC 参数已是最优默认 (BBR + Salamander), 无需选配"
+    "vless|tcp-vision|① 隐匿优先 · REALITY|tcp|off|xtls-rprx-vision|reality|裸TCP + XTLS Vision; 抗 DPI 最强, 无任何 Web 特征|REALITY|"
+    "vless|grpc-video|② gRPC 伪装 · REALITY|grpc|video||reality|gRPC 套一层正常 HTTP/2 流量; 两个内核都验证过|REALITY|"
+    "vless|grpc-dl|③ gRPC 高并发 · REALITY|grpc|download||reality|多路复用扛并发, 适合爬虫/大量小请求|REALITY|"
+    "vless|h2-video|④ HTTP/2 伪装 · REALITY|h2|video||reality|HTTP/2 传输, 对 CDN 面板最友好的形状|REALITY|"
+    "vless|tcp-ech|⑤ 隐匿优先 · ECH|tcp|video||selfsign|ECH 加密 ClientHello 藏住真实 SNI; 直连也不暴露域名|ECH|ech"
+    "vless|grpc-ech|⑥ gRPC + ECH|grpc|video||selfsign|gRPC 伪装再叠 ECH; 抗探测最彻底, 仅 sing-box 客户端|ECH|ech"
+    "vmess|tcp-video|① 隐匿优先 · REALITY|tcp|video||reality|裸TCP, 不带任何 Web 特征|REALITY|"
+    "vmess|grpc-video|② gRPC 伪装 · REALITY|grpc|video||reality|gRPC 套一层正常 HTTP/2 流量|REALITY|"
+    "vmess|grpc-dl|③ gRPC 高并发 · REALITY|grpc|download||reality|多路复用扛并发|REALITY|"
+    "vmess|h2-video|④ HTTP/2 伪装 · REALITY|h2|video||reality|HTTP/2 传输|REALITY|"
+    "vmess|tcp-ech|⑤ 隐匿优先 · ECH|tcp|video||selfsign|ECH 加密 ClientHello; 客户端需 insecure|ECH|ech"
+    "trojan|tcp-video|① 隐匿优先 · REALITY|tcp|video||reality|裸TCP, 不带任何 Web 特征|REALITY|"
+    "trojan|grpc-video|② gRPC 伪装 · REALITY|grpc|video||reality|gRPC 套一层正常 HTTP/2 流量|REALITY|"
+    "trojan|grpc-dl|③ gRPC 高并发 · REALITY|grpc|download||reality|多路复用扛并发|REALITY|"
+    "trojan|h2-video|④ HTTP/2 伪装 · REALITY|h2|video||reality|HTTP/2 传输|REALITY|"
+    "trojan|tcp-ech|⑤ 隐匿优先 · ECH|tcp|video||selfsign|ECH 加密 ClientHello; 客户端需 pin 钉扎|ECH|ech"
+    "anytls|reality|① 隐匿优先 · REALITY|无|无||reality|Reality 免证书; AnyTLS 本身已带一层 TLS 伪装|REALITY|"
+    "anytls|reality-pad|② REALITY + padding|无|无|pad|reality|开 padding 填充实包大小, 抗流量分析|REALITY+pad|pad"
+    "anytls|ech|③ ECH + padding|无|无|pad|selfsign|ECH + padding; AnyTLS 无证书身份, 只能靠 ECH 藏 SNI|ECH+pad|ech pad"
+    "shadowsocks|ss-web|① 网页党 (省资源)|无|web||无|网页浏览; 单连接流数压到 1, 内存占用最低|网页|"
+    "shadowsocks|ss-video|② 视频党 (均衡)|无|video||无|默认档; 看视频 + 日常网页都够用|视频|"
+    "shadowsocks|ss-dl|③ 下载党 (高吞吐)|无|download||无|大文件/长连接; 单连接多流并行|下载|"
+    "hysteria2|h2-default|① 推荐默认|无|无||真证书|Hysteria2 参数已是最优默认 (BBR + Salamander)|默认|"
+    "tuic|tuic-default|① 推荐默认|无|无||真证书|TUIC 参数已是最优默认 (BBR + Salamander)|默认|"
 )
 
 # <协议> 的预置行数
@@ -1298,15 +1321,20 @@ sb_preset_count() {
     printf '%s' "$n"
 }
 
-# <协议> <第几行(1起)> -> stdout: "<传输> <mux档位> <flow> <证书模式>"
+# <协议> <第几行(1起)> -> stdout: "<传输> <mux档位> <flow> <证书> <标签> <额外>"
+#   标签 = 节点名里显示的方案标识 (REALITY / ECH / padding …)
+#   额外 = ech (开 ECH) / pad (开 padding) / 空
+# 用 | 分隔输出, **不能转成空格** —— 表里空字段是 "| |" 这种连续分隔符,
+# 而 read 按 IFS 折叠连续空白, 空列会被整个吞掉、后面所有字段左移一位。
+# (曾因此让 vmess/trojan/anytls 把 "reality" 读成 flow, 证书菜单静默回落自签。)
 sb_preset_get() {
-    local want="$1" idx="$2" i=1 row rest
+    local want="$1" idx="$2" i=1 row cols
     for row in "${SB_PRESETS[@]}"; do
         [[ "${row%%|*}" == "$want" ]] || continue
         if (( i == idx )); then
-            # 逐列剥: 协议|id|显示名|传输|mux|flow|证书|说明
-            rest="${row#*|}"; rest="${rest#*|}"; rest="${rest#*|}"
-            printf '%s' "$rest" | cut -d'|' -f1-4 | tr '|' ' '
+            # 逐列剥: 协议|id|显示名|传输|mux|flow|证书|说明|标签|额外
+            cols="${row#*|}"; cols="${cols#*|}"; cols="${cols#*|}"
+            printf '%s' "$cols"
             return 0
         fi
         ((i++))
@@ -1320,6 +1348,7 @@ sb_preset_get() {
 sb_ask_preset() { # <协议> [菜单标题]
     local proto="$1" title="${2:-预置方案}"
     SB_PRESET_TR=""; SB_PRESET_MUX=""; SB_PRESET_FLOW=""; SB_PRESET_CERT=""
+    SB_PRESET_TAG=""; SB_PRESET_ECH=0; SB_PRESET_PAD=0
     if [[ -n "${SB_BATCH:-}" ]]; then return 0; fi
     local n; n=$(sb_preset_count "$proto")
     (( n == 0 )) && return 0
@@ -1335,16 +1364,18 @@ sb_ask_preset() { # <协议> [菜单标题]
         "${DIM:-}(回答每一个问题)${RESET}" >&2
     local c; c=$(safe_read "选择" "1")
     if [[ "$c" =~ ^[0-9]+$ ]] && (( c >= 1 && c <= n )); then
-        local tr mux flow cert row_get
+        local tr mux flow cert tag extra row_get
         # 不能用 read 拆: 表里空字段是 "| |" 这种连续分隔符, 而 read 按 IFS
         # 折叠连续空白 —— 空列会被整个吞掉, 后面所有字段左移一位
         # (曾导致 vmess/trojan/anytls 把 "reality" 读成 flow, CERT 永远空,
         #  于是证书菜单回落到自签)。逐列按位置取最稳。
         row_get=$(sb_preset_get "$proto" "$c")
-        tr=$(printf '%s' "$row_get"   | cut -d' ' -f1)
-        mux=$(printf '%s' "$row_get"  | cut -d' ' -f2)
-        flow=$(printf '%s' "$row_get" | cut -d' ' -f3)
-        cert=$(printf '%s' "$row_get" | cut -d' ' -f4)
+        tr=$(printf '%s' "$row_get"   | cut -d'|' -f1)
+        mux=$(printf '%s' "$row_get"  | cut -d'|' -f2)
+        flow=$(printf '%s' "$row_get" | cut -d'|' -f3)
+        cert=$(printf '%s' "$row_get" | cut -d'|' -f4)
+        tag=$(printf '%s' "$row_get"   | cut -d'|' -f6)
+        extra=$(printf '%s' "$row_get" | cut -d'|' -f7)
         SB_PRESET_TR=""; SB_PRESET_MUX=""; SB_PRESET_FLOW=""; SB_PRESET_CERT=""
         # "无" 是占位符, 表示该协议没有这个维度
         [[ "$tr"  == "无" ]] && tr=""
@@ -1355,6 +1386,23 @@ sb_ask_preset() { # <协议> [菜单标题]
         # 无法区分, 于是传输菜单回落到默认 ws, 预置①的抗 DPI 定位就没了。
         SB_PRESET_TR="$tr"; SB_PRESET_MUX="$mux"; SB_PRESET_FLOW="$flow"; SB_PRESET_CERT="$cert"
         [[ "$mux" == "off" ]] && SB_PRESET_MUX=""
+        # 方案标识写进节点名 —— 用户在客户端列表里只能看到名字, 这是唯一的区分线索
+        SB_PRESET_TAG="$tag"
+        SB_PRESET_ECH=0; SB_PRESET_PAD=0
+        [[ "$extra" == *ech* ]] && SB_PRESET_ECH=1
+        [[ "$extra" == *pad* ]] && SB_PRESET_PAD=1
+        # 防呆: ECH 与 Reality 是两套不同的藏 SNI 手段, 不能叠加 ——
+        # Reality 借的是真实站点的证书, 本来就没有"自己的 SNI" 可加密。
+        # 表里已经把它们分到不同行, 这里再兜一层底, 防止以后改表时踩进去。
+        if [[ "$SB_PRESET_ECH" == "1" && "$SB_PRESET_CERT" == "reality" ]]; then
+            SB_PRESET_ECH=0; SB_PRESET_CERT="selfsign"; SB_PRESET_FLOW=""
+            print_warn "ECH 不能与 Reality 同开, 已改为自签证书 + ECH"
+        fi
+        # 防呆: ECH 必须有证书可终结 TLS, 没有证书身份就没有 ClientHello 可加密
+        if [[ "$SB_PRESET_ECH" == "1" && "$SB_PRESET_CERT" != "selfsign" && "$SB_PRESET_CERT" != "real" ]]; then
+            SB_PRESET_ECH=0
+            print_warn "该协议没有可终结 TLS 的证书身份, ECH 已关闭"
+        fi
         print_ok "预置方案: $(echo "${SB_PRESETS[@]}" | grep "^${proto}|" | sed -n "${c}p" | cut -d'|' -f3)"
         print_info "下面仍会逐项确认, 想改直接选别的即可"
     fi
@@ -1750,12 +1798,27 @@ sb_cdn_domain() { # <配置文件> -> 证书里的域名
 #   tls      -> -TLS        (自签 / 真证书的 TLS)
 #   其他      -> -plain      (无 TLS)
 # 例: reality01-REALITY, vless01-TLS, vmess01-plain
+# 节点名的后缀标识。用户在客户端列表里**只能看到名字**, 没有别的线索,
+# 所以方案特征 (REALITY / ECH / padding / 档位) 必须写进名字里。
+#   $1 = 传输方式 (reality/tls/plain)
+#   $2 = 方案标签 (来自 sb_ask_preset 的 SB_PRESET_TAG, 可为空)
 tag_form_suffix() {
+    local base
     case "$1" in
-        reality) printf -- "-REALITY" ;;
-        tls)     printf -- "-TLS" ;;
-        *)       printf -- "-plain" ;;
+        reality) base="-REALITY" ;;
+        tls)     base="-TLS" ;;
+        *)       base="-plain" ;;
     esac
+    # REALITY 已经由 base 表达了, 标签里再有 "REALITY" 就不重复拼。
+    # 标签里的 "+" 是给人看的分隔 (ECH+pad), 拼进名字时要换成 "-",
+    # 否则会拼出 "TLS-ECHpad" 这种看不出边界的名字。
+    local tag="${2:-}"
+    [[ "$tag" == *REALITY* ]] && tag="${tag//REALITY/}"
+    tag="${tag//+/-}"
+    # 去掉首尾的 "-", 否则 base+"-"+空会拼出双横线 (REALITY+pad → -REALITY--pad)
+    while [[ "$tag" == -* ]]; do tag="${tag#-}"; done
+    while [[ "$tag" == *- ]]; do tag="${tag%-}"; done
+    [[ -n "$tag" ]] && printf -- "%s-%s" "$base" "$tag" || printf -- "%s" "$base"
 }
 
 get_next_index() {

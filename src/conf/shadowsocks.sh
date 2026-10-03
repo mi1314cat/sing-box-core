@@ -33,7 +33,7 @@ add_config() {
            else key=$(openssl rand -base64 32 | tr -d '\n'); fi ;;
     esac
 
-    idx=$(get_next_index "$PROTO"); file="$SB_CONFIG_DIR/$PROTO-$idx.json"; tag="${PROTO}${idx}-plain"   # 名字体现传输方式
+    idx=$(get_next_index "$PROTO"); file="$SB_CONFIG_DIR/$PROTO-$idx.json"; tag="${PROTO}${idx}$(tag_form_suffix plain "${SB_PRESET_TAG:-}")"   # 名字体现档位与方案
     sb_ask_multiplex shadowsocks server; local _mux=$(sb_mux_json_server)
     local mux_line=""
     [[ -n "$_mux" ]] && mux_line=",
