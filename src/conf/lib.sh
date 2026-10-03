@@ -759,31 +759,87 @@ sb_fragment_link_params() {
     printf '&fragment=1&fragmentFallbackDelay=%sms' "${SB_FRAG_DELAY:-$SB_FRAG_DELAY_DEFAULT}"
 }
 
-# ---------- ECH (Encrypted Client Hello) ----------
-#
-# ECH 把 ClientHello 里的真实 SNI 加密, 外面套一个"公开名"(public_name,
-# 通常是 Cloudflare 之类的大服务商域名)。中间盒于是只看到公开名, 看不到
-# 你实际连的是哪个域名 —— 这是 sing-box 相比 Xray / mihomo 最实在的一个
-# 差异点: Xray 只有客户端侧的 echConfigList, mihomo 的 ech-key 更是只作用在
-# API server 的 HTTPS 上 (官方文档原文: "Currently only used for https in API"),
-# sing-box 是**真正双向**: 服务端持有自己域名的 ECH 密钥, 客户端持有对应 config。
-#
-# 为什么必须绑定 CDN:
-#   服务端的 ech.key 是**你这个域名**的 ECH 私钥, 而这个域名的 TLS 由
-#   Cloudflare 终止。裸直连场景下 SNI 本来就是自己的域名, 加密它没有收益,
-#   客户端还得多带一份 config, 徒增故障面。所以这里只在 CDN 模式下问,
-#   别的路径一律不生成。
-#
-# 生成: sing-box generate ech-keypair <你的域名>
-#       输出两段 PEM: ECH CONFIGS (发给客户端) / ECH KEYS (服务端自留)
-#       ECH CONFIGS 放进分享链接, 客户端侧 config 指向它。
-sb_ech_supported() {
-    # ACCESS_MODE 的三种取值里, cdn 和 cdn-nginx 都走 Cloudflare。
-    # 只认 "cdn" 会漏掉 cdn-nginx —— 而那恰恰是最常用的那种 (CDN + 自建 nginx)。
-    [[ "${1:-}" == "cdn" || "${1:-}" == "cdn-nginx" ]]
+# ---------- 多行输入工具 ----------
+# 多行读取 padding_scheme 规则。
+# 用法: sb_read_lines <提示文字> <全局变量名>
+# 每行一条, 空行结束; 管道/重定向喂进来的内容一律当作只有一行处理, 避免
+# 在批处理里把后面的 stdin 全部吞掉。
+sb_read_lines() { # <提示> <变量名> -> stdout
+    local prompt="$1" __v="$2" line out=""
+    printf '%s' "$prompt" >&2
+    printf '    每行一条规则, 空行结束。\n' >&2
+    while IFS= read -r line; do
+        line=$(clean_input "$line")
+        [[ -z "$line" ]] && break
+        [[ "$line" == "stop="* || "$line" == [0-7]* ]] || {
+            print_warn "看不懂的规则, 已忽略: $line"; continue; }
+        # 用**换行**拼接, 不用逗号: padding 规则本身就含逗号
+        # (如 "2=400-500,c,500-1000"), 逗号拼接后再按逗号还原会把一条规则
+        # 拆成三条。下游 jq -R . 本来就按行切, 换行拼接正好对上。
+        out="${out}${out:+$'\n'}$line"
+    done
+    # 循环退出条件: 空行, 或 stdin 读完 (EOF)。
+    # EOF 也退出是必须的 —— 否则用户没敲空行时, 这里会把后面所有提问的
+    # 输入全部吞掉, 症状和"只支持单行"一模一样。
+    printf '%s' "$out"
 }
 
-# 生成或复用 <域名> 的 ECH 密钥对。
+# 读取多行并渲染成 JSON 数组 (每行一个元素)。
+sb_read_lines_json() { # <提示> -> stdout
+    local raw; raw=$(sb_read_lines "$1" _unused)
+    [[ -n "$raw" ]] || return 0
+    printf '%s' "$raw" | jq -R . | jq -sc .
+}
+
+# ---------- ECH (Encrypted Client Hello) ----------
+#
+# ECH 把 ClientHello 里的真实 SNI 加密, 外面套一个"公开名"(public_name)。
+# 中间盒于是只看到公开名, 看不到你实际连的是哪个域名。
+#
+# ★ 关键: **两种场景的密钥来源完全不同, 不能共用一套逻辑**
+#
+#   CDN ECH (Client → Cloudflare → Nginx/SB)
+#     TLS 在 Cloudflare 边缘终止, ECH 私钥握在 **Cloudflare** 手里。
+#     客户端必须用 **Cloudflare 自己发布的 ECHConfigList** (来自域名的
+#     HTTPS/SVCB DNS 记录的 ech= 参数), public_name 是 cloudflare-ech.com。
+#     → 客户端填 ech.query_server_name, 让 sing-box 自己去 DNS 取。
+#     → **源站 sing-box 完全不需要 ECH 配置** (它根本看不到 ClientHello)。
+#     ✗ 绝不能在这里跑 `sing-box generate ech-keypair` —— 那是给"自己就是
+#       TLS 终点"的场景用的, 生成的密钥 Cloudflare 解不开, 只会得到
+#       "tls: server rejected ECH"; 而且 public_name 会等于你自己的域名,
+#       等于什么都没藏。
+#
+#   直连 SB ECH (Client → SB)
+#     TLS 就在源站 sing-box 上终止, ECH 私钥由我们自己生成。
+#     → 服务端 ech.key_path + 客户端 ech.config_path, 成对使用。
+#
+# 下面两个函数分别实现这两条路, 由 sb_ask_ech 按 ACCESS_MODE 分流。
+sb_ech_supported() {
+    # 直连也支持了: 自己就是 TLS 终点, ECH 密钥由本机 sing-box 持有。
+    # cdn / cdn-nginx → CDN ECH; direct → 直连 ECH。
+    case "${1:-}" in
+        cdn|cdn-nginx|direct) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# 该域名是否发布了可用于 ECH 的 HTTPS 记录 —— 只对 CDN 模式有意义。
+sb_ech_dns_published() { # <域名>
+    local domain="$1" out=""
+    command -v curl >/dev/null 2>&1 || return 1
+    # Cloudflare 的 ech= 参数在 HTTPS(65) 记录里; 不同 DoH 后端返回的
+    # JSON 结构略有差异, 这里只取 Answer[].data 并找 ech= 字段。
+    out=$(curl -s -m 8 -H 'accept: application/dns-json' \
+        "https://dns.alidns.com/resolve?name=$domain&type=HTTPS" 2>/dev/null) || return 1
+    [[ -n "$out" ]] || return 1
+    # 没有 jq 时退回纯文本匹配
+    if command -v jq >/dev/null 2>&1; then
+        out=$(printf '%s' "$out" | jq -r '.Answer[]?.data' 2>/dev/null)
+    fi
+    printf '%s' "$out" | grep -q 'ech="'
+}
+
+# 直连 ECH: 生成或复用 <域名> 的密钥对。
 # 结果写进全局: SB_ECH_KEY_FILE (ECH KEYS, 服务端) / SB_ECH_CONFIG_FILE (ECH CONFIGS, 客户端)
 sb_ech_generate() { # <域名>
     local domain="$1" dir="$SB_ROOT/ech"
@@ -808,50 +864,190 @@ sb_ech_generate() { # <域名>
     SB_ECH_KEY_FILE="$kf"; SB_ECH_CONFIG_FILE="$cf"; return 0
 }
 
-# CDN 模式下询问是否启用 ECH。结果写进 SB_ECH_ON。
+# 只问一次。结果写进 SB_ECH_ON / SB_ECH_MODE (cdn|direct)。
+# 调用点: 服务端建节点时问一次, 客户端渲染时读全局, 不再问第二次。
 sb_ask_ech() { # <域名> <ACCESS_MODE>
     local domain="$1" mode="$2"
-    SB_ECH_ON=0; SB_ECH_KEY_FILE=""; SB_ECH_CONFIG_FILE=""
+    SB_ECH_ON=0; SB_ECH_KEY_FILE=""; SB_ECH_CONFIG_FILE=""; SB_ECH_MODE=""
+    # 客户端渲染要用 (CDN 模式的 query_server_name), 所以即便后面判定为
+    # 不开启也要留下域名, 否则客户端片段会拼出一个空的 query_server_name
+    SB_ECH_DOMAIN="$domain"
     sb_ech_supported "$mode" || return 0
     if [[ -n "${SB_BATCH:-}" ]]; then
-        [[ "${SB_BATCH_ECH:-0}" == "1" ]] && sb_ech_generate "$domain" && SB_ECH_ON=1
+        [[ "${SB_BATCH_ECH:-0}" == "1" ]] || return 0
+        SB_ECH_ON=1
+        if [[ "$mode" == "direct" ]]; then
+            sb_ech_generate "$domain" && SB_ECH_MODE="direct" || { SB_ECH_ON=0; return 0; }
+        else
+            SB_ECH_MODE="cdn"
+        fi
         return 0
     fi
+
     echo >&2
-    echo -e "${CYAN}  ECH (加密 ClientHello)${RESET} ${CYAN}— 隐藏真实 SNI, 中间盒只看到 Cloudflare 域名${RESET}" >&2
-    echo -e "    ${GREEN}1)${RESET} 关闭 (推荐)" >&2
-    echo -e "    ${GREEN}2)${RESET} 开启" >&2
-    echo -e "    ${MAGENTA}仅 CDN 模式有意义: ECH 密钥属于你这个域名, 而 TLS 由 Cloudflare 终止。${RESET}" >&2
-    echo -e "    ${MAGENTA}直连时 SNI 本就是自己的域名, 加密它没有收益。${RESET}" >&2
+    if [[ "$mode" == "direct" ]]; then
+        echo -e "${CYAN}  ECH (加密 ClientHello)${RESET} ${CYAN}— 隐藏真实 SNI${RESET}" >&2
+        echo -e "    ${GREEN}1)${RESET} 关闭" >&2
+        echo -e "    ${GREEN}2)${RESET} 开启  (由本机 sing-box 终结 TLS, 密钥本机生成)" >&2
+        echo -e "    ${MAGENTA}注意: 直连时 IP 已经暴露, 加密 SNI 只挡域名探测这一层。${RESET}" >&2
+    else
+        echo -e "${CYAN}  ECH (加密 ClientHello)${RESET} ${CYAN}— 隐藏真实 SNI, 只对 CDN 生效${RESET}" >&2
+        echo -e "    ${GREEN}1)${RESET} 关闭 (推荐)" >&2
+        echo -e "    ${GREEN}2)${RESET} 开启  (用 Cloudflare 发布的 ECHConfigList)" >&2
+        echo -e "    ${MAGENTA}密钥在 Cloudflare 手里, 客户端从 DNS 自动取; 源站不需要任何配置。${RESET}" >&2
+    fi
     local c
     read -r -p "    请选择 [1-2, 回车=1]: " c || { echo; return 0; }
     c=$(clean_input "$c"); [[ -z "$c" ]] && c=1
     [[ "$c" == "2" ]] || return 0
-    if sb_ech_generate "$domain"; then
-        SB_ECH_ON=1
-        print_ok "ECH 密钥已生成: $(basename "$SB_ECH_KEY_FILE")"
+
+    if [[ "$mode" == "direct" ]]; then
+        if sb_ech_generate "$domain"; then
+            SB_ECH_ON=1; SB_ECH_MODE="direct"
+            print_ok "ECH 已启用 (直连模式, 密钥: $(basename "$SB_ECH_KEY_FILE"))"
+        else
+            print_warn "ECH 密钥生成失败, 继续用未加密 SNI (节点不受影响)"
+        fi
+        return 0
+    fi
+
+    # CDN 模式: 先确认域名确实发布了 ech= 参数, 否则开了也是白开
+    if sb_ech_dns_published "$domain"; then
+        SB_ECH_ON=1; SB_ECH_MODE="cdn"
+        print_ok "ECH 已启用 (CDN 模式, 客户端将从 DNS 获取 Cloudflare 的 ECHConfigList)"
     else
-        print_warn "ECH 密钥生成失败, 继续用未加密 SNI (节点不受影响)"
+        print_warn "该域名的 HTTPS 记录里没有 ech= 参数, Cloudflare 未发布 ECHConfigList"
+        print_warn "保持关闭 —— 开启只会得到 \"server rejected ECH\", 不会更好"
     fi
     return 0
 }
 
-# 服务端 TLS 里的 ech 片段 (供各协议嵌进 tls 对象)
+# 服务端 TLS 里的 ech 片段。
+# CDN 模式返回空: TLS 在 Cloudflare 终止, 源站根本看不到 ClientHello,
+# 写 key_path 只会误导排障。
 sb_ech_json_server() {
-    [[ "${SB_ECH_ON:-0}" == "1" ]] || return 0
+    [[ "${SB_ECH_ON:-0}" == "1" && "${SB_ECH_MODE:-}" == "direct" ]] || return 0
+    [[ -s "${SB_ECH_KEY_FILE:-}" ]] || return 0
     printf '"ech": { "enabled": true, "key_path": "%s" }' "$SB_ECH_KEY_FILE"
 }
 
-# 客户端 TLS 里的 ech 片段
+# 客户端 TLS 里的 ech 片段 (供各协议并进 outbound.tls)
+# CDN: 留空 config/config_path → sing-box 走 query_server_name 从 DNS 取。
+# 直连: 指向本地 ECH CONFIGS 文件 (由客户端部署脚本放到客户端上)。
 sb_ech_json_client() {
     [[ "${SB_ECH_ON:-0}" == "1" ]] || return 0
-    printf '"ech": { "enabled": true, "config_path": "%s" }' "$SB_ECH_CONFIG_FILE"
+    case "${SB_ECH_MODE:-}" in
+        cdn)
+            printf '"ech": { "enabled": true, "query_server_name": "%s" }' "$SB_ECH_DOMAIN"
+            ;;
+        direct)
+            [[ -s "${SB_ECH_CONFIG_FILE:-}" ]] || return 0
+            printf '"ech": { "enabled": true, "config_path": "%s" }' "$SB_ECH_CONFIG_FILE"
+            ;;
+    esac
 }
 
-# 分享链接参数: 客户端拿到 ECH CONFIGS
+# 分享链接参数。CDN 模式不需要带 ECHCONFIGS —— 客户端从 DNS 自己取,
+# 往链接里塞一大坨 base64 反而会让部分客户端解析失败。
 sb_ech_link_params() {
-    [[ "${SB_ECH_ON:-0}" == "1" && -s "${SB_ECH_CONFIG_FILE:-}" ]] || return 0
+    [[ "${SB_ECH_ON:-0}" == "1" && "${SB_ECH_MODE:-}" == "direct" ]] || return 0
+    [[ -s "${SB_ECH_CONFIG_FILE:-}" ]] || return 0
     printf '&ech=%s' "$(tr -d '\n' < "$SB_ECH_CONFIG_FILE" | grep -v -- "-----" )"
+}
+
+# ---------- CDN 站点片段清理 ----------
+# 清理已经没有 CDN 节点的域名所遗留的 SB-Panel 标记块。
+#
+# 为什么需要: cdn_autosetup 在"一个 CDN 节点都不剩"时直接 return, 而且
+# 只为**仍有节点**的域名生成新片段 —— 于是删掉某域名最后一个节点后,
+# 它的 location 会永远留在站点配置里, Cloudflare 回源直接 502。
+#
+# 安全边界: 只用 BEGIN/END 成对标记定位并删除我们自己插入的那一段,
+# 站点里其他 location / 手写配置一律不碰。
+sb_cdn_cleanup_stale() {
+    local d; d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    declare -F cdn_config_roots >/dev/null 2>&1 || return 0
+    [[ -n "${SELF_DIR:-}" ]] || SELF_DIR="$(cd "$d/.." && pwd)"
+    export SELF_DIR
+    declare -F cdn_find_site_file >/dev/null 2>&1 || return 0
+
+    local f domain dn still=0 removed=0
+    local -a stale_files=() stale_domains=()
+    shopt -s nullglob
+    local r
+    while read -r r; do
+        [[ -d "$r" ]] || continue
+        for f in "$r"/*.conf; do
+            [[ -f "$f" ]] || continue
+            # 只看含我们标记块的站点文件
+            grep -q "SB-Panel CDN 开始" "$f" 2>/dev/null || continue
+            # 这个文件对应的域名
+            domain=$(grep -oE '^[[:space:]]*server_name[[:space:]]+[^;]+' "$f" 2>/dev/null \
+                     | head -1 | awk '{print $2}' | tr ' ' '\n' | grep -v '^$' | head -1)
+            [[ -n "$domain" ]] || continue
+            # 该域名下是否还有走 CDN 的节点
+            local cf; local cnt=0
+            for cf in "$SB_CONFIG_DIR"/*.json; do
+                [[ -f "$cf" ]] || continue
+                sb_cdn_enabled "$cf" || continue
+                # 节点的证书域名要跟站点域名一致
+                grep -q "$domain" "$cf" 2>/dev/null && cnt=$((cnt+1))
+            done
+            if (( cnt == 0 )); then
+                stale_files+=("$f"); stale_domains+=("$domain")
+            else
+                still=$((still+1))
+            fi
+        done
+    done < <(cdn_config_roots)
+    shopt -u nullglob
+
+    (( ${#stale_files[@]} )) || return 0
+
+    local i rc
+    for i in "${!stale_files[@]}"; do
+        f="${stale_files[$i]}"; dn="${stale_domains[$i]}"
+        echo >&2
+        print_warn "域名 $dn 已无 CDN 节点, 清除其遗留的 location 片段"
+        rc=0
+        python3 "$SELF_DIR/conf/cdn_apply.py" --domain "$dn" --file "$f" \
+                 --remove --nginx "$(cdn_nginx_mode)" >/dev/null 2>&1 || rc=$?
+        if (( rc == 0 )); then
+            print_ok "已清除: $f"
+            removed=$((removed+1))
+        else
+            print_error "清除失败 (rc=$rc): $f"
+        fi
+    done
+    # 第二遍: 清理**没有 SB-Panel 标记**的遗留块。
+    # 历史版本的插入路径没写标记, 于是 strip_existing(靠标记定位) 永远删不掉,
+    # 站点文件里会一直躺着 `location /xxx { proxy_pass http://127.0.0.1:9999; }`。
+    # 这些块的位置和写法是固定的: 顶层(列 0) + 只反代本机端口, 站点自有的
+    # location(upstream、静态缓存、acme-challenge) 都不长这样。
+    local live_ports="" cf
+    shopt -s nullglob
+    for cf in "$SB_CONFIG_DIR"/*.json; do
+        [[ -f "$cf" ]] || continue
+        local lp
+        lp=$(jq -r '.inbounds[0].listen_port // empty' "$cf" 2>/dev/null)
+        [[ -n "$lp" ]] && live_ports="${live_ports:+$live_ports,}$lp"
+    done
+    shopt -u nullglob
+    local pruned=0
+    while read -r r; do
+        [[ -d "$r" ]] || continue
+        for f in "$r"/*.conf; do
+            [[ -f "$f" ]] || continue
+            grep -qE 'proxy_pass[[:space:]]+http://127\.0\.0\.1:' "$f" 2>/dev/null || continue
+            if python3 "$SELF_DIR/conf/cdn_prune.py" --file "$f" \
+                    --live-ports "$live_ports" --nginx "$(cdn_nginx_mode)" 2>&1 | sed 's/^/    /' | grep -q "已清除"; then
+                pruned=$((pruned+1))
+            fi
+        done
+    done < <(cdn_config_roots)
+
+    (( removed )) && declare -F cdn_nginx_reload >/dev/null 2>&1 && cdn_nginx_reload
+    return 0
 }
 
 # ---------- Multiplex (多路复用) ----------
@@ -1495,6 +1691,10 @@ backup_config() { # backup_config config|kernel|all
       local d; d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
       [[ -f "$d/cdn_node.sh" && -f "$d/cdn.sh" ]] || return 0
       sb_cdn_autosetup
+      # 必须放在 autosetup 之后: autosetup 只为"仍有节点"的域名重写片段,
+      # 已经没有节点的那些域名它根本不会碰, 遗留的 location 就留在站点文件里,
+      # Cloudflare 回源会一直 502。
+      declare -F sb_cdn_cleanup_stale >/dev/null 2>&1 && sb_cdn_cleanup_stale
   }
   
 

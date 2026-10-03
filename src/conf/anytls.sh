@@ -130,12 +130,14 @@ ask_anytls_padding() {
     case "$c" in
         2) AT_PADDING="$AT_PADDING_DEFAULT"; print_ok "padding_scheme: 内置默认 (显式写入)" ;;
         3)
+            # 必须真正多行: 菜单写的是"每行一条规则", 用 safe_read (单行) 会把
+            # 第 2 行起的规则泄漏给后面的空闲会话参数提问, 静默写错值。
             local raw
-            raw=$(safe_read "padding_scheme (每行一条)" "$AT_PADDING_DEFAULT")
+            raw=$(sb_read_lines "    padding_scheme (每行一条规则, 空行结束): " _unused)
             raw="${raw//\"/}"          # 引号会破坏 JSON 字符串, 提前去掉
             [[ -z "$raw" ]] && { print_warn "内容为空, 改用内核默认"; return 0; }
             AT_PADDING="$raw"
-            print_ok "padding_scheme: 自定义 ($(printf '%s' "$raw" | grep -c . ) 条规则)" ;;
+            print_ok "padding_scheme: 自定义 ($(printf '%s\n' "$raw" | grep -c .) 条规则)" ;;
         *) print_info "padding_scheme: 交给内核默认" ;;
     esac
 }

@@ -122,8 +122,11 @@ EOF
     # CDN 只在 443 上提供服务; 沿用源站端口会得到连不通的 域名:源站端口
     sb_node_is_cdn "$file" && listen_port=443
     local link_params utls_fp ctr_json ctr_sep=""
-    sb_ask_multiplex vless client; local muxc=$(sb_mux_json_client)
-    sb_ask_ech "$CERT_DOMAIN" "${ACCESS_MODE:-direct}"; local ech_cli=$(sb_ech_json_client)
+    # 公共参数已在服务端那一步问过 (sb_ask_multiplex / sb_ask_ech),
+    # 这里只按同一个决定分别渲染, 不再问第二遍 —— 同一个问题问两次、
+    # 两次菜单文案还完全一样, 极易答错导致双端不一致。
+    local muxc=$(sb_mux_json_client)
+    local ech_cli=$(sb_ech_json_client)
     sb_ask_fragment "${mode_tls:-$TLS_TYPE}"; local frag_cli=$(sb_fragment_json_client)
     local fr_link; fr_link=$(sb_fragment_link_params)
     link_params=$(sb_transport_link_params "$TR_TYPE" "$TR_PATH" "$TR_SVC" "$TR_HOST")

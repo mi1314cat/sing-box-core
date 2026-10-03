@@ -198,8 +198,9 @@ EOF
     url="$url#$tag"
     local utls_fp; utls_fp=$(ask_utls_fingerprint)
     export SB_UTLS_FP="$utls_fp"
-    sb_ask_multiplex vmess client; export SB_MUX_JSON=$(sb_mux_json_client)
-    sb_ask_ech "$CERT_DOMAIN" "${ACCESS_MODE:-direct}"; export SB_ECH_JSON=$(sb_ech_json_client)
+    # 公共参数已在服务端那一步问过, 这里只渲染, 不重复提问。
+    export SB_MUX_JSON=$(sb_mux_json_client)
+    export SB_ECH_JSON=$(sb_ech_json_client)
     sb_ask_fragment "$CERT_MODE"; export SB_FRAG_JSON=$(sb_fragment_json_client)
     local fr_link; fr_link=$(sb_fragment_link_params)
     python3 - "$SB_OUT_DIR/sb_client-$tag.json" "$tag" "$server_ip" "$listen_port" "$uuid" "$CERT_MODE" "$CERT_DOMAIN" "$ttype" "$tpath" "$svc" "$secpin" "$REAL_PUB" "$sid" "$CERT_FILE" "$DOM" <<'PYGEN'

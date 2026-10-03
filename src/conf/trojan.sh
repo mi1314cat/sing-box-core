@@ -185,8 +185,9 @@ EOF
     ctr_json=$(sb_transport_json_client "$TR_TYPE" "$TR_PATH" "$TR_SVC" "$TR_HOST")
     [[ -n "$ctr_json" ]] && ctr_sep=","
     alpn_json=$(sb_transport_alpn "$TR_TYPE")
-    sb_ask_multiplex trojan client; local mux_json=$(sb_mux_json_client)
-    sb_ask_ech "$CERT_DOMAIN" "${ACCESS_MODE:-direct}"; local ech_cli=$(sb_ech_json_client)
+    # 公共参数已在服务端那一步问过, 这里只渲染, 不重复提问。
+    local mux_json=$(sb_mux_json_client)
+    local ech_cli=$(sb_ech_json_client)
     sb_ask_fragment "$mode_tls"; local frag_cli=$(sb_fragment_json_client)
     local fr_link; fr_link=$(sb_fragment_link_params)
     python3 - "$utls_fp" "$SB_OUT_DIR/sb_client-$tag.json" "$tag" "$server_ip" "$listen_port" "$password" "$CERT_DOMAIN" "$pin" "$mode_tls" "${T_RE_PUB-}" "${T_RE_SID-}" "$ctr_json" "$alpn_json" "$mux_json" "$ech_cli" "$frag_cli" <<'PYGEN'
