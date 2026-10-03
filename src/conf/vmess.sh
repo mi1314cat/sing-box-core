@@ -188,12 +188,23 @@ EOF
         url="vless://$uuid@$server_ip:$listen_port?encryption=aes-128-gcm&security=reality&sni=$rnd&fp=chrome&pbk=$pbk&sid=$sid"
         url="$url$(sb_transport_link_params "$ttype" "$tpath" "$svc" "$TR_HOST")"
     else
-        url="vmess://$(json_base64="$uuid" ; printf '{\"add\":\"%s\",\"port\":\"%s\",\"uuid\":\"%s\",\"aid\":\"0\",\"net\":\"%s\",\"path\":\"%s\",\"security\":\"none\",\"tls\":\"\"}' "$server_ip" "$listen_port" "$uuid" "${ttype:-tcp}" "$tpath" | base64 -w0)"
+        # vmess:// 是 **base64 编码的 JSON payload**, 不像 vless:// 那样用
+        # &query 明文。之前这里把 security/tls 硬编码成 "none"/"" ,
+        # 再往 base64 串后面追加 &SNI=&pinSHA256= —— 那些字符落在 base64
+        # 之外, 客户端解码 payload 时根本读不到: 选真证书的节点, 分享出来
+        # 看上去仍是"裸 ws"。TLS 信息必须编进 JSON 本身。
+        local vtls="" vsni=""
+        case "$CERT_MODE" in
+            real|selfsign)    vtls="tls" ;;
+            reality)          vtls="reality" ;;
+        esac
+        [[ "$vtls" == "tls" || "$vtls" == "reality" ]] && vsni="$CERT_DOMAIN"
+        url="vmess://$(printf '{"add":"%s","port":"%s","uuid":"%s","aid":"0","net":"%s","path":"%s","host":"%s","security":"%s","tls":"%s","sni":"%s","alpn":"%s"}' \
+            "$server_ip" "$listen_port" "$uuid" "${ttype:-tcp}" "$tpath" "${TR_HOST:-$CERT_DOMAIN}" \
+            "auto" "$vtls" "$vsni" "$(sb_transport_alpn "$ttype" | tr -d '[]\"' | cut -d, -f1)" | base64 -w0)"
     fi
     if [[ "$CERT_MODE" == "selfsign" ]]; then
         secpin=$(cert_spki_pin_base64 "$CERT_FILE")
-        url="$url&SNI=$CERT_DOMAIN"
-        [[ -n "$secpin" ]] && url="$url&pinSHA256=$secpin"
     fi
     url="$url#$tag"
     local utls_fp; utls_fp=$(ask_utls_fingerprint)
