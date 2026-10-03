@@ -392,7 +392,11 @@ batch_main() {
     # 内核没有对应字段, 所以不做逐协议勾选, 直接问"要不要开"。
     # 之前它们只在交互路径里问, 批量生成 (stdin 是 /dev/null) 恒定拿到空值
     # 等于永远关闭 —— 用户在批量里根本选不到, 现在补上。
-    local SB_BATCH_HOP="" SB_BATCH_OBFS=""
+    # 注意用 ="" 之外的写法: 这里若写 local SB_BATCH_HOP="" 会把**外部传入**
+    # 的预设值清空 (local VAR= 对已存在的同名变量是赋值, 会覆盖)。
+    # 这曾导致用 SB_BATCH_HOP=31000-31999 预置跑批时, 跳跃范围被无条件
+    # 重置为空 —— 表现是明明设了跳跃, 产物里却没有 server_ports。
+    local SB_BATCH_HOP="${SB_BATCH_HOP:-}" SB_BATCH_OBFS="${SB_BATCH_OBFS:-}"
     echo >&2
     echo -e "${CYAN}③b Hysteria2 专属选项 —— 只影响 hysteria2 节点${RESET}" >&2
     echo -e "   ${CYAN}1)${RESET} 端口跳跃  ${MAGENTA}(UDP 端口跳跃, 抗封锁; 需要 iptables)${RESET}" >&2
@@ -401,17 +405,34 @@ batch_main() {
     local _h=""
     read -r -p "   请选择 [1-4, 回车=4]: " _h
     _h=$(clean_input "${_h:-}")
-    case "${_h:-4}" in
+    # 回车 (未选) 时保留外部预设, 不要无条件清空 —— 否则 SB_BATCH_HOP
+    # 传进来也被 case 的 *) 分支丢掉。
+    if [[ -z "$_h" ]]; then
+        if [[ -n "$SB_BATCH_HOP" || -n "$SB_BATCH_OBFS" ]]; then
+            print_ok "HY2: 沿用预设 (跳跃=${SB_BATCH_HOP:-无} obfs=${SB_BATCH_OBFS:-无})"
+        else
+            print_ok "HY2: 端口跳跃与 obfs 都不开"
+        fi
+        export SB_BATCH_HOP SB_BATCH_OBFS
+    else
+    case "${_h}" in
         1) read -r -p "   跳跃范围 (如 30000-31000) [默认 30000-31000]: " SB_BATCH_HOP
            SB_BATCH_HOP=$(clean_input "${SB_BATCH_HOP:-}")
            [[ -z "$SB_BATCH_HOP" ]] && SB_BATCH_HOP="30000-31000"
            SB_BATCH_OBFS=y; print_ok "HY2: 端口跳跃 $SB_BATCH_HOP + obfs" ;;
         2) SB_BATCH_OBFS=y; print_ok "HY2: 只开 obfs 混淆" ;;
-        3) SB_BATCH_HOP="${SB_HOP_DEF:-30000-31000}"; SB_BATCH_OBFS=y
+        3) # 两个都开: 跳跃范围优先用预设, 没有再问一次 (再没就用默认)
+           if [[ -z "$SB_BATCH_HOP" ]]; then
+               read -r -p "   跳跃范围 (如 30000-31000) [默认 30000-31000]: " SB_BATCH_HOP
+               SB_BATCH_HOP=$(clean_input "${SB_BATCH_HOP:-}")
+           fi
+           [[ -z "$SB_BATCH_HOP" ]] && SB_BATCH_HOP="${SB_HOP_DEF:-30000-31000}"
+           SB_BATCH_OBFS=y
            print_ok "HY2: 端口跳跃 $SB_BATCH_HOP + obfs" ;;
-        *) print_ok "HY2: 端口跳跃与 obfs 都不开" ;;
+        *) SB_BATCH_HOP=""; SB_BATCH_OBFS=""; print_ok "HY2: 端口跳跃与 obfs 都不开" ;;
     esac
     export SB_BATCH_HOP SB_BATCH_OBFS
+    fi
 
     # --- 功能选项 B: CDN 传输 ---
     # 现状: SB_BATCH_TRANSPORT 恒为 ws, 所以批量最多只能出 ws 一种 CDN 形态。

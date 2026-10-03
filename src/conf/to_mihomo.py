@@ -78,20 +78,25 @@ def conv(ob, certdir):
     net = tr.get("type")
 
     # ---- mihomo 实测连不通的组合, 直接跳过 (不产出 YAML) ----
-    # 2026-10 在 DS 上实测 (mihomo 1.19.30 arm64, 同一节点 sing-box 客户端
-    # 5/5 通, 只有 mihomo 不通, 排除端口/防火墙/网络抖动):
-    #     vless + REALITY          -> 5/5 通
-    #     trojan + REALITY         -> 0/8 (REALITY Authentication: true 之后
-    #                                   就静默, 认证过了但传不了数据)
-    #     vmess  + REALITY         -> 0/8 (connect error: 404)
-    # 排除过的可能: smux 开关、flow 字段、udp 字段、network: ws —— 逐个 A/B
-    # 都不影响结果。mihomo 侧日志能看到 REALITY 认证成功, 之后无任何数据,
-    # 属于内核在该组合下的实现问题, 不是配置字段缺失。
-    # 与其产出一份看着正常、实际连不上的 YAML, 不如跳过并说明原因。
-    if reality.get("enabled") and t in ("vmess", "trojan"):
-        return None, ("%s+REALITY —— mihomo 实测连不通 (同节点 sing-box 客户端"
-                      "正常, vless+REALITY 也正常; 属 mihomo 内核侧问题)"
-                      % t.upper())
+    #
+    # **2026-10 二次更正**: 上一版写的是"trojan/vmess + REALITY 不支持",
+    # 那个结论是**错的** —— 当时三个节点的 transport 恰好不同, dest 也没控制,
+    # 变量混在一起。做了控制变量实验 (同一密钥、同 sid、同 dest=openjdk.org,
+    # 只换一个变量), 真实规则是:
+    #
+    #   mihomo, REALITY + **TCP** 传输:
+    #       vless  -> 5/5      trojan -> 5/5      vmess -> 5/5
+    #   mihomo, REALITY + **ws** 传输:
+    #       vless  -> 0/5      trojan -> 0/5      vmess -> 0/5
+    #   mihomo, REALITY + TCP, 只换 dest (www.mysql.com / apps.apple.com /
+    #       s0.awsstatic.com)                                -> 全部 5/5
+    #
+    # 所以 **与协议无关, 与 dest 无关, 只与传输层有关**: mihomo 的 REALITY
+    # 不能配 ws。sing-box 客户端两种传输都能用 (5/5), 所以服务端配置照常
+    # 生成, 只是不给 mihomo 产出会连不上的 YAML。
+    if reality.get("enabled") and net == "ws":
+        return None, ("REALITY + ws 传输 —— mihomo 实测连不通 (同配置 TCP "
+                      "传输 5/5, 换协议/换 dest 均无影响; 换 sing-box 客户端可用)")
 
     d = {"name": tag, "server": srv, "port": int(port)}
 

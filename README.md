@@ -168,6 +168,17 @@ bash src/conf/vless.sh list|del     # 查看 / 删除
 > 节点。表现同样是"只有开了跳跃的 HY2 连不通"，但根因是规则堆积，
 > 换协议、重启服务都找不到。（实测连开 4 个节点后复现。）
 
+两个选项都可以**用环境变量预设**，跑非交互批处理时不必逐问答：
+
+```bash
+SB_BATCH_HOP=31000-31999 SB_BATCH_OBFS=y bash conf/batch.sh
+```
+
+> 交互处直接回车会**沿用预设**，不会把预设清空。（实现上踩过一个坑：
+> `local SB_BATCH_HOP=""` 会覆盖同名外部变量，而 `case` 的 `*)` 分支又会在
+> 回车时无条件清空，两个 bug 叠加导致"明明传了跳跃范围，产物里没有
+> `server_ports`"。）
+
 **obfs 混淆** 开启后服务端与客户端都带
 `obfs: {type: salamander, password: <24位hex>}`，mihomo 侧对应
 `obfs: salamander` + `obfs-password`。fscarmen 那一版**没有** obfs
@@ -609,18 +620,23 @@ YAML 仍然会生成（只是少了 ech 字段），连得上但**没有 ECH 保
 
 这些组合不会产出对应文件，并打印原因。
 
-**Trojan / VMess + REALITY 也跳过**（2026-10 实测新增）。同一个节点
-sing-box 客户端稳定 5/5 通，只有 mihomo 不通：
+**REALITY + ws 传输也跳过**（2026-10 实测，**原写"trojan/vmess + REALITY"，已更正**）。
 
-| 节点 | sing-box | mihomo | mihomo 日志 |
+上一版的结论是错的。当时那批节点的 transport 恰好不同、dest 也没控制，
+变量混在一起。做控制变量实验（同一密钥、同 short-id、同 dest=openjdk.org，
+一次只换一个变量）后真实规律是：
+
+| 传输 | vless | trojan | vmess |
 |---|---|---|---|
-| vless + REALITY | 5/5 | **5/5** | — |
-| trojan + REALITY | 5/5 | **0/8** | `REALITY Authentication: true` 之后静默 |
-| vmess + REALITY | 5/5 | **0/8** | `connect error: unexpected status: 404` |
+| **TCP** | 5/5 | 5/5 | 5/5 |
+| **ws** | 0/5 | 0/5 | 0/5 |
 
-排除过的变量（逐个 A/B 都不影响结果）：`smux` 开关、`flow` 字段、
-`udp: true`、`network: ws`。端口可达、服务端监听正常、REALITY 公钥与
-short-id 完全匹配。认证成功后无任何数据传输，属于内核在该组合下的实现问题。
+再固定协议为 vless、只换 dest（`www.mysql.com` / `apps.apple.com` /
+`s0.awsstatic.com`）—— 全部 5/5，说明 **与协议无关、与 dest 无关，
+只与传输层有关：mihomo 的 REALITY 不能配 ws**。
+
+sing-box 客户端两种传输都能用，所以服务端配置照常生成，只是不给 mihomo
+产出连不上的 YAML。
 
 > 与其产出一份**看着正常、实际连不上的** YAML，不如跳过并写明原因。
 > 服务端配置照常生成 —— 换 sing-box 客户端是能用的。
