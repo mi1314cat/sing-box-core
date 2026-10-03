@@ -15,6 +15,7 @@ Reality 参数、自签回退 (skip-cert-verify) 的处理逻辑完全一致。
 import sys, os, json
 
 MISSING_FP = []
+SKIPPED_OPTS = []
 
 HDR = ["# 由 SB-Panel 生成 (conf/to_mihomo.py)",
        "# 源: sb_client-<tag>.json (sing-box outbound) -> mihomo (Clash.Meta)",
@@ -117,7 +118,7 @@ def conv(ob, certdir):
     need_tls = bool(tls.get("enabled"))
     if need_tls:
         d["tls"] = True
-        if sni: d["servername"] = sni
+        if sni: d["sni"] = sni   # mihomo 的字段是 sni (servername 是 sing-box 的叫法)
         if alpn: d["alpn"] = list(alpn)
         if tls.get("insecure"): d["skip-cert-verify"] = True
         if fp: d["client-fingerprint"] = fp
@@ -139,6 +140,44 @@ def conv(ob, certdir):
             else:
                 d["skip-cert-verify"] = True
                 MISSING_FP.append(tag)
+
+        # ---- ECH ----
+        # mihomo 的 ech-opts 与 sing-box 的 ech 同义: 都是让客户端去 DNS 取
+        # 域名的 ECHConfigList (HTTPS/SVCB 的 ech= 参数), 用 Cloudflare 发布的
+        # 密钥加密 ClientHello, 外层 SNI 换成 cloudflare-ech.com。
+        #   mihomo: ech-opts: { enable: true, query-server-name: <真实域名> }
+        #   sing-box: ech: { enabled: true, query_server_name: <真实域名> }
+        ech = tls.get("ech") or {}
+        if ech.get("enabled"):
+            q = ech.get("query_server_name")
+            if q:
+                d["ech-opts"] = {"enable": True, "query-server-name": q}
+            elif ech.get("config") or ech.get("config_path"):
+                # 直连模式: sing-box 用本地 ECHCONFIGS 文件, mihomo 没有对应字段
+                # (ech-opts 只支持 DNS 查询形式), 转过去必然连不上。
+                SKIPPED_OPTS.append("%s: ech 用本地 config 文件, mihomo 无法表达" % tag)
+            else:
+                SKIPPED_OPTS.append("%s: ech 开了但没有 query_server_name" % tag)
+
+    # ---- 多路复用 ----
+    # mihomo 的 smux 是**通用字段**, 任何 proxy 类型都能挂; 它的 brutal 直接内建
+    # 在 smux.brutal-opts 下 (up/down 单位 Mbps), 正好对上 sing-box 的 brutal。
+    # 官方文档: smux.protocol 默认就是 h2mux。
+    mx = ob.get("multiplex") or {}
+    if mx.get("enabled"):
+        sm = {"enabled": True}
+        if mx.get("protocol"): sm["protocol"] = mx["protocol"]
+        if mx.get("max_connections"): sm["max-connections"] = mx["max_connections"]
+        if mx.get("min_streams"):   sm["min-streams"] = mx["min_streams"]
+        if mx.get("max_streams"):   sm["max-streams"] = mx["max_streams"]
+        b = mx.get("brutal") or {}
+        if b.get("enabled"):
+            sm["brutal-opts"] = {
+                "enabled": True,
+                "up": b.get("up_mbps", 0),
+                "down": b.get("down_mbps", 0),
+            }
+        d["smux"] = sm
 
     # ---- 传输层 ----
     # sing-box 的 type -> mihomo 的 network, 两个反直觉的映射:
@@ -247,6 +286,8 @@ def write_single(outdir, certdir, paths):
     for tag in MISSING_FP:
         sys.stderr.write("  [注意] %-16s 自签证书钉扎改用 skip-cert-verify "
                          "(未找到 cert-<sni>.crt 可算 fingerprint)\n" % tag)
+    for msg in SKIPPED_OPTS:
+        sys.stderr.write("  [注意] %s\n" % msg)
     return 0
 
 
@@ -275,6 +316,8 @@ def main():
         sys.stderr.write("已生成 %s: %d 个节点\n" % (out, len(proxies)))
         for tag, why in skipped:
             sys.stderr.write("  [跳过] %-16s %s\n" % (tag, why))
+        for msg in SKIPPED_OPTS:
+            sys.stderr.write("  [注意] %s\n" % msg)
         for tag in MISSING_FP:
             sys.stderr.write("  [注意] %-16s 自签证书钉扎改用 skip-cert-verify "
                              "(未找到 cert-<sni>.crt 可算 fingerprint)\n" % tag)
