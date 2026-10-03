@@ -151,6 +151,13 @@ add_config() {
     esac
 
     local base
+    # tag 必须在 base 展开**之前**算完: base 里的 "tag": "$tag" 是 heredoc
+    # 展开时就固化的, 之后再改 $tag 不会反映到配置里。
+    # (vless/trojan/hysteria2/tuic 都是"先算 tag, 后拼 base", 只有这里反了 ——
+    #  症状是 CDN/ECH 节点的形态后缀写不进去, 名字停在 vmess01 看不出形态。)
+    sb_resolve_tag "${SB_TAG_FORM:-plain}"
+    tag="$tag$(tag_form_suffix "${SB_TAG_FORM:-plain}" "$SB_TAG_EXTRA")"
+
     base=$(cat <<EOF
 {
   "inbounds": [
@@ -190,9 +197,6 @@ EOF
     # ECH 必须放在 CERT_MODE 的 case **之后**: 那个分支是用 jq 整体替换
     # .inbounds[0].tls 的, 放前面会被冲掉。
     sb_ask_ech "$CERT_DOMAIN" "${ACCESS_MODE:-direct}"
-    # 名称必须在 ECH/接入方式确定之后才算 —— 见 sb_resolve_tag 的说明
-    sb_resolve_tag "${SB_TAG_FORM:-plain}"
-    tag="$tag$(tag_form_suffix "${SB_TAG_FORM:-plain}" "$SB_TAG_EXTRA")"
     local _ech=$(sb_ech_json_server)
     [[ -n "$_ech" ]] && base=$(echo "$base" | jq --argjson ec "{$_ech}" '.inbounds[0].tls += $ec')
     backup_config config

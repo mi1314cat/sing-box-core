@@ -1372,29 +1372,41 @@ SB_PRESETS=(
     "vless|ws-cdn|⑤ CDN 网页党 · 真证书|ws|web||真证书|走 Cloudflare 回源; 网页浏览档, 最省资源|CDN|"
     "vless|ws-cdn-ech|⑥ CDN + ECH · 网页党|ws|web||真证书|ECH 加密真实 SNI, CDN 回源; 域名探测也挡得住|CDN+ECH|ech"
     "vless|h2-cdn-ech|⑦ CDN + ECH · 视频党|h2|video||真证书|HTTP/2 + ECH; 看视频档, ECH 全程生效|CDN+ECH|ech"
+    "vless|grpc-cdn|⑧ CDN · gRPC 档|grpc|video||真证书|Cloudflare 回源; gRPC 走 HTTP/2, 与网页档的 WebSocket 形态不同, 便于分散流量特征|CDN|"
+    "vless|grpc-cdn-ech|⑨ CDN + ECH · gRPC 档|grpc|video||真证书|gRPC + ECH; Cloudflare 回源; gRPC 走 HTTP/2, 与网页档的 WebSocket 形态不同, 便于分散流量特征|CDN+ECH|ech"
     "vmess|tcp-video|① 隐匿优先 · REALITY|tcp|video||reality|裸TCP, 不带任何 Web 特征|REALITY|"
     "vmess|grpc-video|② gRPC 伪装 · REALITY|grpc|video||reality|gRPC 套一层正常 HTTP/2 流量|REALITY|"
     "vmess|grpc-dl|③ gRPC 高并发 · REALITY|grpc|download||reality|多路复用扛并发|REALITY|"
     "vmess|h2-video|④ HTTP/2 伪装 · REALITY|h2|video||reality|HTTP/2 传输|REALITY|"
-    "vmess|ws-cdn-ech|⑤ CDN + ECH · 网页党|ws|web||真证书|ECH 加密真实 SNI, CDN 回源|CDN+ECH|ech"
+    "vmess|ws-cdn|⑤ CDN 网页党 · 真证书|ws|web||真证书|走 Cloudflare 回源; 网页浏览档, 最省事|CDN|"
+    "vmess|ws-cdn-ech|⑥ CDN + ECH · 网页党|ws|web||真证书|ECH 加密真实 SNI, CDN 回源|CDN+ECH|ech"
+    "vmess|grpc-cdn|⑦ CDN · gRPC 档|grpc|video||真证书|Cloudflare 回源; gRPC 走 HTTP/2, 与网页档的 WebSocket 形态不同, 便于分散流量特征|CDN|"
+    "vmess|grpc-cdn-ech|⑧ CDN + ECH · gRPC 档|grpc|video||真证书|gRPC + ECH; Cloudflare 回源; gRPC 走 HTTP/2, 与网页档的 WebSocket 形态不同, 便于分散流量特征|CDN+ECH|ech"
     "trojan|tcp-video|① 隐匿优先 · REALITY|tcp|video||reality|裸TCP, 不带任何 Web 特征|REALITY|"
     "trojan|grpc-video|② gRPC 伪装 · REALITY|grpc|video||reality|gRPC 套一层正常 HTTP/2 流量|REALITY|"
     "trojan|grpc-dl|③ gRPC 高并发 · REALITY|grpc|download||reality|多路复用扛并发|REALITY|"
     "trojan|h2-video|④ HTTP/2 伪装 · REALITY|h2|video||reality|HTTP/2 传输|REALITY|"
     "trojan|ws-cdn-ech|⑤ CDN + ECH · 网页党|ws|web||真证书|ECH 加密真实 SNI, CDN 回源|CDN+ECH|ech"
+    "trojan|grpc-cdn|⑥ CDN · gRPC 档|grpc|video||真证书|Cloudflare 回源; gRPC 走 HTTP/2, 与网页档的 WebSocket 形态不同, 便于分散流量特征|CDN|"
+    "trojan|grpc-cdn-ech|⑦ CDN + ECH · gRPC 档|grpc|video||真证书|gRPC + ECH; Cloudflare 回源; gRPC 走 HTTP/2, 与网页档的 WebSocket 形态不同, 便于分散流量特征|CDN+ECH|ech"
     "anytls|reality|① 隐匿优先 · REALITY|无|无||reality|Reality 免证书; AnyTLS 本身已带一层 TLS 伪装|REALITY|"
+    # anytls 只有 REALITY 一种可用形态。实测 (2026-10): anytls 出站配普通
+    # TLS (certificate_path/key_path) 时, 服务端在 ClientHello 阶段就 reset,
+    # sing-box 与 mihomo 客户端都连不上 (mihomo 偶发 2/3); 换 REALITY 立刻
+    # 3/3。与面板代码无关 —— 完全手写的配置同样复现, 内核字段也不报
+    # unknown field。所以 TLS/padding/ECH 那几个基于 TLS 的预置全部撤掉了,
+    # 留着只会让用户建出连不上的节点。padding 可以叠在 REALITY 上。
     "anytls|reality-pad|② REALITY + padding|无|无|pad|reality|开 padding 填充实包大小, 抗流量分析|REALITY+pad|pad"
-    "anytls|tls-pad|③ TLS + padding|无|无|pad|selfsign|自签 + padding; 无 CDN 无 Reality 时的稳选|TLS+pad|pad"
-    "anytls|tls-ech|④ TLS + 内核 ECH|无|无||selfsign|内核 ECH 加密 ClientHello, 隐藏真实 SNI (仅 sing-box 客户端)|TLS+ECH|ech"
-    "shadowsocks|ss-web|① 网页党 (省资源)|无|web||无|网页浏览; 单连接流数压到 1, 内存占用最低|网页|"
+    
+        "shadowsocks|ss-web|① 网页党 (省资源)|无|web||无|网页浏览; 单连接流数压到 1, 内存占用最低|网页|"
     "shadowsocks|ss-video|② 视频党 (均衡)|无|video||无|默认档; 看视频 + 日常网页都够用|视频|"
     "shadowsocks|ss-dl|③ 下载党 (高吞吐)|无|download||无|大文件/长连接; 单连接多流并行|下载|"
     "hysteria2|h2-default|① 推荐默认|无|无||真证书|Hysteria2 参数已是最优默认 (BBR + Salamander)|默认|"
     "hysteria2|h2-ech|② TLS + 内核 ECH|无|无||真证书|内核 ECH 加密 ClientHello, 隐藏真实 SNI (仅 sing-box 客户端)|TLS+ECH|ech"
     "tuic|tuic-default|① 推荐默认|无|无||真证书|TUIC 参数已是最优默认 (BBR + Salamander)|默认|"
     "tuic|tuic-ech|② TLS + 内核 ECH|无|无||真证书|内核 ECH 加密 ClientHello, 隐藏真实 SNI (仅 sing-box 客户端)|TLS+ECH|ech"
-    "naive|naive-real|① 真证书 (推荐)|无|无||真证书|naiveproxy 走真证书, 客户端无需 insecure|真证书|"
-    "naive|naive-self|② 自签 + 伪装域名|无|无||selfsign|自签证书 + 伪装域名; 客户端需 pin 钉扎||"
+    "naive|naive-self|① 自签 + 伪装域名 (推荐)|无|无||selfsign|默认走这条: 一路回车就能建出来, 不需要先备好 crt/key|自签|"
+    "naive|naive-real|② 真证书|无|无||真证书|naiveproxy 走真证书, 客户端无需 insecure/pin; 需先备好 crt/key 路径|真证书|"
 )
 
 # <协议> 的预置行数
