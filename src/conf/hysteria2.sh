@@ -80,8 +80,15 @@ ask_cert() {
     echo "  1) 扫描本机已有证书 (CA可信)" >&2
     echo "  2) 手动输入路径" >&2
     echo "  3) 生成自签证书 (无需域名, 用 pin 校验)" >&2
-    read -r -p "  选择 (默认 3): " c
-    c=$(clean_input "$c"); [[ -z "$c" ]] && c=3
+    # 预置方案点名要真证书时, 默认值落到 2 (手动输入路径)
+    local hdef=3 hhint=""
+    case "${SB_PRESET_CERT:-}" in
+        真证书|real) hdef=2; hhint=" (预置方案指定真证书, 请填 crt/key 路径)" ;;
+        selfsign)    hhint=" (预置方案指定自签)" ;;
+    esac
+    [[ -n "$hhint" ]] && echo -e "    ${MAGENTA}${hhint}${RESET}" >&2
+    read -r -p "  选择 (默认 ${hdef}): " c
+    c=$(clean_input "$c"); [[ -z "$c" ]] && c=$hdef
     sb_batch_tls_override 2 c
     case "$c" in
         2)
@@ -144,6 +151,13 @@ add_config() {
 
     sb_ask_preset hysteria2 "推荐配置"
     ask_cert || return 1
+
+    # ECH (可选): 这三个协议没有 Reality 可选, 内核 ECH 是它们唯一的
+    # SNI 隐藏手段。默认关闭; 开启后仅 sing-box 客户端可用 (需内联
+    # ECHConfigList, mihomo/Clash 不支持) —— 实测 anytls/hysteria2/tuic
+    # 端到端 3/3, 服务端无 "server rejected ECH"。
+    # 这三个协议只走直连, 没有 CDN 在中间终结 TLS, 所以固定 direct。
+    sb_ask_ech "$CERT_DOMAIN" direct
     local password="" mask="none"
     read -r -p "是否启用 obfs 混淆? [y/N]: " oyn
     if [[ "$(clean_input "$oyn")" =~ ^[yY] ]]; then
@@ -154,10 +168,16 @@ add_config() {
 
     local idx file tag json
     idx=$(get_next_index "$PROTO")
-    file="$SB_CONFIG_DIR/$PROTO-$idx.json"; tag="${PROTO}${idx}$(tag_form_suffix tls "${SB_PRESET_TAG:-}")"   # 名字体现方案
+    file="$SB_CONFIG_DIR/$PROTO-$idx.json"
+    # 名称要在 ECH 定了之后再算 (见 sb_resolve_tag)
+    SB_TAG_FORM="tls"; sb_resolve_tag tls
+    tag="${PROTO}${idx}$(tag_form_suffix tls "$SB_TAG_EXTRA")"   # 名字体现方案
 
     local cert_paths_line
     cert_paths_line="\"certificate_path\": \"$CERT_FILE\", \"key_path\": \"$KEY_FILE\""
+    # 内核 ECH: 我们自己终结 TLS, 解密 inner ClientHello 靠的就是这把私钥
+    local ech_srv; ech_srv=$(sb_ech_json_server)
+    local ech_sep=""; [[ -n "$ech_srv" ]] && ech_sep=", $ech_srv"
 
     local json
     json=$(cat <<EOF
@@ -172,7 +192,7 @@ add_config() {
       "up_mbps": 100,
       "down_mbps": 500,
       "obfs": { "type": "salamander", "password": "$mask" },
-      "tls": { "enabled": true, "alpn": ["h3"], $cert_paths_line }
+      "tls": { "enabled": true, "alpn": ["h3"], $cert_paths_line$ech_sep }
     }
   ]
 }
@@ -205,8 +225,13 @@ EOF
     fi
     local link="hysteria2://$auth@$server_ip:$listen_port?${hop:+mport=$hop&}sni=$CERT_DOMAIN&obfs=$( [[ $mask != none ]] && echo salamander || echo none )&obfs-password=$( [[ $mask != none ]] && echo $mask )&alpn=h3"
     [[ "$CERT_TRUSTED" == "false" ]] && link="$link&pinSHA256=$pin"
-    link="$link#$tag"
+    link="$link$(sb_ech_link_params)#$tag"
     # 简化: 对标准客户端, 自签统一用 insecure=1 提示, 或者 pin=hex (v2rayN 等)
+    # 客户端 ech 片段 (内联完整 ECHCONFIGS PEM; 只有 sing-box 客户端认)。
+    # 必须在本 heredoc **之前**算好 —— heredoc 展开时变量若还没赋值就是空的。
+    local ech_cli; ech_cli=$(sb_ech_json_client)
+    local ech_cli_field=""; [[ -n "$ech_cli" ]] && ech_cli_field=", $ech_cli"
+
     cat > "$SB_OUT_DIR/sb_client-$tag.json" <<EOF
 {
   "outbounds": [
@@ -222,12 +247,13 @@ EOF
       "tls": {
         "enabled": true,
         "server_name": "$CERT_DOMAIN",
-        "alpn": ["h3"]$pin_field
+        "alpn": ["h3"]$pin_field$ech_cli_field
       }
     }
   ]
 }
 EOF
+
     [[ "$mask" == "none" ]] && { jq 'del(.outbounds[0].obfs)' "$SB_OUT_DIR/sb_client-$tag.json" > /tmp/hyc.$$ && mv /tmp/hyc.$$ "$SB_OUT_DIR/sb_client-$tag.json" ; }
     mkdir -p "$SB_OUT_DIR"
     echo "{\"tag\":\"$tag\",\"port\":$listen_port,\"hop\":\"$hop\",\"cert\":\"$CERT_FILE\",\"cert_trusted\":$CERT_TRUSTED,\"auth\":\"$auth\",\"mask\":\"$mask\"}" | jq . > "$SB_OUT_DIR/sb_meta-$tag.json"

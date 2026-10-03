@@ -166,11 +166,22 @@ add_config() {
     sb_ask_preset anytls "TLS 预置方案"
     password=$(openssl rand -base64 18 | tr -d '/+=\n' | head -c 24)
     ask_cert || return 1
+
+    # ECH (可选): 这三个协议没有 Reality 可选, 内核 ECH 是它们唯一的
+    # SNI 隐藏手段。默认关闭; 开启后仅 sing-box 客户端可用 (需内联
+    # ECHConfigList, mihomo/Clash 不支持) —— 实测 anytls/hysteria2/tuic
+    # 端到端 3/3, 服务端无 "server rejected ECH"。
+    # 这三个协议只走直连, 没有 CDN 在中间终结 TLS, 所以固定 direct。
+    sb_ask_ech "$CERT_DOMAIN" direct
     ask_anytls_padding || return 1
 
     idx=$(get_next_index "$PROTO"); file="$SB_CONFIG_DIR/$PROTO-$idx.json"; tag="${PROTO}${idx}"
-    # 名字体现传输方式: ask_cert 决定 reality 还是 TLS
-    [[ "${TLS_TYPE:-}" == "reality" ]] && tag="$tag$(tag_form_suffix reality "${SB_PRESET_TAG:-}")" || tag="$tag$(tag_form_suffix tls "${SB_PRESET_TAG:-}")"
+    # 名字体现传输方式与 ECH。sb_resolve_tag 必须在 sb_ask_ech 之后调用 ——
+    # ECH 开没开要到那一步才定, 用预置标签直接拼会产出一个写着 -ECH 其实没开
+    # 的节点名 (用户在客户端列表里唯一的线索就是名字)。
+    SB_TAG_FORM="tls"; [[ "${TLS_TYPE:-}" == "reality" ]] && SB_TAG_FORM="reality"
+    sb_resolve_tag "$SB_TAG_FORM"
+    tag="$tag$(tag_form_suffix "$SB_TAG_FORM" "$SB_TAG_EXTRA")" || tag="$tag$(tag_form_suffix tls "${SB_PRESET_TAG:-}")"
     local json
     # padding_scheme 是字符串数组, sing-box 用 \n join -> 每行一个元素
     # padding_scheme: sing-box 用 "\n" join 数组元素 -> 每个元素必须正好是一行规则,
@@ -207,6 +218,10 @@ add_config() {
 EOF
 )
     else
+    # 内核 ECH: 我们自己终结 TLS, 解密 inner ClientHello 靠的就是这把私钥。
+    # (Reality 分支不加 —— 那没有"自己的 SNI"可加密)
+    local ech_srv; ech_srv=$(sb_ech_json_server)
+    local ech_sep=""; [[ -n "$ech_srv" ]] && ech_sep=", $ech_srv"
     json=$(cat <<EOF
 {
   "inbounds": [
@@ -216,7 +231,7 @@ EOF
       "listen": "$listen_ip",
       "listen_port": $listen_port,
       "users": [ { "name": "user", "password": "$password" } ]${pad_line},
-      "tls": { "enabled": true, "alpn": ["h2", "http/1.1"], "certificate_path": "$CERT_FILE", "key_path": "$KEY_FILE" }
+      "tls": { "enabled": true, "alpn": ["h2", "http/1.1"], "certificate_path": "$CERT_FILE", "key_path": "$KEY_FILE"${ech_sep} }
     }
   ]
 }
@@ -238,13 +253,15 @@ EOF
     local fp=""; [[ "$CERT_TRUSTED" == "false" ]] && fp=$(cert_fingerprint_hex "$CERT_FILE")
 
     # anytls:// 分享链接 (自签走 pinSHA256, 与 trojan 同一套语义)
+    # 内核 ECH 的 ech= 参数附在链接尾部 (只有认这个形式的客户端能用, 即 sing-box)
+    local ech_link; ech_link=$(sb_ech_link_params)
     local link
     if [[ "${TLS_TYPE:-tls}" == "reality" ]]; then
-        link="anytls://$password@$server_ip:$listen_port?sni=$CERT_DOMAIN&insecure=0&pbk=$T_RE_PUB&sid=$T_RE_SID#$tag"
+        link="anytls://$password@$server_ip:$listen_port?sni=$CERT_DOMAIN&insecure=0&pbk=$T_RE_PUB&sid=$T_RE_SID"$ech_link"#$tag"
     elif [[ "$CERT_TRUSTED" == "true" ]]; then
-        link="anytls://$password@$server_ip:$listen_port?sni=$CERT_DOMAIN&insecure=0#$tag"
+        link="anytls://$password@$server_ip:$listen_port?sni=$CERT_DOMAIN&insecure=0"$ech_link"#$tag"
     else
-        link="anytls://$password@$server_ip:$listen_port?sni=$CERT_DOMAIN&insecure=1${pin:+&pinSHA256=$pin}#$tag"
+        link="anytls://$password@$server_ip:$listen_port?sni=$CERT_DOMAIN&insecure=1${pin:+&pinSHA256=$pin}"$ech_link"#$tag"
     fi
 
     local utls_fp; utls_fp=$(ask_utls_fingerprint)
@@ -254,11 +271,12 @@ EOF
     isc=$(safe_read "空闲会话检查间隔 (秒, 0=用默认30)" "0")
     ist=$(safe_read "空闲会话超时 (秒, 0=用默认30)" "0")
     mis=$(safe_read "最少保留空闲会话数 (0=用默认0)" "0")
+    local ech_cli; ech_cli=$(sb_ech_json_client)
     python3 - "$utls_fp" "$SB_OUT_DIR/sb_client-$tag.json" "$tag" "$server_ip" "$listen_port" \
         "$password" "$CERT_DOMAIN" "$pin" "${TLS_TYPE:-tls}" "${T_RE_PUB-}" "${T_RE_SID-}" \
-        "$isc" "$ist" "$mis" <<'PYGEN'
+        "$isc" "$ist" "$mis" "$ech_cli" <<'PYGEN'
 import json,sys
-_,fp,ofile,tag,srv,port,pw,sni,pin,mode,pub,sid,isc,ist,mis=sys.argv
+_,fp,ofile,tag,srv,port,pw,sni,pin,mode,pub,sid,isc,ist,mis,ech=sys.argv
 if mode=="reality":
     tls={"enabled":True,"server_name":sni,
          "utls":{"enabled":True,"fingerprint":fp},
@@ -267,6 +285,9 @@ else:
     tls={"enabled":True,"server_name":sni,"alpn":["h2","http/1.1"],
          "utls":{"enabled":True,"fingerprint":fp}}
     if pin: tls["certificate_public_key_sha256"]=pin
+    # 内核 ECH: 片段形如 "ech": { "enabled": true, "config": "-----BEGIN...\n" },
+    # 补 {} 才是完整 JSON 值 (完整 PEM 含头尾行, 内核只认这个形式)
+    if ech: tls.update(json.loads("{"+ech+"}"))
 out={"type":"anytls","tag":tag,"server":srv,"server_port":int(port),"password":pw,"tls":tls}
 # 0 = 不写, 交给 sing-box 用它自己的默认值 (30/30/0)
 if isc and int(isc)!=0: out["idle_session_check_interval"]=str(int(isc))+"s"

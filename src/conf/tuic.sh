@@ -21,10 +21,17 @@ ask_cert() {
     echo "TLS 证书：" >&2
     echo "  1) 手动输入 crt/key 路径" >&2
     echo "  2) 生成自签证书" >&2
-    local c=""; read -r -p "  选择 (默认 2=自签): " c; c=$(clean_input "$c")
+    # 预置方案点名要真证书时, 默认值落到 1 (手动输入 crt/key); 否则默认 2=自签
+    local tdef=2 thint=""
+    case "${SB_PRESET_CERT:-}" in
+        真证书|real) tdef=1; thint=" (预置方案指定真证书, 请填 crt/key 路径)" ;;
+        selfsign)    thint=" (预置方案指定自签)" ;;
+    esac
+    [[ -n "$thint" ]] && echo -e "    ${MAGENTA}${thint}${RESET}" >&2
+    local c=""; read -r -p "  选择 (默认 ${tdef}): " c; c=$(clean_input "$c")
+    [[ -z "$c" ]] && c=$tdef
     # 批量选了真证书就改判到真证书分支, 否则这里默认 2=自签 会把 ③ 的选择架空
     sb_batch_tls_override 1 c
-    [[ -z "$c" ]] && c=2
     if [[ "$c" == "2" ]]; then
         local dom
         dom=$(safe_read "自签域名" "$(random_domain)")
@@ -51,11 +58,26 @@ add_config() {
     password=$(openssl rand -hex 16)
     sb_ask_preset tuic "推荐配置"
     ask_cert || return 1
+
+    # ECH (可选): 这三个协议没有 Reality 可选, 内核 ECH 是它们唯一的
+    # SNI 隐藏手段。默认关闭; 开启后仅 sing-box 客户端可用 (需内联
+    # ECHConfigList, mihomo/Clash 不支持) —— 实测 anytls/hysteria2/tuic
+    # 端到端 3/3, 服务端无 "server rejected ECH"。
+    # 这三个协议只走直连, 没有 CDN 在中间终结 TLS, 所以固定 direct。
+    sb_ask_ech "$CERT_DOMAIN" direct
     local congestion
     congestion=$(safe_read "拥塞控制 (bbr/cubic/new-reno)" "bbr")
     case "$congestion" in bbr|cubic|new-reno) ;; *) congestion="bbr"; print_warn "未知算法, 已回落 bbr" ;; esac
 
-    idx=$(get_next_index "$PROTO"); file="$SB_CONFIG_DIR/$PROTO-$idx.json"; tag="${PROTO}${idx}$(tag_form_suffix tls "${SB_PRESET_TAG:-}")"   # 名字体现方案
+    # 取序号与文件路径 (这两行之前被改 tag 时误删了 —— 结果 write_config 收到
+    # 空的路径, 报 "lib.sh: line 1965: : No such file or directory")
+    idx=$(get_next_index "$PROTO"); file="$SB_CONFIG_DIR/$PROTO-$idx.json"
+    # 名称要在 ECH 定了之后再算 (见 sb_resolve_tag)
+    SB_TAG_FORM="tls"; sb_resolve_tag tls
+    tag="${PROTO}${idx}$(tag_form_suffix tls "$SB_TAG_EXTRA")"   # 名字体现方案
+    # 内核 ECH: 我们自己终结 TLS, 解密 inner ClientHello 靠的就是这把私钥
+    local ech_srv; ech_srv=$(sb_ech_json_server)
+    local ech_sep=""; [[ -n "$ech_srv" ]] && ech_sep=", $ech_srv"
     json=$(cat <<EOF
 {
   "inbounds": [
@@ -66,7 +88,7 @@ add_config() {
       "listen_port": $listen_port,
       "users": [ { "uuid": "$uuid", "password": "$password" } ],
       "congestion_control": "$congestion",
-      "tls": { "enabled": true, "alpn": ["h3"], "certificate_path": "$CERT_FILE", "key_path": "$KEY_FILE" }
+      "tls": { "enabled": true, "alpn": ["h3"], "certificate_path": "$CERT_FILE", "key_path": "$KEY_FILE"$ech_sep }
     }
   ]
 }
@@ -79,13 +101,17 @@ EOF
     sb_reload || print_warn "请确认服务状态"
 
     local server_ip; server_ip=$(ask_server_addr)
-    local link="tuic://$uuid:$password@$server_ip:$listen_port?sni=$CERT_DOMAIN&congestion_control=$congestion&alpn=h3$( [[ "$CERT_TRUSTED" == "false" ]] && echo "&allow_insecure=1" )#$tag"
+    local link="tuic://$uuid:$password@$server_ip:$listen_port?sni=$CERT_DOMAIN&congestion_control=$congestion&alpn=h3$( [[ "$CERT_TRUSTED" == "false" ]] && echo "&allow_insecure=1" )#$tag"$(sb_ech_link_params)
+    # 客户端 ech 片段 (内联完整 ECHCONFIGS PEM; 只有 sing-box 客户端认)。
+    # 必须在本 heredoc **之前**算好 —— heredoc 展开时变量若还没赋值就是空的。
+    local ech_cli; ech_cli=$(sb_ech_json_client)
+    local ech_cli_field=""; [[ -n "$ech_cli" ]] && ech_cli_field=", $ech_cli"
     cat > "$SB_OUT_DIR/sb_client-$tag.json" <<EOF
 {
   "outbounds": [
     { "type": "tuic", "tag": "$tag", "server": "$server_ip", "server_port": $listen_port,
       "uuid": "$uuid", "password": "$password", "congestion_control": "$congestion",
-      "tls": { "enabled": true, "server_name": "$CERT_DOMAIN", "alpn": ["h3"], "insecure": $( [[ "$CERT_TRUSTED" == "true" ]] && echo false || echo true ) } }
+      "tls": { "enabled": true, "server_name": "$CERT_DOMAIN", "alpn": ["h3"], "insecure": $( [[ "$CERT_TRUSTED" == "true" ]] && echo false || echo true )$ech_cli_field } }
   ]
 }
 EOF

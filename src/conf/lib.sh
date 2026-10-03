@@ -834,13 +834,17 @@ sb_read_lines_json() { # <提示> -> stdout
 #       "tls: server rejected ECH"; 而且 public_name 会等于你自己的域名,
 #       等于什么都没藏。
 #
-#   直连 SB ECH (Client → SB) —— **已移除**
-#     曾实现过 (服务端 ech.key_path + 客户端内联 ech.config), 实测只有
-#     sing-box 客户端能跑通 (3/3), mihomo 等内核完全不支持; 而且它要求
-#     客户端把整份 ECHCONFIGS PEM 内联进配置, 分享出去也没法让别人用。
-#     与上面"CDN ECH"相比没有实际收益, 却把 ECH 变成一个只有自己能用、
-#     换个客户端就废的假选项。留着更糟 —— 用户选了却发现换个内核就连不上。
-#     所以 ECH 现在只在 CDN 接入下开放 (见 sb_ech_supported)。
+#   直连 SB ECH (Client → SB) —— 重新开放, 但仅限 sing-box 客户端
+#     TLS 就在源站 sing-box 上终结, ECH 密钥对由我们自己生成:
+#       服务端 ech.key_path  = 私钥 (ECH KEYS PEM)
+#       客户端 ech.config    = 内联整份 ECHCONFIGS PEM (公钥侧)
+#     已实测 anytls / hysteria2 / tuic 三个协议端到端 3/3 (2026-10):
+#     服务端与客户端配置 check 全过, 关/开 ECH 对照均连通, 且服务端日志里
+#     没有 server rejected ECH —— 说明加密的 inner ClientHello 被成功解密。
+#     **限制**: 客户端必须内联整份 PEM, mihomo / Clash 系内核不认这种形式,
+#     所以它只能作为**显式选配**, 不能默认开, 也不能进 CDN 那三个协议的
+#     常规路径 (那几个要兼容 mihomo)。对 anytls/hysteria2/tuic 意义不同:
+#     它们本来就没有 Reality 可选, 内核 ECH 是它们唯一的 SNI 隐藏手段。
 #
 # 下面两个函数分别实现这两条路, 由 sb_ask_ech 按 ACCESS_MODE 分流。
 # URL 编码 (分享链接的 ech= 参数要用)
@@ -878,9 +882,12 @@ SB_ECH_QUERY_PARAM="${SB_ECH_PUBLIC_NAME}+${SB_ECH_DNS_UPSTREAM}"
 #             (sing-box 的 ech.config 只认内联 PEM, 见 sb_ech_json_client),
 #             mihomo/Clash 这类内核完全不支持, 实际没人用。
 # 所以直连一律不问 ECH, 避免给出一个"看着能用、换个内核就废"的选项。
+#   cdn / cdn-nginx → Cloudflare ECH (通用, mihomo 也能用)
+#   direct           → 内核 ECH    (仅 sing-box 客户端, 见上方实测记录)
+# 第二个参数可传 "kernel-only" —— 只对没有 CDN 能力的协议用内核 ECH。
 sb_ech_supported() {
     case "${1:-}" in
-        cdn|cdn-nginx) return 0 ;;
+        cdn|cdn-nginx|direct) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -901,13 +908,52 @@ sb_ech_dns_published() { # <域名>
     printf '%s' "$out" | grep -q 'ech="'
 }
 
-# 直连 ECH 的密钥生成已移除。
-# 以前它给"直连 ECH"准备密钥, 但那条路走不通: ECHConfigList 的私钥必须由
-# 真正终结 TLS 的那一端持有。直连时我们自己终结, 但客户端 (mihomo/Clash/
-# 大多数 sing-box 以外的实现) 都不认内联 PEM 的 ech.config, 等于只有自己
-# 能用自己。CDN 模式下私钥在 Cloudflare 手里, 客户端从 DNS 自取, 才是通用做法。
-# 所以 ECH 现在只在 CDN 接入下开放 (见 sb_ech_supported)。
-
+# 直连 (内核) ECH 的密钥生成 —— 只在 direct 模式用。
+#
+# `sing-box generate ech-keypair <域名>` 一次输出两份 PEM:
+#   ECH CONFIGS = 公钥侧 (给客户端内联进 ech.config)
+#   ECH KEYS    = 私钥侧 (留在服务端 ech.key_path, 用来解密 inner ClientHello)
+# 两份必须成对: 客户端拿 CONFIGS 加密, 服务端拿 KEYS 解密。
+# 同域名复用同一份文件, 重复建节点不会把已有节点的密钥换掉。
+#
+# 注意与 CDN 模式的区别: CDN 下这把私钥在 Cloudflare 手里, 源站不需要;
+# 直连下我们自己终结 TLS, 所以私钥必须留在源站, 客户端只拿公钥。
+sb_ech_generate() { # <域名>
+    local domain="$1" dir="$SB_ROOT/ech"
+    SB_ECH_KEY_FILE="" SB_ECH_CONFIG_FILE=""
+    [[ -n "$domain" ]] || return 1
+    command -v "$SB_BIN" >/dev/null 2>&1 || return 1
+    mkdir -p "$dir" || return 1
+    local safe; safe=$(printf '%s' "$domain" | tr -c 'A-Za-z0-9._-' '_')
+    local kf="$dir/${safe}_ech.key.pem" cf="$dir/${safe}_ech.config.pem"
+    # 已存在就复用 —— 换一份密钥会让此前所有客户端产物失效
+    if [[ -s "$kf" && -s "$cf" ]]; then
+        SB_ECH_KEY_FILE="$kf"; SB_ECH_CONFIG_FILE="$cf"; return 0
+    fi
+    local out
+    out=$("$SB_BIN" generate ech-keypair "$domain" 2>/dev/null) || return 1
+    printf '%s\n' "$out" | python3 -c '
+import sys, os
+kf, cf = sys.argv[1], sys.argv[2]
+buf, cur = {}, None
+for line in sys.stdin:
+    line = line.rstrip("\n")
+    if "BEGIN ECH CONFIGS" in line: cur = "c"; buf[cur] = [line]; continue
+    if "BEGIN ECH KEYS" in line:    cur = "k"; buf[cur] = [line]; continue
+    if "END ECH" in line:
+        if cur: buf[cur].append(line); cur = None
+        continue
+    if cur: buf[cur].append(line)
+# 头尾行必须完整保留 —— sing-box 只认完整 PEM, 缺 BEGIN/END 会报
+# "invalid ECH configs pem" (实测踩过: 只给 base64 正文是不行的)
+for key, path in (("k", kf), ("c", cf)):
+    if key in buf and buf[key]:
+        open(path, "w").write("\n".join(buf[key]) + "\n")
+' "$kf" "$cf" 2>/dev/null || return 1
+    [[ -s "$kf" && -s "$cf" ]] || return 1
+    chmod 600 "$kf"
+    SB_ECH_KEY_FILE="$kf"; SB_ECH_CONFIG_FILE="$cf"; return 0
+}
 # 只问一次, 且**只在 CDN 接入下才问** (sb_ech_supported 决定)。
 # ECHConfigList 由 Cloudflare 发布、私钥在 Cloudflare 手里, 客户端从 DNS 自取;
 # 源站不需要任何证书材料, 也不需要改配置。
@@ -919,12 +965,14 @@ sb_ask_ech() { # <域名> <ACCESS_MODE>
     # 客户端渲染要用 (CDN 模式的 query_server_name), 所以即便后面判定为
     # 不开启也要留下域名, 否则客户端片段会拼出一个空的 query_server_name
     SB_ECH_DOMAIN="$domain"
-    # 直连场景不问: 前面没有 CDN 终结 TLS, 自己持密钥的 ECH 只有
-    # sing-box 客户端认 (还要求内联整份 PEM), mihomo/Clash 全不支持。
     sb_ech_supported "$mode" || return 0
     if [[ -n "${SB_BATCH:-}" ]]; then
         [[ "${SB_BATCH_ECH:-0}" == "1" ]] || return 0
-        SB_ECH_ON=1; SB_ECH_MODE="cdn"
+        if [[ "$mode" == "direct" ]]; then
+            sb_ech_generate "$domain" && { SB_ECH_ON=1; SB_ECH_MODE="direct"; } || SB_ECH_ON=0
+        else
+            SB_ECH_ON=1; SB_ECH_MODE="cdn"
+        fi
         return 0
     fi
 
@@ -932,16 +980,33 @@ sb_ask_ech() { # <域名> <ACCESS_MODE>
     local pdef=1
     [[ "${SB_PRESET_ECH:-0}" == "1" ]] && pdef=2
     echo >&2
-    echo -e "${CYAN}  ECH (加密 ClientHello)${RESET} ${CYAN}— 隐藏真实 SNI, 只对 CDN 有效${RESET}" >&2
-    echo -e "    ${GREEN}1)${RESET} 关闭 (推荐)" >&2
-    echo -e "    ${GREEN}2)${RESET} 开启  (用 Cloudflare 发布的 ECHConfigList)" >&2
-    echo -e "    ${MAGENTA}密钥在 Cloudflare 手里, 客户端从 DNS 自动取; 源站不需要任何证书${RESET}" >&2
+    if [[ "$mode" == "direct" ]]; then
+        echo -e "${CYAN}  ECH (加密 ClientHello)${RESET} ${CYAN}— 隐藏真实 SNI${RESET}" >&2
+        echo -e "    ${GREEN}1)${RESET} 关闭 (推荐)" >&2
+        echo -e "    ${GREEN}2)${RESET} 开启  (内核 ECH, 由本机 sing-box 终结 TLS)" >&2
+        echo -e "    ${MAGENTA}注意: 仅 sing-box 客户端可用 —— 需内联 ECHConfigList, mihomo/Clash 不支持${RESET}" >&2
+    else
+        echo -e "${CYAN}  ECH (加密 ClientHello)${RESET} ${CYAN}— 隐藏真实 SNI, 只对 CDN 有效${RESET}" >&2
+        echo -e "    ${GREEN}1)${RESET} 关闭 (推荐)" >&2
+        echo -e "    ${GREEN}2)${RESET} 开启  (用 Cloudflare 发布的 ECHConfigList)" >&2
+        echo -e "    ${MAGENTA}密钥在 Cloudflare 手里, 客户端从 DNS 自动取; 源站不需要任何证书${RESET}" >&2
+    fi
     local c
     read -r -p "    请选择 [1-2, 回车=${pdef}]: " c || { echo; return 0; }
     c=$(clean_input "$c"); [[ -z "$c" ]] && c=$pdef
     [[ "$c" == "2" ]] || return 0
 
-    # 先确认域名确实发布了 ech= 参数, 否则开了也是白开
+    if [[ "$mode" == "direct" ]]; then
+        if sb_ech_generate "$domain"; then
+            SB_ECH_ON=1; SB_ECH_MODE="direct"
+            print_ok "ECH 已启用 (内核模式, 密钥: $(basename "$SB_ECH_KEY_FILE"), 仅 sing-box 客户端)"
+        else
+            print_warn "ECH 密钥生成失败, 继续用未加密 SNI (节点不受影响)"
+        fi
+        return 0
+    fi
+
+    # CDN 模式: 先确认域名确实发布了 ech= 参数, 否则开了也是白开
     if sb_ech_dns_published "$domain"; then
         SB_ECH_ON=1; SB_ECH_MODE="cdn"
         print_ok "ECH 已启用 (CDN 模式, 客户端将从 DNS 获取 Cloudflare 的 ECHConfigList)"
@@ -956,9 +1021,12 @@ sb_ask_ech() { # <域名> <ACCESS_MODE>
 # CDN 模式返回空: TLS 在 Cloudflare 终止, 源站根本看不到 ClientHello,
 # 写 key_path 只会误导排障。
 sb_ech_json_server() {
-    # 恒空: ECH 现在只在 CDN 接入下开放, 而 CDN 模式下 TLS 在 Cloudflare
-    # 终结, 源站根本看不到 ClientHello, 写 key_path 只会误导排障。
-    return 0
+    # CDN 模式恒空: TLS 在 Cloudflare 终结, 源站根本看不到 ClientHello,
+    # 写 key_path 只会误导排障。
+    # 内核模式要写: 我们自己终结 TLS, 解密 inner ClientHello 靠的就是这把私钥。
+    [[ "${SB_ECH_ON:-0}" == "1" && "${SB_ECH_MODE:-}" == "direct" ]] || return 0
+    [[ -s "${SB_ECH_KEY_FILE:-}" ]] || return 0
+    printf '"ech": { "enabled": true, "key_path": "%s" }' "$SB_ECH_KEY_FILE"
 }
 
 # 客户端 TLS 里的 ech 片段 (供各协议并进 outbound.tls)
@@ -967,17 +1035,41 @@ sb_ech_json_server() {
 # 那边不存在, 曾导致所有 ECH 节点实测 0/3。
 sb_ech_json_client() {
     [[ "${SB_ECH_ON:-0}" == "1" ]] || return 0
-    [[ "${SB_ECH_MODE:-}" == "cdn" ]] || return 0
-    [[ -n "${SB_ECH_DOMAIN:-}" ]] || return 0
-    printf '"ech": { "enabled": true, "query_server_name": "%s" }' "$SB_ECH_DOMAIN"
+    case "${SB_ECH_MODE:-}" in
+        cdn)
+            [[ -n "${SB_ECH_DOMAIN:-}" ]] || return 0
+            printf '"ech": { "enabled": true, "query_server_name": "%s" }' "$SB_ECH_DOMAIN"
+            ;;
+        direct)
+            # 必须内联**完整 PEM** (含 BEGIN/END ECH CONFIGS 头尾行):
+            #   ech.config      = 内联 PEM  ← 用这个
+            #   ech.config_path = 本地文件路径, 那是**服务端**机器上的绝对
+            #                     路径, 写进客户端产物客户端必然打不开
+            #                     (实测所有 ECH 节点 0/3)
+            #   ech.configs     = 内核 1.14 不认 (unknown field)
+            [[ -s "${SB_ECH_CONFIG_FILE:-}" ]] || return 0
+            local cf; cf=$(jq -Rs . < "$SB_ECH_CONFIG_FILE")
+            [[ "$cf" != '""' ]] || return 0
+            printf '"ech": { "enabled": true, "config": %s }' "$cf"
+            ;;
+    esac
 }
 
 # 分享链接参数: 同样只有 CDN 形式 (客户端从 DNS 自取 ECHConfigList)
 sb_ech_link_params() {
     [[ "${SB_ECH_ON:-0}" == "1" ]] || return 0
-    [[ "${SB_ECH_MODE:-}" == "cdn" ]] || return 0
-    [[ -n "${SB_ECH_DOMAIN:-}" ]] || return 0
-    printf '&ech=%s' "$(sb_urlencode "$SB_ECH_QUERY_PARAM")"
+    case "${SB_ECH_MODE:-}" in
+        cdn)
+            [[ -n "${SB_ECH_DOMAIN:-}" ]] || return 0
+            printf '&ech=%s' "$(sb_urlencode "$SB_ECH_QUERY_PARAM")"
+            ;;
+        direct)
+            # 内核 ECH: 链接里带 ECHCONFIGS 正文 (去掉 PEM 头尾行)。
+            # 只有认这个形式的客户端能用, 也就是 sing-box。
+            [[ -s "${SB_ECH_CONFIG_FILE:-}" ]] || return 0
+            printf '&ech=%s' "$(sb_urlencode "$(sed '1d;$d' "$SB_ECH_CONFIG_FILE" | tr -d '\n\r')")"
+            ;;
+    esac
 }
 
 # 节点名的**最终裁决**。必须在 ECH / 接入方式都确定之后调用。
@@ -1293,11 +1385,14 @@ SB_PRESETS=(
     "anytls|reality|① 隐匿优先 · REALITY|无|无||reality|Reality 免证书; AnyTLS 本身已带一层 TLS 伪装|REALITY|"
     "anytls|reality-pad|② REALITY + padding|无|无|pad|reality|开 padding 填充实包大小, 抗流量分析|REALITY+pad|pad"
     "anytls|tls-pad|③ TLS + padding|无|无|pad|selfsign|自签 + padding; 无 CDN 无 Reality 时的稳选|TLS+pad|pad"
+    "anytls|tls-ech|④ TLS + 内核 ECH|无|无||selfsign|内核 ECH 加密 ClientHello, 隐藏真实 SNI (仅 sing-box 客户端)|TLS+ECH|ech"
     "shadowsocks|ss-web|① 网页党 (省资源)|无|web||无|网页浏览; 单连接流数压到 1, 内存占用最低|网页|"
     "shadowsocks|ss-video|② 视频党 (均衡)|无|video||无|默认档; 看视频 + 日常网页都够用|视频|"
     "shadowsocks|ss-dl|③ 下载党 (高吞吐)|无|download||无|大文件/长连接; 单连接多流并行|下载|"
     "hysteria2|h2-default|① 推荐默认|无|无||真证书|Hysteria2 参数已是最优默认 (BBR + Salamander)|默认|"
+    "hysteria2|h2-ech|② TLS + 内核 ECH|无|无||真证书|内核 ECH 加密 ClientHello, 隐藏真实 SNI (仅 sing-box 客户端)|TLS+ECH|ech"
     "tuic|tuic-default|① 推荐默认|无|无||真证书|TUIC 参数已是最优默认 (BBR + Salamander)|默认|"
+    "tuic|tuic-ech|② TLS + 内核 ECH|无|无||真证书|内核 ECH 加密 ClientHello, 隐藏真实 SNI (仅 sing-box 客户端)|TLS+ECH|ech"
     "naive|naive-real|① 真证书 (推荐)|无|无||真证书|naiveproxy 走真证书, 客户端无需 insecure|真证书|"
     "naive|naive-self|② 自签 + 伪装域名|无|无||selfsign|自签证书 + 伪装域名; 客户端需 pin 钉扎||"
 )
@@ -1384,18 +1479,14 @@ sb_ask_preset() { # <协议> [菜单标题]
         [[ "$extra" == *pad* ]] && SB_PRESET_PAD=1
         # 标签里带 CDN 的方案 (走 Cloudflare 回源)
         [[ "$tag" == *CDN* ]] && SB_PRESET_CDN=1
-        # 防呆: ECH 是 **CDN 专属**。ECH 的意义在于让客户端连 CDN 时把真实
-        # SNI 加密掉, ECHConfigList 的私钥在 Cloudflare 手里 —— 直连场景
-        # 前面没有 CDN 终结 TLS, 我们自己持密钥加密 ClientHello (direct 模式)
-        # 只有 sing-box 客户端认, 且要求客户端内联整份 PEM, 兼容性很差。
-        # 所以直连方案一律不带 ECH, ECH 只在 CDN 接入下才问。
-        if [[ "$SB_PRESET_ECH" == "1" && "$SB_PRESET_CDN" != "1" ]]; then
-            SB_PRESET_ECH=0
-            SB_PRESET_TAG="${SB_PRESET_TAG//ECH/}"
-            while [[ "$SB_PRESET_TAG" == *+* ]]; do SB_PRESET_TAG="${SB_PRESET_TAG//+/}"; done
-            while [[ "$SB_PRESET_TAG" == *CDN* ]]; do SB_PRESET_TAG="${SB_PRESET_TAG//CDN/}"; done
-            print_warn "ECH 只在 CDN 接入下有意义, 该方案是直连, 已关闭 ECH"
-        fi
+        # ECH 有两条路, 别用"必须 CDN"把其中一条堵死:
+        #   CDN    : ECHConfigList 私钥在 Cloudflare, 客户端从 DNS 自取 (通用)
+        #   内核   : 我们自己持密钥对 (服务端 ech.key_path + 客户端内联 PEM),
+        #            只对没有 CDN 可用的 anytls / hysteria2 / tuic 提供 ——
+        #            它们本来就没有 REALITY 可选, 内核 ECH 是唯一的 SNI 隐藏手段。
+        # 具体哪条由调用 sb_ask_ech 时传的 ACCESS_MODE 决定, 这里只负责把
+        # 预置标签里的 ECH 记下来 (清理标签留到 sb_resolve_tag, 那时才知道
+        # 实际开没开)。
         # 防呆: ECH 与 Reality 是两套不同的藏 SNI 手段, 不能叠加 ——
         # Reality 借的是真实站点的证书, 本来就没有"自己的 SNI" 可加密。
         # 表里已经把它们分到不同行, 这里再兜一层底, 防止以后改表时踩进去。
@@ -1820,11 +1911,16 @@ tag_form_suffix() {
         tls)     base="-TLS" ;;
         *)       base="-plain" ;;
     esac
-    # REALITY 已经由 base 表达了, 标签里再有 "REALITY" 就不重复拼。
+    # base 已经表达的形态, 标签里就别再写一遍:
+    #   reality 形态 + 标签含 REALITY → 否则 "-REALITY-TLS"
+    #   tls 形态     + 标签含 TLS     → 否则 "-TLS-TLS"
     # 标签里的 "+" 是给人看的分隔 (ECH+pad), 拼进名字时要换成 "-",
     # 否则会拼出 "TLS-ECHpad" 这种看不出边界的名字。
     local tag="${2:-}"
-    [[ "$tag" == *REALITY* ]] && tag="${tag//REALITY/}"
+    case "$1" in
+        reality) tag="${tag//REALITY/}" ;;
+        tls)     tag="${tag//TLS/}" ;;
+    esac
     tag="${tag//+/-}"
     # 去掉首尾的 "-", 否则 base+"-"+空会拼出双横线 (REALITY+pad → -REALITY--pad)
     while [[ "$tag" == -* ]]; do tag="${tag#-}"; done
