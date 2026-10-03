@@ -22,9 +22,13 @@ ask_cert() {  # 输出三种: CERT_FILE+KEY_FILE (TLS) / REALITY_ENV (Reality = 
     # 批量生成 Reality 变体时由 batch 显式指定 (见 batch.sh 注释);
     # 只替换交互输入, 复用下方原有 Reality 分支
     local c
+    # 预置方案指定 Reality 时默认落在 3, 一路回车才是真正的一键生成。
+    local def=2 def_hint=""
+    if [[ -n "${SB_PRESET_TR:-}" || -n "${SB_PRESET_FLOW:-}" ]]; then def=3; def_hint=" (预置方案指定 Reality)"; fi
     if [[ "${SB_FORCE_TLS_REALTY:-}" == "1" ]]; then c=3
     else
-        read -r -p "选择: " c; c=$(clean_input "$c"); [[ -z "$c" ]] && c=2
+        echo -e "    ${MAGENTA}${def_hint}${RESET}" >&2
+        read -r -p "选择 (回车=${def}): " c; c=$(clean_input "$c"); [[ -z "$c" ]] && c=$def
         sb_batch_tls_override 1 c
     fi
     if [[ "$c" == "3" ]]; then
@@ -70,6 +74,10 @@ add_config() {
     password=$(openssl rand -base64 18 | tr -d '/+=' | head -c 20)
     # Trojan 与 VLESS/VMess 一样带 transport 字段 (只有这两个协议和三者的
     # 兄弟 VMess 有), 之前完全没做传输选项, 等于把这一个维度整个漏掉了。
+    # Reality 预置方案: 同时决定传输层与流控, 排在传输提问之前,
+    # 后面的默认值和互斥拦截才拿得到决定权。
+    SB_PRESET_PROTO="trojan"; sb_ask_reality_preset
+    SB_PRESET_TR_HINT=$(sb_preset_transport_hint)
     sb_ask_transport
     ask_cert || return 1
     [[ -z "$TR_HOST" ]] && TR_HOST="$CERT_DOMAIN"
@@ -95,6 +103,14 @@ add_config() {
     # ask_cert 已决定: TLS_TYPE=reality 还是 selfsign/real —— 名字体现传输方式
     [[ "${TLS_TYPE:-}" == "reality" ]] && tag="$tag$(tag_form_suffix reality)" || tag="$tag$(tag_form_suffix tls)"
     local json tr_json tr_line=""
+    # flow (XTLS Vision) 是 VLESS 独有: sing-box 的 Trojan/VMess
+    # outbound 选项里没有 flow 字段, 写了内核会直接报 unknown field。
+    # 预置方案是按 Reality 场景设计的, 这里必须把 vision 剥掉, 否则
+    # 用户选 ① 预置会得到一个连不上的节点。
+    if [[ -n "${FLOW:-}" ]]; then
+        print_warn "flow=xtls-rprx-vision 仅 VLESS 支持, 本协议已忽略"
+        FLOW=""
+    fi
     sb_ask_multiplex trojan server; local _mux=$(sb_mux_json_server)
     # ECH 只在 CDN 模式问; 两个模板的 tls 行都要插
     sb_ask_ech "$CERT_DOMAIN" "${ACCESS_MODE:-direct}"
@@ -104,6 +120,13 @@ add_config() {
     # 在运行时把它们的参数当命令执行, 而且报错位置还会被归到别处, 极难查。
     # 统一改成 heredoc 出基础结构, 之后用 jq 合并 (和 vmess 同一套路)。
     if [[ "${TLS_TYPE:-}" == "reality" ]]; then
+        # Reality 也能配传输层 —— 内核实测 ws+Reality 3/3 连通 (只要不带
+        # flow=xtls-rprx-vision, 那个与传输互斥)。原来这个分支漏了
+        # tr_line, 于是选了 ws/grpc/httpupgrade 也静默退化成裸 TCP。
+        local tr_json_r; tr_json_r=$(sb_transport_json_server "$TR_TYPE" "$TR_PATH" "$TR_SVC" "$TR_HOST")
+        local tr_line_r=""
+        [[ -n "$tr_json_r" ]] && tr_line_r="      \"transport\": $tr_json_r,
+"
         json=$(cat <<EOF
 {
   "inbounds": [
@@ -113,7 +136,7 @@ add_config() {
       "listen": "$listen_ip",
       "listen_port": $listen_port,
       "users": [ { "password": "$password" } ],
-      "tls": {
+${tr_line_r}      "tls": {
         "enabled": true,
         "server_name": "$CERT_DOMAIN",
         "reality": {
@@ -173,7 +196,7 @@ EOF
     # CDN 只在 443 上提供服务; 沿用源站端口会得到连不通的 域名:源站端口
     sb_node_is_cdn "$file" && listen_port=443
     if [[ "$mode_tls" == "reality" ]]; then
-        link="trojan://$password@$server_ip:$listen_port?sni=$CERT_DOMAIN&security=reality&pbk=$T_RE_PUB&sid=$T_RE_SID&type=tcp$mux_link$ech_link$fr_link#$tag"
+        link="trojan://$password@$server_ip:$listen_port?sni=$CERT_DOMAIN&security=reality&pbk=$T_RE_PUB&sid=$T_RE_SID$(sb_transport_link_params "$TR_TYPE" "$TR_PATH" "$TR_SVC" "$TR_HOST")$mux_link$ech_link$fr_link#$tag"
     else
         # alpn 必须跟着传输走: grpc / http(H2) 要 h2, 写死 http/1.1 会
         # 让客户端在 TLS 握手时与需要 h2 的服务端协商失败。

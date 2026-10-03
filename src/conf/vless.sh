@@ -27,9 +27,41 @@ ask_cert() {
     echo "TLS 证书：" >&2
     echo "  1) 手动输入 crt/key 路径" >&2
     echo "  2) 生成自签证书 (客户端需 insecure/pin)" >&2
+    echo "  3) Reality (无证书, 借用真实站点 TLS 握手)" >&2
     local c f k
-    read -r -p "  选择 (默认 2=自签): " c
-    c=$(clean_input "$c"); [[ -z "$c" ]] && c=2
+    # 预置方案本身就叫 "Reality 预置", 所以默认落在 3 而不是自签 ——
+    # 一路回车才是名副其实的"一键生成"。
+    local cert_def=2 cert_hint=""
+    if [[ -n "${SB_PRESET_TR:-}" || -n "${SB_PRESET_FLOW:-}" ]]; then
+        cert_def=3; cert_hint=" (预置方案指定 Reality)"
+    fi
+    [[ -n "$cert_hint" ]] && echo -e "    ${MAGENTA}${cert_hint}${RESET}" >&2
+    read -r -p "  选择 (回车=${cert_def}): " c
+    c=$(clean_input "$c"); [[ -z "$c" ]] && c=$cert_def
+    if [[ "$c" == "3" ]]; then
+        local kp rnd sid
+        [[ -f "$SB_OUT_DIR/reality-keys.json" ]] && {
+            REAL_PRIV=$(jq -r .private_key "$SB_OUT_DIR/reality-keys.json")
+            REAL_PUB=$(jq -r .public_key "$SB_OUT_DIR/reality-keys.json")
+        }
+        [[ -z "${REAL_PRIV:-}" ]] && {
+            mapfile -t kp < <("$SB_BIN" generate reality-keypair 2>/dev/null | awk -F': ' '/PrivateKey/{print $2}')
+            [[ ${#kp[@]} -ge 1 ]] && { REAL_PRIV="${kp[0]}"; REAL_PUB="${kp[1]}"; }
+        }
+        [[ -z "${REAL_PRIV:-}" ]] && { print_err "无法生成 Reality 密钥对"; return 1; }
+        mkdir -p "$SB_OUT_DIR"
+        printf '{"private_key":"%s","public_key":"%s"}\n' "$REAL_PRIV" "$REAL_PUB" \
+            > "$SB_OUT_DIR/reality-keys.json"
+        rnd=$(reality_random_domain)
+        sid=$(sb_real_shortid)
+        # Reality 的 server_name 就是握手目标 —— 客户端拿它当 SNI, 服务端拿它
+        # 转发 TLS。必须是**真实可解析**的域名, 解析不了服务端会直接拒绝。
+        [[ -z "${rnd}" ]] && { print_err "Reality 目标域名池为空"; return 1; }
+        CERT_DOMAIN="$rnd"; REAL_SID="$sid"; CERT_MODE="reality"
+        CERT_FILE=""; KEY_FILE=""; CERT_TRUSTED=false
+        return 0
+    fi
+    CERT_MODE="real"
     if [[ "$c" == "2" ]]; then
         local dom
         dom=$(safe_read "自签域名" "$(random_domain)")
@@ -52,15 +84,21 @@ add_config() {
     server_ip=$(ask_server_addr)
     listen_port=$(safe_read_port)
     uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen)
+    # Reality 预置方案放在最前面: 它同时决定传输层和流控, 先问它, 后面
+    # 每一步才能给出正确的默认值 / 正确地关掉互斥项。
+    SB_PRESET_PROTO="vless"; sb_ask_reality_preset
     # 传输先问: ws/grpc/http/httpupgrade 四种 HTTP 类传输都能走 CDN, 裸 TCP 不能。
+    SB_PRESET_TR_HINT=$(sb_preset_transport_hint)
     sb_ask_transport
     ask_cert || return 1
     # http 传输的 host 用证书域名 —— sing-box 会拿它做 Host 校验
     [[ -z "$TR_HOST" ]] && TR_HOST="$CERT_DOMAIN"
 
-    # 接入方式在证书选定之后询问: 只有"真证书 + HTTP 类传输"才有 CDN 可选。
-    # 监听地址由它决定 (CDN+Nginx 必须只听 127.0.0.1), 所以放到这一步问。
-    local trusted="no"
+    # Reality 与 CDN 互斥: Cloudflare 在边缘就终止了 TLS, 端到端的 Reality
+    # 握手被中间一跳打断必然失败 (实测 fscarmen 脚本的 Reality 节点也一律
+    # 走直连端口)。所以 Reality 变体强制直连, 连问都不问。
+    local trusted="no" ACCESS_MODE="direct"
+    if [[ "${CERT_MODE:-}" != "reality" ]]; then
     # 判定"是否真证书"必须用 lib.sh 里已有的能力, 不能调 cdn.sh 的函数
     # (protocol 脚本不一定加载了 cdn.sh, 调不到就等于"不是真证书" -> CDN 选项被藏)
     sb_key_for "$CERT_FILE" >/dev/null 2>&1 && \
@@ -70,6 +108,19 @@ add_config() {
     # 命令替换会让函数里的 read 跑在子 shell 上, stdin 可能已耗尽,
     # 结果是"明明选了 CDN+Nginx 却还在问监听地址"。
     ask_access_mode "$TR_TYPE" "$trusted"
+    fi
+    # XTLS Vision 流控 —— Reality 的正路, 与 multiplex **互斥**。
+    # 必须排在 sb_ask_multiplex 前面: 后者会读 FLOW 决定要不要放行 mux 菜单。
+    # 有传输层时 sb_flow_conflict 会直接跳过提问 (vision + ws 运行时必然失败)。
+    if [[ "${CERT_MODE:-}" == "reality" ]]; then
+        if [[ -n "${SB_PRESET_FLOW:-}" ]]; then
+            FLOW="$SB_PRESET_FLOW"; print_ok "flow: $FLOW (预置方案指定)"
+        else
+            sb_ask_flow "$CERT_MODE" "$TR_TYPE"
+        fi
+    else
+        FLOW=""
+    fi
     # multiplex 仅 VLESS/VMess/Trojan/SS 支持; 服务端侧无 protocol 字段, 由内核自动识别
     sb_ask_multiplex vless server; mux_json=$(sb_mux_json_server)
     case "$ACCESS_MODE" in
@@ -79,14 +130,30 @@ add_config() {
     esac
 
     idx=$(get_next_index "$PROTO"); file="$SB_CONFIG_DIR/$PROTO-$idx.json"; tag="${PROTO}${idx}"
-    tag="$tag$(tag_form_suffix tls)"   # 名字体现传输方式
-    local tls_line alpn tr_json tr_line="" mux_line=""
+    # Reality 变体的名字要带 -REALITY —— tag 会写进 inbound 和客户端产物,
+    # 名字里能一眼看出这个节点是 Reality 才不会在管理界面里混淆。
+    if [[ "${CERT_MODE:-}" == "reality" ]]; then
+        tag="$tag$(tag_form_suffix reality)"
+    else
+        tag="$tag$(tag_form_suffix tls)"
+    fi
+    local tls_line alpn tr_json tr_line="" mux_line="" user_flow=""
     alpn=$(sb_transport_alpn "$TR_TYPE")
-    tls_line="\"enabled\": true, \"certificate_path\": \"$CERT_FILE\", \"key_path\": \"$KEY_FILE\", \"alpn\": $alpn"
-    # ECH 只在 CDN 模式问 (直连时加密自己的 SNI 没有收益, 还多一份 config 要维护)
-    sb_ask_ech "$CERT_DOMAIN" "${ACCESS_MODE:-direct}"
-    local ech_srv=$(sb_ech_json_server)
-    [[ -n "$ech_srv" ]] && tls_line="$tls_line, $ech_srv"
+    user_flow=$(sb_flow_json_user)     # Reality + vision 时给 users[] 加 flow
+    if [[ "${CERT_MODE:-}" == "reality" ]]; then
+        # Reality 不需要证书文件, 信任来自密钥对; handshake.server 必须真实
+        # 可解析 (解析不了服务端会直接 reject, 见 fscarmen 的做法)。
+        tls_line="\"enabled\": true, \"server_name\": \"$CERT_DOMAIN\", \"reality\": { \"enabled\": true, \"handshake\": { \"server\": \"$CERT_DOMAIN\", \"server_port\": 443 }, \"private_key\": \"$REAL_PRIV\", \"short_id\": [ \"$REAL_SID\" ] }"
+    else
+        tls_line="\"enabled\": true, \"certificate_path\": \"$CERT_FILE\", \"key_path\": \"$KEY_FILE\", \"alpn\": $alpn"
+    fi
+    # ECH 只在 CDN 模式问 (直连时加密自己的 SNI 没有收益, 还多一份 config 要维护);
+    # Reality 与 CDN 互斥, 这里不会命中。
+    if [[ "${CERT_MODE:-}" != "reality" ]]; then
+        sb_ask_ech "$CERT_DOMAIN" "${ACCESS_MODE:-direct}"
+        local ech_srv=$(sb_ech_json_server)
+        [[ -n "$ech_srv" ]] && tls_line="$tls_line, $ech_srv"
+    fi
     # 裸 TCP: sing-box 里不存在 "type":"tcp", 必须**整个省略 transport 字段。
     # 整行一起加/去 —— 只在字段之间插逗号会出现 ",," 这种双逗号。
     tr_json=$(sb_transport_json_server "$TR_TYPE" "$TR_PATH" "$TR_SVC" "$TR_HOST")
@@ -104,7 +171,7 @@ add_config() {
       "tag": "$tag",
       "listen": "$listen_ip",
       "listen_port": $listen_port,
-      "users": [ { "name": "user", "uuid": "$uuid" } ],
+      "users": [ { "name": "user", "uuid": "$uuid"$user_flow } ],
 $tr_line$mux_line      "tls": { $tls_line }
     }
   ]
@@ -137,14 +204,28 @@ EOF
       \"transport\": $ctr_json"
     local mux_link ech_link
     mux_link=$(sb_mux_link_params); ech_link=$(sb_ech_link_params)
-    local link="vless://$uuid@$server_ip:$listen_port?encryption=none&security=tls&sni=$CERT_DOMAIN$link_params$mux_link$ech_link$fr_link#$tag"
+    # Reality 客户端的 tls 块与证书形态完全不同: 要 pbk/sid, 不要
+    # certificate_path 也不需要 insecure/pin —— 信任由公钥校验建立。
+    # uTLS 指纹必须在拼链接**之前**问 (两条分支都要用到 fp), 所以统一提前。
     utls_fp=$(ask_utls_fingerprint)
+    local tls_cli flow_link="" flow_cli="" link
+    if [[ -n "$FLOW" ]]; then
+        flow_cli=", \"flow\": \"$FLOW\""      # outbound 顶层 (JSON)
+        flow_link="&flow=$FLOW"              # 分享链接 (URL query)
+    fi
+    if [[ "${CERT_MODE:-}" == "reality" ]]; then
+        tls_cli="\"enabled\": true, \"server_name\": \"$CERT_DOMAIN\", \"utls\": { \"enabled\": true, \"fingerprint\": \"$utls_fp\" }, \"reality\": { \"enabled\": true, \"public_key\": \"$REAL_PUB\", \"short_id\": \"$REAL_SID\" }${frag_cli:+, $frag_cli}"
+        link="vless://$uuid@$server_ip:$listen_port?encryption=none&security=reality&sni=$CERT_DOMAIN&fp=$utls_fp&pbk=$REAL_PUB&sid=$REAL_SID$link_params$flow_link$fr_link#$tag"
+    else
+        tls_cli="\"enabled\": true, \"server_name\": \"$CERT_DOMAIN\", \"insecure\": $( [[ "$CERT_TRUSTED" == "true" ]] && echo false || echo true ), \"utls\": { \"enabled\": true, \"fingerprint\": \"$utls_fp\" }${ech_cli:+, $ech_cli}${frag_cli:+, $frag_cli} }"
+        link="vless://$uuid@$server_ip:$listen_port?encryption=none&security=tls&sni=$CERT_DOMAIN$link_params$mux_link$ech_link$fr_link#$tag"
+    fi
     cat > "$SB_OUT_DIR/sb_client-$tag.json" <<EOF
 {
   "outbounds": [
     { "type": "vless", "tag": "$tag", "server": "$server_ip", "server_port": $listen_port,
-      "uuid": "$uuid",
-      "tls": { "enabled": true, "server_name": "$CERT_DOMAIN", "insecure": $( [[ "$CERT_TRUSTED" == "true" ]] && echo false || echo true ), "utls": { "enabled": true, "fingerprint": "$utls_fp" }${ech_cli:+, $ech_cli}${frag_cli:+, $frag_cli} }$ctr_sep${muxc:+,
+      "uuid": "$uuid"$flow_cli,
+      "tls": { $tls_cli }$ctr_sep${muxc:+,
         $muxc} }
   ]
 }
