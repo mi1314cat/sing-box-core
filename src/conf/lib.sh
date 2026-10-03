@@ -624,7 +624,23 @@ sb_ask_transport() {
         echo "    ${CYAN}3)${RESET} http (HTTP/2)   ${DIM:-}(低优先级: Xray 已移除此传输)${RESET}" >&2
         echo "    ${CYAN}4)${RESET} httpupgrade    ${DIM:-}(主动探测最难识别, CPU 开销最低)${RESET}" >&2
         echo "    ${CYAN}5)${RESET} 裸 TCP          ${DIM:-}(不写 transport 字段)${RESET}" >&2
-        t=$(safe_read "选择" "1")
+        # 预置方案指定的传输: 菜单照常打出来 (用户仍能改), 但回车直接落在
+        # 它身上。用独立变量而不是复用 SB_BATCH_TRANSPORT —— 后者会把整个
+        # sb_ask_transport 切到不提问的批量分支, 等于剥夺用户改动的机会。
+        local preset_tr="${SB_PRESET_TR_HINT:-}" preset_tr_idx=""
+        if [[ -n "$preset_tr" ]]; then
+            case "$preset_tr" in
+                ws)          preset_tr_idx=1 ;;
+                grpc)        preset_tr_idx=2 ;;
+                http)        preset_tr_idx=3 ;;
+                httpupgrade) preset_tr_idx=4 ;;
+                tcp)         preset_tr_idx=5 ;;
+            esac
+            [[ -n "$preset_tr_idx" ]] && \
+                echo -e "    ${MAGENTA}(预置方案指定 ${preset_tr_idx} —— 回车即用, 输别的数字可改)${RESET}" >&2
+        fi
+        local def_tr_idx="${preset_tr_idx:-1}"
+        t=$(safe_read "选择 [1-5, 回车=${def_tr_idx}]" "$def_tr_idx")
     fi
     # 同时接受菜单序号和传输名 —— 批量走的是 SB_BATCH_TRANSPORT=grpc 这种
     # **名字**, 只认序号的话它会落到 *) 兜底变成 ws, 表现为"传了也没用"。
@@ -1158,6 +1174,149 @@ SB_MUX_TIER_PROTO="h2mux"
 # 菜单展示顺序 (英文 id)
 SB_MUX_TIER_ORDER=(web video download)
 
+# ══════════════════════════════════════════════════════════════════════
+# Reality 流控 (flow)
+# ══════════════════════════════════════════════════════════════════════
+# sing-box 的 vless users[].flow 目前只有 xtls-rprx-vision 一个取值。它
+# 是 XTLS 层级的流控 —— 在 Reality 的类 TLS 握手之上再套一层"按数据形态
+# 分流 + 零拷贝", 比 multiplex 更省 CPU 也更不容易被侧信道统计识别。
+#
+# 与 multiplex 的关系是**二选一**, 不是叠加。两者都在争同一层带宽预算:
+#   vision  = 改写数据流, 适合"少而长"的大流量 (视频/下载/下载器)
+#   multiplex = 多路复用 TCP, 适合"多而短"的小请求 (网页/爬虫/IM)
+# 同时开等于两套机制互相拖慢, 收益为负。
+#
+# ⚠ 与 transport 的互斥是实测出来的, 不是猜的 —— 见下方 sb_flow_conflict。
+# sing-box check 对 flow + ws/grpc/httpupgrade **一律放行**, 但运行时
+# Reality 校验直接失败:
+#   裸TCP + flow=vision              → 3/3 连通
+#   WS   + flow=vision              → 0/3 reality verification failed
+#   WS   + 无flow + multiplex        → 3/3 连通
+# 所以必须由面板拦, 内核拦不住。
+SB_FLOW_VALUES=(xtls-rprx-vision)
+SB_FLOW_DEFAULT="xtls-rprx-vision"
+
+# 有传输层就配不了 vision。返回 0 = 冲突。
+sb_flow_conflict() { # <TR_TYPE> -> 冲突时 return 0
+    local tr="${1:-}"
+    [[ -z "$tr" ]] && return 1      # 裸 TCP: 没问题
+    return 0                         # ws/grpc/http/httpupgrade: 冲突
+}
+
+# 该协议/传输是否支持 flow。只有 vless 的 Reality 形态有意义。
+sb_flow_supported() { # <协议> <CERT_MODE> <TR_TYPE>
+    [[ "$1" == "vless" ]] || return 1
+    [[ "$2" == "reality" ]] || return 1
+    sb_flow_conflict "$3" && return 1
+    return 0
+}
+
+sb_ask_flow() { # <CERT_MODE> <TR_TYPE>  -> stdout: flow 取值 (空=不用)
+    FLOW=""
+    local mode="$1" tr="$2"
+    [[ "$mode" == "reality" ]] || return 0
+    # 有传输层直接跳过, 不给用户选一个注定连不上的组合
+    sb_flow_conflict "$tr" && return 0
+    if [[ -n "${SB_BATCH:-}" ]]; then
+        FLOW="${SB_BATCH_FLOW:-$SB_FLOW_DEFAULT}"
+        return 0
+    fi
+    print_title "XTLS Vision 流控 (Reality 专用)"
+    echo "    ${CYAN}1)${RESET} 开启 vision  ${DIM:-}(Reality 的正解, 少而长的大流量)${RESET}" >&2
+    echo "    ${CYAN}2)${RESET} 不开         ${DIM:-}(留给 multiplex 用, 多而短的小请求)${RESET}" >&2
+    local c; c=$(safe_read "选择" "1")
+    [[ "$c" == "2" ]] && return 0
+    FLOW="$SB_FLOW_DEFAULT"
+    print_ok "flow: $FLOW (与 multiplex 互斥, mux 将自动关闭)"
+    return 0
+}
+
+sb_flow_json_user() { # 服务端 inbound users[] 需要 flow
+    [[ -n "$FLOW" ]] || return 0
+    printf ', "flow": "%s"' "$FLOW"
+}
+
+# ══════════════════════════════════════════════════════════════════════
+# Reality 预置方案
+# ══════════════════════════════════════════════════════════════════════
+# 这些是实战里被反复用的组合, 不是随便凑的档位。格式与 SB_MUX_TIERS 一致:
+#   <id>|<中文显示名>|<传输>|<multiplex档位>|<flow>|<说明>
+#
+# 依据是 fscarmen/sing-box.sh (社区最流行的一键脚本) 的节点表, 它的
+# idx11 就是 "Reality + 裸TCP + xtls-rprx-vision, 明确把 multiplex 关掉",
+# idx19/20 是 "Reality + 传输 + multiplex, 明确不设 flow" —— 与上面
+# sb_flow_conflict 的实测结论完全吻合。
+#
+# 优先级: 隐蔽性 > 兼容性。默认项绝对不能是 CDN/ECH 相关的, 那些要在
+# 完整菜单里自己选。
+SB_REALITY_PRESETS=(
+    "vision|① 隐匿优先|tcp|off|xtls-rprx-vision|抗 DPI 最强, 无任何 Web 特征; 大流量最快"
+    "vision+ws|② 隐匿+伪装流量|ws|video||套一层正常 WS 流量, 需要与网页同形时用"
+    "ws+mux|③ 伪装+高并发|ws|download||多路复用扛并发, 适合爬虫/大量小请求"
+    "grpc+mux|④ gRPC 伪装|grpc|download||需要后端 gRPC 网关, Cloudflare 面板要开开关"
+)
+
+sb_reality_preset_get() { # <preset id> -> stdout: "<传输> <mux档位> <flow>"
+    local want="$1" row rest
+    for row in "${SB_REALITY_PRESETS[@]}"; do
+        [[ "${row%%|*}" == "$want" ]] || continue
+        rest="${row#*|}"; rest="${rest#*|}"
+        printf '%s' "$rest" | cut -d'|' -f1,2,3 | tr '|' ' '
+        return 0
+    done
+    return 1
+}
+
+# 一键套用预置方案。设 SB_PRESET_TR / SB_PRESET_MUX / SB_PRESET_FLOW,
+# 由各协议脚本在正常提问流程里读取 —— 不绕过菜单, 只是把答案预填上,
+# 用户仍然可以在后续提示里改回来。
+sb_ask_reality_preset() {
+    if [[ -n "${SB_BATCH:-}" ]]; then
+        SB_PRESET_TR=""; SB_PRESET_MUX=""; SB_PRESET_FLOW=""
+        return 0
+    fi
+    print_title "Reality 预置方案 (不想选就一路回车, 逐项自己配)"
+    local i=1 row
+    for row in "${SB_REALITY_PRESETS[@]}"; do
+        printf '    %s%s)%s %-22s %s\n' \
+            "$CYAN" "$i" "$RESET" "$(echo "$row" | cut -d'|' -f2)" \
+            "$(echo "$row" | cut -d'|' -f6)" >&2
+        ((i++))
+    done
+    printf '    %s%s)%s 不用预设, 我自己逐项配%s\n' "$CYAN" "$((i))" "$RESET" \
+        "${DIM:-}(回答每一个问题)${RESET}" >&2
+    local c; c=$(safe_read "选择" "1")
+    SB_PRESET_TR=""; SB_PRESET_MUX=""; SB_PRESET_FLOW=""
+    if [[ "$c" =~ ^[0-9]+$ ]] && (( c >= 1 && c <= ${#SB_REALITY_PRESETS[@]} )); then
+        local pid; pid=$(echo "${SB_REALITY_PRESETS[$((c-1))]}" | cut -d'|' -f1)
+        local tr mux flow
+        read -r tr mux flow <<< "$(sb_reality_preset_get "$pid")"
+        # 裸 TCP 必须留成显式的 "tcp" 而不是清空 —— 清空后与"用户没选预设"
+        # 无法区分, 于是传输菜单回落到默认 ws, 预置①的抗 DPI 定位就没了。
+        [[ "$tr" == "裸TCP" ]] && tr="tcp"
+        # vision 是 VLESS 独有 —— 非 vless 协议直接剥掉, 不让用户以为
+        # 选了①就一定带流控。传输和 mux 两项所有 Reality 协议通用。
+        [[ -n "${SB_PRESET_PROTO:-}" && "${SB_PRESET_PROTO}" != "vless" ]] && flow=""
+        SB_PRESET_TR="$tr"; SB_PRESET_MUX="$mux"; SB_PRESET_FLOW="$flow"
+        [[ "$mux" == "off" ]] && SB_PRESET_MUX=""
+        print_ok "预置方案: $(echo "${SB_REALITY_PRESETS[$((c-1))]}" | cut -d'|' -f2,6 | tr '|' ' ')"
+        print_info "下面仍会逐项确认, 想改直接选别的即可"
+    fi
+    return 0
+}
+
+# 预置方案 → sb_ask_transport 的答案。空表示用默认。
+sb_preset_transport_hint() {
+    case "${SB_PRESET_TR:-}" in
+        ws)           echo "ws" ;;
+        grpc)         echo "grpc" ;;
+        httpupgrade)  echo "httpupgrade" ;;
+        http)         echo "http" ;;
+        tcp)          echo "tcp" ;;
+        "")           echo "" ;;     # 没选预设: 不干预, 用菜单默认值
+    esac
+}
+
 sb_mux_tier_get() { # <档位id> -> stdout: "maxconn minstreams maxstreams"
     local want="$1" row rest
     for row in "${SB_MUX_TIERS[@]}"; do
@@ -1189,6 +1348,17 @@ sb_mux_supported() {
 # 批量模式一律关闭: 批量是"一把梭生成全套", 不该替用户做带宽假设。
 sb_ask_multiplex() { # <协议> <server|client>
     local proto="$1" side="${2:-server}"
+
+    # ── 防呆: flow (XTLS Vision) 与 multiplex 互斥 ──────────────────
+    # 两者争同一层带宽预算, 叠加收益为负。flow 由 sb_ask_flow 在此之前
+    # 问过, 这里只做拦截不再询问 —— 用户已经明确选了 vision, 静默关掉
+    # mux 比再弹一次菜单更不容易把人绕晕。
+    if [[ -n "${FLOW:-}" && "${SB_MUX_FORCE_ON:-0}" != "1" ]]; then
+        print_warn "已选 flow=xtls-rprx-vision, multiplex 自动关闭 (两者互斥)"
+        SB_MUX_ON=0
+        return 0
+    fi
+
     SB_MUX_ON=0; SB_MUX_PROTO=""; SB_MUX_MAXCONN=0; SB_MUX_MINSTR=0; SB_MUX_MAXSTR=0
     SB_MUX_PAD=0; SB_MUX_BRUTAL=0; SB_MUX_UP=0; SB_MUX_DOWN=0
 
@@ -1236,7 +1406,15 @@ echo >&2
     default_pos=$(printf '%s\n' "${SB_MUX_TIER_ORDER[@]}" | grep -n "^${SB_MUX_TIER_DEFAULT}$" | cut -d: -f1)
     [[ -n "$default_pos" ]] || default_pos=2
     default_idx=$(( default_pos + 1 ))
-    default_name=$(sb_mux_tier_name "$SB_MUX_TIER_DEFAULT")
+    # 预置方案指定了档位时, 回车直接落在那个档位上 (而不是全局默认)。
+    local preset_mux="${SB_PRESET_MUX:-}" preset_idx=""
+    if [[ -n "$preset_mux" ]]; then
+        local pp ppos
+        ppos=$(printf '%s\n' "${SB_MUX_TIER_ORDER[@]}" | grep -n "^${preset_mux}$" | cut -d: -f1)
+        [[ -n "$ppos" ]] && { preset_idx=$(( ppos + 1 )); default_idx=$preset_idx; }
+        [[ -n "$preset_idx" ]] && default_name="$(sb_mux_tier_name "$preset_mux") (预置)"
+    fi
+    default_name="${default_name:-$(sb_mux_tier_name "$SB_MUX_TIER_DEFAULT")}"
     read -r -p "    请选择 [1-${custom_idx}, 回车=${default_idx} (${default_name})]: " c || { echo; return 0; }
     c=$(clean_input "$c"); [[ -z "$c" ]] && c="$default_idx"
     [[ "$c" == "1" ]] && { print_info "multiplex: 关闭"; return 0; }
@@ -2218,6 +2396,11 @@ sb_latest_version() {
 # ---- 统一 Reality 域名来源（mi1314cat/One-click-script domains.sh）----
 # 运行时拉取并抽取 domains 数组 + random_website()，不本地复制数据
 SB_DOMAINS_SH_URL="${SB_DOMAINS_SH_URL:-https://raw.githubusercontent.com/mi1314cat/One-click-script/main/domains.sh}"
+
+# Reality short_id: 16 位十六进制 = 8 字节。空串是合法且推荐的值
+# (客户端和服务端都允许短到 0 字节), 但随机 8 字节能避免"只有一条连接
+# 恰好 short_id 为空才通过"这种可被主动探测利用的特征。
+sb_real_shortid() { openssl rand -hex 8 2>/dev/null || echo "$(head -c8 /dev/urandom | od -An -tx1 | tr -d ' \n')"; }
 
 reality_random_domain() {
     local tmp

@@ -30,11 +30,15 @@ ask_tls() { # 输出: CERT_MODE|cert_file|key_file|cert_domain|trusted(0|1) 到 
     # 批量生成 Reality 变体时由 batch 显式指定 (依赖应答串会因 safe_read 不消费
     # 队列而整体错位, 见 batch.sh 注释)。只替换交互输入, 复用下方原有分支。
     local c
+    # 预置方案指定 Reality 时默认落在 4, 一路回车才是真正的一键生成。
+    local def=1 def_hint=""
+    if [[ -n "${SB_PRESET_TR:-}" || -n "${SB_PRESET_FLOW:-}" ]]; then def=4; def_hint=" (预置方案指定 Reality)"; fi
     if [[ "${SB_FORCE_TLS_REALTY:-}" == "1" ]]; then c=4
     else
-        read -r -p "选择 (默认 1): " c
+        echo -e "    ${MAGENTA}${def_hint}${RESET}" >&2
+        read -r -p "选择 (回车=${def}): " c
         sb_batch_tls_override 2 c
-        c=$(clean_input "$c"); [[ -z "$c" ]] && c=1
+        c=$(clean_input "$c"); [[ -z "$c" ]] && c=$def
     fi
     case "$c" in
         1) echo "none|||" ;;
@@ -68,6 +72,10 @@ add_config() {
     # Trojan 共用同一份实现 —— 之前 vmess 自带一套菜单, 少 httpupgrade,
     # 而且 4) tcp裸 靠 ttype="" 隐式表达, 新人很容易读成"应该写 type:tcp"。
     local ttype tpath svc
+    # Reality 预置方案: 同时决定传输层与流控, 排在传输提问之前,
+    # 后面的默认值和互斥拦截才拿得到决定权。
+    SB_PRESET_PROTO="vmess"; sb_ask_reality_preset
+    SB_PRESET_TR_HINT=$(sb_preset_transport_hint)
     sb_ask_transport
     ttype="$TR_TYPE"; tpath="$TR_PATH"; svc="$TR_SVC"
 
@@ -100,6 +108,14 @@ add_config() {
     ACCESS_MODE=""
     ask_access_mode "$ttype" "$_trusted"
     # multiplex 仅 VMess/Trojan/VLESS/SS 支持; 服务端侧无 protocol 字段
+    # flow (XTLS Vision) 是 VLESS 独有: sing-box 的 Trojan/VMess
+    # outbound 选项里没有 flow 字段, 写了内核会直接报 unknown field。
+    # 预置方案是按 Reality 场景设计的, 这里必须把 vision 剥掉, 否则
+    # 用户选 ① 预置会得到一个连不上的节点。
+    if [[ -n "${FLOW:-}" ]]; then
+        print_warn "flow=xtls-rprx-vision 仅 VLESS 支持, 本协议已忽略"
+        FLOW=""
+    fi
     sb_ask_multiplex vmess server; local _mux=$(sb_mux_json_server)
     case "$ACCESS_MODE" in
         cdn)        listen_ip="0.0.0.0" ;;
