@@ -3163,6 +3163,106 @@ sb_switch_addr_family() {
 }
 
 # 菜单入口: 问用户要 IPv4 还是 IPv6, 然后切换
+# ---------- 全局切换 uTLS 指纹 ----------
+# 背景: 指纹原本只能在建节点时逐个选, 想换一套指纹就得重建全部节点 (端口 /
+# 凭据全变, 已发出的链接全失效)。而指纹是**纯客户端表现层**的字段, 改它
+# 不影响服务端的任何行为 —— 所以单独做一个批量切换, 只重写产物。
+#
+# 影响范围:
+#   JSON: outbounds[].tls.utls.fingerprint  (sing-box 字段名 fingerprint)
+#   YAML: client-fingerprint                (由 to_mihomo.py 从 JSON 转换而来)
+#   分享链接本身**不含**指纹 (URI 标准没有这个参数), 但改完要重生成, 否则
+#   聚合产物和单节点会对不上。
+# 不动的: 服务端 config/ 下的任何配置 —— 指纹只出现在客户端出站。
+sb_switch_utls_fingerprint() { # <指纹名>
+    local fp="${1:-}"
+    [[ -n "$fp" ]] || { print_error "用法: sb_switch_utls_fingerprint <指纹名>"; return 1; }
+    local ok=0 f
+    for f in "${SB_UTLS_FINGERPRINTS[@]}"; do
+        [[ "$f" == "$fp" ]] && { ok=1; break; }
+    done
+    if (( ! ok )); then
+        print_error "内核不支持的指纹: $fp"
+        print_info "可选: ${SB_UTLS_FINGERPRINTS[*]}"
+        return 1
+    fi
+
+    local n=0 t
+    shopt -s nullglob
+    # 1) 单节点 JSON + 聚合 JSON: 改 tls.utls.fingerprint。
+    #    没有 tls.utls 的节点 (shadowsocks / naive 这类无 TLS 层的, 或
+    #    用户当初就关了 uTLS) 不动它们 —— 凭空给它们加上 utls 反而会写出
+    #    连不上的配置。
+    for f in "$SB_OUT_DIR"/sb_client-*.json; do
+        t=$(basename "$f")
+        if jq -e '(.outbounds // []) | any(.tls.utls.enabled == true)' "$f" >/dev/null 2>&1; then
+            jq --arg fp "$fp" '(.outbounds[] | select(.tls.utls.enabled == true) | .tls.utls.fingerprint) = $fp' \
+                "$f" > "$f.tmp" 2>/dev/null && mv -f "$f.tmp" "$f" && n=$((n+1)) \
+                || print_warn "跳过 $t (改写失败)"
+        fi
+    done
+    shopt -u nullglob
+    if (( n == 0 )); then
+        print_warn "没有带 uTLS 的产物可改 (shadowsocks / naive 无 TLS 层; 其他节点需在建节点时开启 uTLS)"
+        return 1
+    fi
+
+    # 2) 重新生成 mihomo YAML —— YAML 的 client-fingerprint 是从 JSON 转换
+    #    出来的, 不重转就会与 JSON 不一致 (看着改了其实没改)。
+    if declare -F gen_all_mihomo >/dev/null 2>&1; then
+        gen_all_mihomo >/dev/null 2>&1
+    fi
+    if declare -F single_yaml_view >/dev/null 2>&1; then
+        local -a jarr=()
+        mapfile -t jarr < <(ls "$SB_OUT_DIR"/sb_client-*.json 2>/dev/null | grep -v 'sb_client-all\.json$' | sort)
+        (( ${#jarr[@]} )) && python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/to_mihomo.py" \
+            --single "$SB_OUT_DIR" "$SB_ROOT/cert" "${jarr[@]}" >/dev/null 2>&1
+    fi
+    # 3) 聚合 JSON / 分享链接同步重建
+    declare -F sb_regen_aggregate >/dev/null 2>&1 && sb_regen_aggregate >/dev/null 2>&1
+
+    # 4) 记下当前值, 让下次进这个菜单能看到
+    mkdir -p "$SB_ROOT" 2>/dev/null
+    printf '%s\n' "$fp" > "$SB_ROOT/.utls-fp" 2>/dev/null
+
+    print_ok "客户端产物指纹已切换为: $fp"
+    print_info "已更新 $n 个 JSON, 并重建了 YAML / 分享链接"
+    print_info "服务端配置未改动 —— 指纹只影响客户端出站的 ClientHello 伪装"
+    return 0
+}
+
+sb_menu_utls_fingerprint() {
+    print_title "切换全部客户端产物的 uTLS 指纹"
+    local cur="" f
+    [[ -f "$SB_ROOT/.utls-fp" ]] && cur=$(head -1 "$SB_ROOT/.utls-fp" 2>/dev/null)
+    [[ -z "$cur" ]] && cur="$SB_DEFAULT_UTLS_FP"
+    echo
+    echo -e "  当前产物指纹: ${YELLOW}${cur}${RESET}" >&2
+    echo -e "  ${MAGENTA}这是 ClientHello 伪装 —— 改它不影响服务端, 也不需要重建节点${RESET}" >&2
+    echo >&2
+    local i=1
+    for f in "${SB_UTLS_FINGERPRINTS[@]}"; do
+        local mark=" "; [[ "$f" == "$cur" ]] && mark="*"
+        echo -e "  ${GREEN}${i})${RESET} ${CYAN}${f}${RESET} ${YELLOW}${mark}${RESET}" >&2
+        i=$((i+1))
+    done
+    echo -e "  ${MAGENTA}全部) 一次性切到同一个指纹${RESET}" >&2
+    echo >&2
+    local c=""
+    read -r -p "  请选择 [1-${#SB_UTLS_FINGERPRINTS[@]}, 回车不变]: " c || { echo; return 0; }
+    c=$(clean_input "${c:-}")
+    if [[ -z "$c" ]]; then print_info "未选择, 未做修改"; return 0; fi
+    if [[ "$c" == "全部" || "$c" == "all" ]]; then
+        sb_switch_utls_fingerprint "$SB_DEFAULT_UTLS_FP"
+        return $?
+    fi
+    if [[ ! "$c" =~ ^[0-9]+$ ]] || (( c < 1 || c > ${#SB_UTLS_FINGERPRINTS[@]} )); then
+        print_error "无效选项"; return 1
+    fi
+    local pick="${SB_UTLS_FINGERPRINTS[$((c-1))]}"
+    sb_switch_utls_fingerprint "$pick"
+}
+
 sb_menu_addr_family() {
     print_title "切换客户端产物的地址族 (IPv4 / IPv6)"
     local a4 a6 cur
