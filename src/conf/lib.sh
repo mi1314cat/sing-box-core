@@ -1244,24 +1244,28 @@ echo >&2
 
     if [[ "$c" == "$custom_idx" ]]; then
         # 自定义: 沿用逐项询问
+        #
+        # InboundMultiplexOptions 只有 enabled/padding/brutal 三个字段 (已用
+        # sing-box check 实测: inbound 侧 max_connections 报 unknown field),
+        # protocol 和那三个数值参数都是出站独有的。所以服务端选"自定义"时
+        # 一个参数都不问 —— 客户端侧才问。
         if [[ "$side" == "client" ]]; then
-            # 只有出站有 protocol
-            echo -e "${CYAN}  复用协议${RESET}" >&2
-            echo -e "    ${GREEN}1)${RESET} ${YELLOW}h2mux${RESET}   基于 HTTP/2, 延迟最低, 与传输无关" >&2
-            echo -e "    ${GREEN}2)${RESET} ${GREEN}yamux${RESET}   通用双工流, 与 HTTP/2 不兼容" >&2
-            echo -e "    ${GREEN}3)${RESET} ${CYAN}smux${RESET}    最省内存, 主要为 kcp-go 设计" >&2
-            local p
-            read -r -p "    请选择 [1-3, 回车=1]: " p || { print_warn "读取中断, 按 h2mux + 视频档继续"; p=1; }
-            p=$(clean_input "$p"); [[ -z "$p" ]] && p=1
-            case "$p" in
-                2) SB_MUX_PROTO="yamux" ;;
-                3) SB_MUX_PROTO="smux" ;;
-                *) SB_MUX_PROTO="h2mux" ;;
-            esac
-            SB_MUX_MAXCONN=$(safe_read "最大连接数 (1-256, 0=不限)" "4")
-            SB_MUX_MINSTR=$(safe_read "最少复用流数 (过少会退化成独占)" "4")
-            SB_MUX_MAXSTR=$(safe_read "单连接最大流数 (0=不限)" "0")
-        fi
+                echo -e "${CYAN}  复用协议${RESET}" >&2
+                echo -e "    ${GREEN}1)${RESET} ${YELLOW}h2mux${RESET}   基于 HTTP/2, 延迟最低, 与传输无关" >&2
+                echo -e "    ${GREEN}2)${RESET} ${GREEN}yamux${RESET}   通用双工流, 与 HTTP/2 不兼容" >&2
+                echo -e "    ${GREEN}3)${RESET} ${CYAN}smux${RESET}    最省内存, 主要为 kcp-go 设计" >&2
+                local p
+                read -r -p "    请选择 [1-3, 回车=1]: " p || { print_warn "读取中断, 按 h2mux 继续"; p=1; }
+                p=$(clean_input "$p"); [[ -z "$p" ]] && p=1
+                case "$p" in
+                    2) SB_MUX_PROTO="yamux" ;;
+                    3) SB_MUX_PROTO="smux" ;;
+                    *) SB_MUX_PROTO="h2mux" ;;
+                esac
+                SB_MUX_MAXCONN=$(safe_read "最大连接数 (1-256, 0=不限)" "4")
+                SB_MUX_MINSTR=$(safe_read "最少复用流数 (过少会退化成独占)" "4")
+                SB_MUX_MAXSTR=$(safe_read "单连接最大流数 (0=不限)" "0")
+            fi
     else
         # 档位: 三个参数一次填好, 用户不需要理解内核的门槛语义
         local tid_sel tname
