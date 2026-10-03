@@ -1085,6 +1085,14 @@ sb_ech_link_params() {
 sb_resolve_tag() { # <基础形态: reality|tls|plain> -> 追加到 SB_TAG_EXTRA
     local form="${1:-plain}"
     local extra="$SB_PRESET_TAG"
+    # 批量模式下 sb_ask_preset 直接 return (不消费答案, 也不读预置行), 于是
+    # SB_PRESET_TAG 恒为空 —— 批量建出来的 CDN 节点名字就少一个 "-CDN",
+    # 用户在客户端列表里分不出哪个走 CDN。这里按批量自己选的接入方式补回。
+    if [[ -z "$extra" && -n "${SB_BATCH:-}" ]]; then
+        case "${ACCESS_MODE:-direct}" in
+            cdn|cdn-nginx) extra="CDN" ;;
+        esac
+    fi
     # CDN: 以实际接入方式为准
     case "${ACCESS_MODE:-direct}" in
         cdn|cdn-nginx) ;;
