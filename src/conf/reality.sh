@@ -61,6 +61,10 @@ add_config() {
     local pick dest sni dport
     pick=$(pick_dest)
     dest="${pick%%|*}"; sni="${pick#*|}"; sni="${sni%%|*}"; dport="${pick##*|}"
+    # dest 必须实测: 同密钥同端口, 只换 dest 就能从 5/5 变 0/5。
+    # 选完立刻把最终 dest 摆出来, 方便用户连不上时第一时间换。
+    print_info "REALITY dest = $dest:$dport  (若连不上, 换 dest 再排查)"
+    print_info "  实测可用: openjdk.org / www.mysql.com / www.apple.com"
 
     echo -n "Reality transport: 1) vision(TCP) 2) gRPC 3) HTTP/2 [默认1]: " >&2
     read -r tv

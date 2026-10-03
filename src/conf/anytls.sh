@@ -60,21 +60,28 @@ ask_cert() {  # 输出 CERT_FILE/KEY_FILE/CERT_DOMAIN/CERT_TRUSTED, 或 TLS_TYPE
     # (SB_BATCH=1 SB_FORCE_TLS_REALTY=1) 仍然取自签, Reality 变体永远产不出来。
     # 这也是 batch 的 variant_list 里一直只有 vmess/trojan 的原因。
     if [[ "${SB_FORCE_TLS_REALTY:-}" == "1" ]]; then c=3
-    elif [[ -n "${SB_BATCH:-}" ]]; then
-        # 批量只出 Reality (c=3), 不再默认自签 TLS (原来是 c=2)。
-        # 原因: 实测 anytls 出站配普通 TLS (certificate_path/key_path) 时,
-        # 服务端在 ClientHello 阶段就 reset 连接 —— sing-box 与 mihomo 客户端
-        # 都连不上 (mihomo 偶发 2/3), 完全手写配置同样复现, 内核 check 也不
-        # 报 unknown field。所以 anytls 的 TLS 形态本身不可用 (见 lib.sh 的
-        # 预置表注释), 批量生成不能再默认产出这种连不上的节点。
-        c=3
+        # 批量下不再强制 c=3 (Reality)。
+        # 原来这里写死"批量只出 Reality", 依据是"anytls 配普通 TLS 连不通"
+        # —— 该结论已被推翻 (真凶是测试时端口没放行防火墙, 不是内核限制;
+        # 详见 lib.sh 预置表上方的更正与 README 对应小节)。现在批量会按
+        # 预置表的四种形态老实产出原生 TLS 节点。
+        local bdef=2 bhint=""
+        case "${SB_PRESET_CERT:-}" in
+            reality)    bdef=3; bhint=" (预置指定 Reality)" ;;
+            真证书|real) bdef=1; bhint=" (预置指定真证书)" ;;
+        esac
+        printf "AnyTLS 批量形态 [1=真证书 2=自签 3=Reality] %s: " "$bdef" "$bhint" >&2
+        read -r -p "" c
+        [[ -z "${c:-}" ]] && c="$bdef"
+        c=$(clean_input "$c")
     else
         # 批量生成 Reality 变体时由 batch 显式指定 (见 batch.sh 注释);
         # 只替换交互输入, 复用下方原有 Reality 分支
         local adef=2 ahint=""
         case "${SB_PRESET_CERT:-}" in
             reality)  adef=3; ahint=" (预置方案指定 Reality)" ;;
-            selfsign) adef=2; ahint=" (预置方案指定自签 + ECH)" ;;
+            selfsign) adef=2; ahint=" (预置方案指定自签 + pin)" ;;
+            真证书|real) adef=1; ahint=" (预置方案指定真证书)" ;;
         esac
         [[ -n "$ahint" ]] && echo -e "    ${MAGENTA}${ahint}${RESET}" >&2
         read -r -p "选择 (回车=${adef}): " c; c=$(clean_input "$c"); [[ -z "$c" ]] && c=$adef
@@ -82,11 +89,10 @@ ask_cert() {  # 输出 CERT_FILE/KEY_FILE/CERT_DOMAIN/CERT_TRUSTED, 或 TLS_TYPE
     # 覆盖放在 if/else 外面: 之前写在 else 里, 批量路径压根不经过, 于是
     # ③ 选了真证书, anytls 出来的还是自签。
     sb_batch_tls_override 1 c
-    # 批量里再强制回 Reality: sb_batch_tls_override 会按用户选的证书方案覆盖 $c,
-    # 而 anytls 的"真证书"分支就是普通 TLS (certificate_path), 那条路实测
-    # 连不通 (见 lib.sh 预置表注释)。用户选了真证书不代表他知道 anytls 不能
-    # 用它 —— 这里静默纠正成 Reality, 而不是产出一个连不上的节点。
-    if [[ -n "${SB_BATCH:-}" ]]; then c=3; fi
+    # 注意: 这里**不再**强制切到 Reality。
+    # 上一版有 `if [[ -n "${SB_BATCH:-}" ]]; then c=3; fi`, 依据是"anytls 配
+    # 普通 TLS 连不通"。那个结论已被实测推翻 (详见 lib.sh 预置表上方的更正):
+    # anytls 原生 TLS 完全可用, 唯一硬性要求是客户端必须带 ALPN。
     if [[ "$c" == "3" ]]; then
         local d sid
         d=$(safe_read "Reality 握手目标 (统一 domains.sh)" "$(reality_random_domain)")

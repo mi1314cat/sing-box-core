@@ -77,6 +77,22 @@ def conv(ob, certdir):
     tr = ob.get("transport") or {}
     net = tr.get("type")
 
+    # ---- mihomo 实测连不通的组合, 直接跳过 (不产出 YAML) ----
+    # 2026-10 在 DS 上实测 (mihomo 1.19.30 arm64, 同一节点 sing-box 客户端
+    # 5/5 通, 只有 mihomo 不通, 排除端口/防火墙/网络抖动):
+    #     vless + REALITY          -> 5/5 通
+    #     trojan + REALITY         -> 0/8 (REALITY Authentication: true 之后
+    #                                   就静默, 认证过了但传不了数据)
+    #     vmess  + REALITY         -> 0/8 (connect error: 404)
+    # 排除过的可能: smux 开关、flow 字段、udp 字段、network: ws —— 逐个 A/B
+    # 都不影响结果。mihomo 侧日志能看到 REALITY 认证成功, 之后无任何数据,
+    # 属于内核在该组合下的实现问题, 不是配置字段缺失。
+    # 与其产出一份看着正常、实际连不上的 YAML, 不如跳过并说明原因。
+    if reality.get("enabled") and t in ("vmess", "trojan"):
+        return None, ("%s+REALITY —— mihomo 实测连不通 (同节点 sing-box 客户端"
+                      "正常, vless+REALITY 也正常; 属 mihomo 内核侧问题)"
+                      % t.upper())
+
     d = {"name": tag, "server": srv, "port": int(port)}
 
     if t == "vless":
@@ -88,6 +104,10 @@ def conv(ob, certdir):
     elif t == "trojan":
         d["type"] = "trojan"; d["password"] = ob["password"]
     elif t == "anytls":
+        # anytls 原生 TLS **必须协商 ALPN**, 否则握手直接失败 (实测 0/6;
+        # 带任意 alpn 即 5/5)。mihomo 侧对应 alpn + idle-session-*。
+        # 源 JSON 里 anytls.sh 已经写死 alpn=[h2, http/1.1], 这里做兜底:
+        # 万一产物缺了, 这里补上, 免得产出连不上的 YAML。
         if reality.get("enabled"):
             # mihomo 官方原文: "Mihomo does not support AnyTLS+Reality, and will not
             # support this combination in the future."
@@ -100,6 +120,16 @@ def conv(ob, certdir):
         obfs = ob.get("obfs") or {}
         if obfs.get("type"):
             d["obfs"] = obfs["type"]; d["obfs-password"] = obfs.get("password", "")
+        # 端口跳跃: sing-box 出站写 server_ports (["起-止"]), mihomo 对应
+        # ports (同样是字符串数组)。不转的话 mihomo 客户端不知道要跳跃,
+        # 会一直打真实端口 —— 服务端 iptables 的 DNAT 规则就白配了。
+        hops = ob.get("server_ports") or []
+        if hops:
+            # mihomo 的 ports 是**字符串**不是数组 (实测: 写成数组会
+            # "proxy 0: 'ports' expected type 'string', got unconvertible type
+            # '[]interface {}'"), 且分隔符用 "-" 而非 sing-box 的 ":"。
+            # 多个范围用逗号分隔 (参考 fscarmen/sing-box 的写法)。
+            d["ports"] = ",".join(str(x).replace(":", "-") for x in hops)
     elif t == "tuic":
         d["type"] = "tuic"; d["uuid"] = ob["uuid"]; d["password"] = ob["password"]
         d["congestion-controller"] = ob.get("congestion_control", "bbr")
@@ -134,7 +164,16 @@ def conv(ob, certdir):
                 d["servername"] = sni
             else:
                 d["sni"] = sni
-        if alpn: d["alpn"] = list(alpn)
+        # 关于 anytls 的 ALPN: 这里**不做任何兜底**。
+        # 曾经有个注释说"anytls 原生 TLS 必须协商 ALPN, 否则握手失败", 那是
+        # 误判 —— 当时的 0/6 是测试环境问题 (临时起的端口没在防火墙放行,
+        # 现象是 i/o timeout), 被当成了内核结论。复核方式: 把 ufw 放行规则
+        # 删掉, 同一个配置立刻退回 0/6; 放行回来又是 8/8 —— 变量是防火墙,
+        # 不是 ALPN。四种组合 (服务端有无 alpn x 客户端有无 alpn) 实测全部 8/8。
+        # 参考 fscarmen/sing-box: 他的 anytls 服务端和客户端也都不写 alpn,
+        # 照样正常, 与本项目实测一致。
+        if alpn:
+            d["alpn"] = list(alpn)
         if tls.get("insecure"): d["skip-cert-verify"] = True
         if fp: d["client-fingerprint"] = fp
         if reality.get("enabled"):
@@ -155,6 +194,19 @@ def conv(ob, certdir):
             else:
                 d["skip-cert-verify"] = True
                 MISSING_FP.append(tag)
+
+        # ---- anytls 专属字段 ----
+        # 对照用户 mihomo--core/conf/AnyTLS.sh 的客户端配置补齐。缺 udp 时
+        # mihomo 的 anytls 不转发 UDP; idle-session-* 不给则用内核默认值
+        # (30/30/0), 显式写出来是为了与服务端保持一致。
+        if t == "anytls" and not reality.get("enabled"):
+            d["udp"] = True
+            if ob.get("idle_session_check_interval"):
+                d["idle-session-check-interval"] = ob["idle_session_check_interval"]
+            if ob.get("idle_session_timeout"):
+                d["idle-session-timeout"] = ob["idle_session_timeout"]
+            if ob.get("min_idle_session") is not None:
+                d["min-idle-session"] = ob["min_idle_session"]
 
         # ---- ECH ----
         # mihomo 的 ech-opts 与 sing-box 的 ech 同义: 都是让客户端去 DNS 取
