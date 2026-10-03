@@ -362,7 +362,7 @@ batch_main() {
         echo -e "   ${GREEN}${_mi})${RESET} ${CYAN}${_name}${RESET}  ${DIM:-}(${_id})${RESET}" >&2
         _mi=$((_mi + 1))
     done
-    local _mc ""
+    local _mc=""
     read -r -p "   请选择 [1-$((_mi - 1)), 回车=1]: " _mc
     _mc=$(clean_input "${_mc:-}")
     # 只接受纯数字: 用户乱输入字母时不能进算术展开, 否则下面 _pick 变空
@@ -400,7 +400,7 @@ batch_main() {
         echo -e "   ${GREEN}1)${RESET} ${CYAN}ws${RESET}            ${MAGENTA}(默认, Cloudflare 全兼容)${RESET}" >&2
         echo -e "   ${GREEN}2)${RESET} ${CYAN}gRPC${RESET}          ${MAGENTA}(Cloudflare 面板需开启 gRPC)${RESET}" >&2
         echo -e "   ${GREEN}3)${RESET} ${CYAN}ws + gRPC${RESET}      ${MAGENTA}(两种都建, 共 6 个 CDN 节点)${RESET}" >&2
-        local _ct ""
+        local _ct=""
         read -r -p "   请选择 [1-3, 回车=1]: " _ct
         _ct=$(clean_input "${_ct:-}")
         case "${_ct:-1}" in
