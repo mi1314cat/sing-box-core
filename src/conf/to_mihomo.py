@@ -293,6 +293,9 @@ def write_single(outdir, certdir, paths):
             continue
         buf = list(HDR)
         emit({"proxies": [p]}, 0, buf)
+        # 目标目录不存在时直接 FileNotFoundError 崩掉, 报错信息还是 Python
+        # 的原始 traceback, 没人看得懂是哪一步。显式建目录。
+        os.makedirs(os.path.dirname(out), exist_ok=True)
         open(out, "w").write("\n".join(buf) + "\n")
         ok += 1
     sys.stderr.write("已生成单节点 YAML: %d 个 -> %s\n" % (ok, outdir))
