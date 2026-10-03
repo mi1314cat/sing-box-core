@@ -335,6 +335,85 @@ batch_main() {
           print_warn "未检测到真证书 (Cloudflare 不接受自签回源) —— 本次全部只能直连"
       fi
       export SB_BATCH_CDN SB_BATCH_CDN_DOMAIN
+
+    # ================= 新增: 功能选项 (批量前统一问一次) =================
+    # 为什么放这里: 批量是"一把梭", 但功能开关 (mux 档位 / CDN 传输) 是
+    # **每个协议都有或没有**的选项, 让用户在生成完再去逐个进节点菜单改,
+    # 等于把一次批量拆成十几次单协议操作 —— 那不如一开始就在这里定。
+    # 协议维度只问"要不要 / 哪一档", 不问"哪个协议要不要": 那属于协议的
+    # 能力差异 (内核字段是否存在), 由 sb_mux_supported / 传输菜单自己决定,
+    # 在这里列 10 个协议的单选框只会让人以为每个都能勾。
+
+    # --- 功能选项 A: multiplex (多路复用) 档位 ---
+    # 现状: lib.sh 里 sb_ask_multiplex 在 SB_BATCH 下把 mux 一律关掉, 理由是
+    # "批量不该替用户做带宽假设"。但 multiplex 不是带宽假设 —— 三个档位
+    # (web/video/download) 都是保守的固定值, 且复用协议统一 h2mux, 不猜带宽。
+    # 所以这里显式问一次, 用户不选就保持关闭 (= 原来的行为)。
+    # 支持 mux 的协议: vless / vmess / trojan / shadowsocks (sb_mux_supported)
+    local SB_BATCH_MUX=0 SB_BATCH_MUX_PROFILE=""
+    echo >&2
+    echo -e "${CYAN}③ 多路复用 (multiplex) —— 把多条请求复用到一条连接上${RESET}" >&2
+    echo -e "   ${MAGENTA}仅 vless / vmess / trojan / shadowsocks 支持; 其他协议内核没有这个字段${RESET}" >&2
+    echo -e "   ${GREEN}1)${RESET} ${YELLOW}不开${RESET}   (每个请求走独立连接, 行为最接近普通代理)" >&2
+    local _mi=2
+    for row in "${SB_MUX_TIERS[@]}"; do
+        local _id _name _rest
+        _id="${row%%|*}"; _rest="${row#*|}"; _name="${_rest%%|*}"
+        echo -e "   ${GREEN}${_mi})${RESET} ${CYAN}${_name}${RESET}  ${DIM:-}(${_id})${RESET}" >&2
+        _mi=$((_mi + 1))
+    done
+    local _mc ""
+    read -r -p "   请选择 [1-$((_mi - 1)), 回车=1]: " _mc
+    _mc=$(clean_input "${_mc:-}")
+    # 只接受纯数字: 用户乱输入字母时不能进算术展开, 否则下面 _pick 变空
+    # 又会触发 local 的 "not a valid identifier" 把函数打断
+    if [[ "$_mc" =~ ^[0-9]+$ ]] && [[ "$_mc" != "1" ]]; then
+        # 注意: 不能写成 local _pick=$((_mc - 2)) row2 id2 —— _mc 非数字时
+        # 算术展开成空, bash 的 local 会报 "'': not a valid identifier" 并
+        # **中断整个函数**, 后面④的 CDN 传输提问就再也不会出现 (静默丢失)。
+        local _pick row2 id2
+        _pick=$(( _mc - 2 ))
+        row2=$(printf '%s\n' "${SB_MUX_TIERS[@]}" | sed -n "$((_pick + 1))p")
+        if [[ -n "$row2" ]]; then
+            id2="${row2%%|*}"
+            SB_BATCH_MUX=1
+            SB_BATCH_MUX_PROFILE="$id2"
+            export SB_BATCH_MUX SB_BATCH_MUX_PROFILE
+            print_ok "多路复用: 开 (档位 $(sb_mux_tier_name "$id2"), h2mux)"
+        else
+            print_warn "无效选项, 按不开处理"
+        fi
+    else
+        print_ok "多路复用: 不开"
+    fi
+
+    # --- 功能选项 B: CDN 传输 ---
+    # 现状: SB_BATCH_TRANSPORT 恒为 ws, 所以批量最多只能出 ws 一种 CDN 形态。
+    # gRPC 在 Cloudflare 侧也支持 (面板需开 gRPC), 与 ws 的流量特征不同,
+    # 各建一个可以分散特征。这里让用户选"要哪几种", 每个协议各建一份。
+    # 只有 vless/vmess/trojan 有 Transport 字段, 其他协议给 CDN 也走不通。
+    local -a SB_BATCH_CDN_TRANSPORTS=()
+    if (( SB_BATCH_CDN )); then
+        echo >&2
+        echo -e "${CYAN}④ CDN 传输 —— 每个 CDN 协议各建哪几种传输${RESET}" >&2
+        echo -e "   ${MAGENTA}每选一种, vless/vmess/trojan 就各多一个 CDN 节点 (传输形态不同, 便于分散流量特征)${RESET}" >&2
+        echo -e "   ${GREEN}1)${RESET} ${CYAN}ws${RESET}            ${MAGENTA}(默认, Cloudflare 全兼容)${RESET}" >&2
+        echo -e "   ${GREEN}2)${RESET} ${CYAN}gRPC${RESET}          ${MAGENTA}(Cloudflare 面板需开启 gRPC)${RESET}" >&2
+        echo -e "   ${GREEN}3)${RESET} ${CYAN}ws + gRPC${RESET}      ${MAGENTA}(两种都建, 共 6 个 CDN 节点)${RESET}" >&2
+        local _ct ""
+        read -r -p "   请选择 [1-3, 回车=1]: " _ct
+        _ct=$(clean_input "${_ct:-}")
+        case "${_ct:-1}" in
+            2) SB_BATCH_CDN_TRANSPORTS=(grpc)
+               print_ok "CDN 传输: gRPC (3 个节点)" ;;
+            3) SB_BATCH_CDN_TRANSPORTS=(ws grpc)
+               print_ok "CDN 传输: ws + gRPC (6 个节点)" ;;
+            *) SB_BATCH_CDN_TRANSPORTS=(ws)
+               print_ok "CDN 传输: ws (3 个节点)" ;;
+        esac
+    fi
+    export SB_BATCH_CDN_TRANSPORTS
+
     rm -f "$SB_OUT_DIR/.batch-used" "$SB_OUT_DIR/.batch-port"
 
     # --- 覆盖模式: 跳过已有 (幂等) / 覆盖全部 (先删后建) ---
@@ -395,6 +474,7 @@ batch_main() {
           SB_BATCH_CERT_KEY="$SB_BATCH_CERT_KEY" SB_BATCH_CERT_DOMAIN="$SB_BATCH_CERT_DOMAIN" \
         SB_BATCH_PORT_START="$SB_BATCH_PORT_START" SB_BATCH_PORT_END="$SB_BATCH_PORT_END" \
         SB_BATCH_TRANSPORT="${SB_BATCH_TRANSPORT:-ws}" \
+        SB_BATCH_MUX="${SB_BATCH_MUX:-0}" SB_BATCH_MUX_PROFILE="${SB_BATCH_MUX_PROFILE:-}" \
         timeout 240 bash "$SELF_DIR/conf/${proto}.sh" add </dev/null >/tmp/batch-$proto.log 2>&1
         local mod_rc=$?
         if [[ $mod_rc -eq 0 ]]; then
@@ -433,6 +513,57 @@ batch_main() {
             printf "%b[失败]%b (详见 /tmp/batch-%s-v.log)\n" "$RED" "$RESET" "$vp" >&2
         fi
     done
+
+    # --- CDN 变体补齐 ---
+    # 主循环里 SB_BATCH_CDN=1 的那一份, 传输是主循环统一给的 (ws), 所以
+    # 用户在④里多选了 gRPC 之后, 这里按传输逐个补。
+    # 只有 vless/vmess/trojan 有 Transport 字段 —— Cloudflare 代理的是
+    # HTTP(S) 上的 ws/grpc/http, 原生 TCP/UDP 协议 (hysteria2/tuic/anytls/
+    # shadowsocks/naive) 无论怎么设都过不了 CDN, 不在这里列。
+    if (( SB_BATCH_CDN )) && (( ${#SB_BATCH_CDN_TRANSPORTS[@]} > 1 )); then
+        echo >&2
+        print_title "CDN 传输变体补齐"
+        local -a cdn_protos=(vless vmess trojan)
+        local cdp cdt cdn_before cdn_done=0
+        # 已经有的 CDN 节点不重复建 (幂等): 主循环建出来的那一份算第一个传输
+        for cdp in "${cdn_protos[@]}"; do
+            for cdt in "${SB_BATCH_CDN_TRANSPORTS[@]}"; do
+                # 主循环已经用 ws 建过一个, 跳过; 这里只补主循环没覆盖的
+                [[ "$cdt" == "ws" ]] && continue
+                printf "%b• %s · %s%b ... " "$CYAN" "$cdp" "$cdt" "$RESET" >&2
+                # 幂等: 同协议同传输的节点已存在就跳过, 避免重复跑覆盖模式
+                # 把它删掉重建 (那会换端口/凭据, 已发出的链接全失效)
+                local dup=0 cdf
+                shopt -s nullglob
+                for cdf in "$SB_CONFIG_DIR"/${cdp}-*.json; do
+                    if [[ "$(jq -r '.inbounds[0].transport.type // ""' "$cdf" 2>/dev/null)" == "$cdt" ]] \
+                       && sb_cdn_enabled "$cdf"; then dup=1; break; fi
+                done
+                shopt -u nullglob
+                if (( dup )); then
+                    printf "%b[已存在]%b 跳过 (幂等)\n" "$YELLOW" "$RESET" >&2
+                    continue
+                fi
+                SB_BATCH=1 SB_NO_RELOAD=1 \
+                  SB_BATCH_CDN=1 SB_BATCH_CDN_DOMAIN="$SB_BATCH_CDN_DOMAIN" \
+                  SB_BATCH_CDN_TRANSPORTS="" \
+                  SB_LISTEN_ADDR="$SB_LISTEN_ADDR" SB_SERVER_ADDR="$SB_SERVER_ADDR" \
+                  SB_BATCH_CERT="$SB_BATCH_CERT" SB_BATCH_CERT_CRT="$SB_BATCH_CERT_CRT" \
+                  SB_BATCH_CERT_KEY="$SB_BATCH_CERT_KEY" SB_BATCH_CERT_DOMAIN="$SB_BATCH_CERT_DOMAIN" \
+                  SB_BATCH_PORT_START="$SB_BATCH_PORT_START" SB_BATCH_PORT_END="$SB_BATCH_PORT_END" \
+                  SB_BATCH_TRANSPORT="$cdt" \
+                  SB_BATCH_MUX="$SB_BATCH_MUX" SB_BATCH_MUX_PROFILE="$SB_BATCH_MUX_PROFILE" \
+                  timeout 240 bash "$SELF_DIR/conf/${cdp}.sh" add </dev/null >/tmp/batch-$cdp-$cdt.log 2>&1
+                if [[ $? -eq 0 ]]; then
+                    printf "%b[OK]%b 生成\n" "$GREEN" "$RESET" >&2
+                    cdn_done=$((cdn_done + 1))
+                else
+                    printf "%b[失败]%b (详见 /tmp/batch-%s-%s.log)\n" "$RED" "$RESET" "$cdp" "$cdt" >&2
+                fi
+            done
+        done
+        (( cdn_done > 0 )) && print_ok "CDN 变体补齐: 新增 $cdn_done 个"
+    fi
 
     # --- 全目录统一 check ---
     echo >&2
