@@ -34,7 +34,12 @@ ask_cert() {
     local cert_def=2 cert_hint=""
     case "${SB_PRESET_CERT:-}" in
         reality)  cert_def=3; cert_hint=" (预置方案指定 Reality)" ;;
-        selfsign) cert_def=2; cert_hint=" (预置方案指定自签 + ECH)" ;;
+        selfsign) cert_def=2; cert_hint=" (预置方案指定自签)" ;;
+        # CDN 方案必须有真证书 —— Cloudflare 不接受自签回源, 所以这里默认
+        # 落在 1 (手动指定 crt/key)。之前 CDN 预置没给这个默认值, 证书菜单
+        # 静默回落到自签, 紧接着"接入方式"就以"走 CDN 需要真证书"把节点
+        # 打成直连 —— 预置形同虚设 (实测 vless05-07 全部变成 -TLS 直连)。
+        真证书|real) cert_def=1; cert_hint=" (CDN 方案必须有真证书, 请填 crt/key 路径)" ;;
     esac
     [[ -n "$cert_hint" ]] && echo -e "    ${MAGENTA}${cert_hint}${RESET}" >&2
     read -r -p "  选择 (回车=${cert_def}): " c
@@ -136,9 +141,9 @@ add_config() {
     # Reality 变体的名字要带 -REALITY —— tag 会写进 inbound 和客户端产物,
     # 名字里能一眼看出这个节点是 Reality 才不会在管理界面里混淆。
     if [[ "${CERT_MODE:-}" == "reality" ]]; then
-        tag="$tag$(tag_form_suffix reality "${SB_PRESET_TAG:-}")"
+        SB_TAG_FORM="reality"   # 名字延后到 ECH 之后再定
     else
-        tag="$tag$(tag_form_suffix tls "${SB_PRESET_TAG:-}")"
+        SB_TAG_FORM="tls"
     fi
     local tls_line alpn tr_json tr_line="" mux_line="" user_flow=""
     alpn=$(sb_transport_alpn "$TR_TYPE")
@@ -157,6 +162,13 @@ add_config() {
         local ech_srv=$(sb_ech_json_server)
         [[ -n "$ech_srv" ]] && tls_line="$tls_line, $ech_srv"
     fi
+    # 名称必须在 ECH/接入方式确定之后才算 —— 见 sb_resolve_tag 的说明。
+    # 之前预置标签在这里就拼完了, 于是"预置要 ECH 但域名没发布 ech= 参数"
+    # 的情况会产出一个叫 -ECH 其实没加密的节点名。
+    # 注意这行必须在上面的 if **外面**: Reality 节点不走 ECH, 但名字里的
+    # -REALITY 一样要保留。
+    sb_resolve_tag "${SB_TAG_FORM:-plain}"
+    tag="$tag$(tag_form_suffix "${SB_TAG_FORM:-plain}" "$SB_TAG_EXTRA")"
     # 裸 TCP: sing-box 里不存在 "type":"tcp", 必须**整个省略 transport 字段。
     # 整行一起加/去 —— 只在字段之间插逗号会出现 ",," 这种双逗号。
     tr_json=$(sb_transport_json_server "$TR_TYPE" "$TR_PATH" "$TR_SVC" "$TR_HOST")

@@ -26,7 +26,9 @@ ask_cert() {  # 输出三种: CERT_FILE+KEY_FILE (TLS) / REALITY_ENV (Reality = 
     local def=2 def_hint=""
     case "${SB_PRESET_CERT:-}" in
         reality)  def=3; def_hint=" (预置方案指定 Reality)" ;;
-        selfsign) def=2; def_hint=" (预置方案指定自签 + ECH)" ;;
+        selfsign) def=2; def_hint=" (预置方案指定自签)" ;;
+        # CDN 方案必须有真证书 (Cloudflare 不接受自签回源), 见 vless.sh 同处注释
+        真证书|real) def=1; def_hint=" (CDN 方案必须有真证书, 请填 crt/key 路径)" ;;
     esac
     if [[ "${SB_FORCE_TLS_REALTY:-}" == "1" ]]; then c=3
     else
@@ -106,7 +108,11 @@ add_config() {
 
     idx=$(get_next_index "$PROTO"); file="$SB_CONFIG_DIR/$PROTO-$idx.json"; tag="${PROTO}${idx}"
     # ask_cert 已决定: TLS_TYPE=reality 还是 selfsign/real —— 名字体现传输方式
-    [[ "${TLS_TYPE:-}" == "reality" ]] && tag="$tag$(tag_form_suffix reality "${SB_PRESET_TAG:-}")" || tag="$tag$(tag_form_suffix tls "${SB_PRESET_TAG:-}")"
+    if [[ "${TLS_TYPE:-}" == "reality" ]]; then
+        SB_TAG_FORM="reality"   # 名字延后到 ECH 之后再定
+    else
+        SB_TAG_FORM="tls"
+    fi
     local json tr_json tr_line=""
     # flow (XTLS Vision) 是 VLESS 独有: sing-box 的 Trojan/VMess
     # outbound 选项里没有 flow 字段, 写了内核会直接报 unknown field。
@@ -119,6 +125,9 @@ add_config() {
     sb_ask_multiplex trojan server; local _mux=$(sb_mux_json_server)
     # ECH 只在 CDN 模式问; 两个模板的 tls 行都要插
     sb_ask_ech "$CERT_DOMAIN" "${ACCESS_MODE:-direct}"
+    # 名称必须在 ECH/接入方式确定之后才算 —— 见 sb_resolve_tag 的说明
+    sb_resolve_tag "${SB_TAG_FORM:-tls}"
+    tag="$tag$(tag_form_suffix "${SB_TAG_FORM:-tls}" "$SB_TAG_EXTRA")"
     local ech_srv=$(sb_ech_json_server)
     # 这里刻意不把 mux/ech 塞进 heredoc 模板 —— 模板里已经有一个跨行的
     # tr_line 赋值 (为了给 transport 留尾逗号), 再叠一层跨行变量会让 bash
