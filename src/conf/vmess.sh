@@ -34,7 +34,9 @@ ask_tls() { # 输出: CERT_MODE|cert_file|key_file|cert_domain|trusted(0|1) 到 
     local def=1 def_hint=""
     case "${SB_PRESET_CERT:-}" in
         reality)  def=4; def_hint=" (预置方案指定 Reality)" ;;
-        selfsign) def=3; def_hint=" (预置方案指定自签 + ECH)" ;;
+        selfsign) def=3; def_hint=" (预置方案指定自签)" ;;
+        # CDN 方案必须有真证书 (Cloudflare 不接受自签回源), 见 vless.sh 同处注释
+        真证书|real) def=2; def_hint=" (CDN 方案必须有真证书, 请填 crt/key 路径)" ;;
     esac
     if [[ "${SB_FORCE_TLS_REALTY:-}" == "1" ]]; then c=4
     else
@@ -143,9 +145,9 @@ add_config() {
     idx=$(get_next_index "$PROTO"); file="$SB_CONFIG_DIR/$PROTO-$idx.json"; tag="${PROTO}${idx}"
     # 名字体现传输方式: ask_tls 决定 reality / selfsign / real / none
     case "${CERT_MODE:-none}" in
-        reality)       tag="$tag$(tag_form_suffix reality "${SB_PRESET_TAG:-}")" ;;
-        selfsign|real) tag="$tag$(tag_form_suffix tls "${SB_PRESET_TAG:-}")" ;;
-        *)             tag="$tag$(tag_form_suffix plain "${SB_PRESET_TAG:-}")" ;;
+        reality)       SB_TAG_FORM="reality" ;;   # 名字延后到 ECH 之后再定
+        selfsign|real) SB_TAG_FORM="tls" ;;
+        *)             SB_TAG_FORM="plain" ;;
     esac
 
     local base
@@ -187,7 +189,11 @@ EOF
 
     # ECH 必须放在 CERT_MODE 的 case **之后**: 那个分支是用 jq 整体替换
     # .inbounds[0].tls 的, 放前面会被冲掉。
-    sb_ask_ech "$CERT_DOMAIN" "${ACCESS_MODE:-direct}"; local _ech=$(sb_ech_json_server)
+    sb_ask_ech "$CERT_DOMAIN" "${ACCESS_MODE:-direct}"
+    # 名称必须在 ECH/接入方式确定之后才算 —— 见 sb_resolve_tag 的说明
+    sb_resolve_tag "${SB_TAG_FORM:-plain}"
+    tag="$tag$(tag_form_suffix "${SB_TAG_FORM:-plain}" "$SB_TAG_EXTRA")"
+    local _ech=$(sb_ech_json_server)
     [[ -n "$_ech" ]] && base=$(echo "$base" | jq --argjson ec "{$_ech}" '.inbounds[0].tls += $ec')
     backup_config config
     write_config "$file" "$base" || return 1

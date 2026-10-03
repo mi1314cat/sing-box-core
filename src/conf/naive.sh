@@ -22,11 +22,19 @@ add_config() {
     local listen_ip listen_port idx file tag
     listen_ip=$(ask_listen_addr)
     listen_port=$(safe_read_port)
+    sb_ask_preset naive "证书预置方案"
     local user pass
     user=$(openssl rand -hex 6)
     pass=$(openssl rand -hex 6)
-    echo "TLS 证书: 1) 真证书 2) 自签(200天+pin) [默认2]" >&2
-    read -r -p "选择: " c; c=$(clean_input "$c"); [[ -z "$c" ]] && c=2
+    echo "TLS 证书: 1) 真证书 2) 自签(200天+pin)" >&2
+    # 预置方案指定真证书时默认落在 1 (naive 走真证书客户端最省事, 不用 pin)
+    local cdef=2 chint=""
+    case "${SB_PRESET_CERT:-}" in
+        真证书|real) cdef=1; chint=" (预置方案指定真证书)" ;;
+        selfsign)    cdef=2; chint=" (预置方案指定自签 + 伪装域名)" ;;
+    esac
+    [[ -n "$chint" ]] && echo -e "    ${MAGENTA}${chint}${RESET}" >&2
+    read -r -p "选择 (回车=${cdef}): " c; c=$(clean_input "$c"); [[ -z "$c" ]] && c=$cdef
     sb_batch_tls_override 1 c
     if [[ "$c" == "1" ]]; then
         read -r -p "crt: " CERT_FILE; read -r -p "KEY: " KEY_FILE
@@ -42,7 +50,9 @@ add_config() {
         CERT_DOMAIN="$d"; CERT_TRUSTED=false
     fi
 
-    idx=$(get_next_index "$PROTO"); file="$SB_CONFIG_DIR/$PROTO-$idx.json"; tag="${PROTO}${idx}-TLS"   # 名字体现传输方式
+    idx=$(get_next_index "$PROTO"); file="$SB_CONFIG_DIR/$PROTO-$idx.json"
+    local cform=real; [[ "$cdef" == "2" ]] && cform=tls
+    tag="${PROTO}${idx}$(tag_form_suffix "$cform" "${SB_PRESET_TAG:-}")"   # 名字体现证书方案
     local json
     json=$(cat <<EOF
 {

@@ -636,8 +636,17 @@ sb_ask_transport() {
                 httpupgrade) preset_tr_idx=4 ;;
                 tcp)         preset_tr_idx=5 ;;
             esac
-            [[ -n "$preset_tr_idx" ]] && \
-                echo -e "    ${MAGENTA}(预置方案指定 ${preset_tr_idx} —— 回车即用, 输别的数字可改)${RESET}" >&2
+            # 提示里打传输**名字**而不是菜单序号: "预置方案指定 1" 对用户毫无意义
+            # (1 是 ws 还是 http 要翻上面的菜单才知道)。名字在下面 case 里取。
+            [[ -n "$preset_tr_idx" ]] && {
+                local preset_tr_name="$preset_tr"
+                case "$preset_tr" in
+                    ws) preset_tr_name="WebSocket" ;;   grpc) preset_tr_name="gRPC" ;;
+                    http) preset_tr_name="HTTP/2" ;;     httpupgrade) preset_tr_name="HTTPUpgrade" ;;
+                    tcp) preset_tr_name="裸TCP" ;;
+                esac
+                echo -e "    ${MAGENTA}(预置方案指定 ${preset_tr_name} —— 回车即用, 输别的序号可改)${RESET}" >&2
+            }
         fi
         local def_tr_idx="${preset_tr_idx:-1}"
         t=$(safe_read "选择 [1-5, 回车=${def_tr_idx}]" "$def_tr_idx")
@@ -825,9 +834,13 @@ sb_read_lines_json() { # <提示> -> stdout
 #       "tls: server rejected ECH"; 而且 public_name 会等于你自己的域名,
 #       等于什么都没藏。
 #
-#   直连 SB ECH (Client → SB)
-#     TLS 就在源站 sing-box 上终止, ECH 私钥由我们自己生成。
-#     → 服务端 ech.key_path + 客户端 ech.config_path, 成对使用。
+#   直连 SB ECH (Client → SB) —— **已移除**
+#     曾实现过 (服务端 ech.key_path + 客户端内联 ech.config), 实测只有
+#     sing-box 客户端能跑通 (3/3), mihomo 等内核完全不支持; 而且它要求
+#     客户端把整份 ECHCONFIGS PEM 内联进配置, 分享出去也没法让别人用。
+#     与上面"CDN ECH"相比没有实际收益, 却把 ECH 变成一个只有自己能用、
+#     换个客户端就废的假选项。留着更糟 —— 用户选了却发现换个内核就连不上。
+#     所以 ECH 现在只在 CDN 接入下开放 (见 sb_ech_supported)。
 #
 # 下面两个函数分别实现这两条路, 由 sb_ask_ech 按 ACCESS_MODE 分流。
 # URL 编码 (分享链接的 ech= 参数要用)
@@ -858,11 +871,16 @@ SB_ECH_PUBLIC_NAME="cloudflare-ech.com"
 SB_ECH_DNS_UPSTREAM="https://dns.alidns.com/dns-query"
 SB_ECH_QUERY_PARAM="${SB_ECH_PUBLIC_NAME}+${SB_ECH_DNS_UPSTREAM}"
 
+# ECH 只在 CDN 接入下有意义。
+#   CDN 模式: ECHConfigList 由 Cloudflare 发布, 私钥在 Cloudflare 手里,
+#             客户端从 DNS 自动取 —— 这也是浏览器和主流客户端唯一认的形式。
+#   直连模式: 要自己持一份 ECH 密钥对, 且客户端必须内联整份 PEM
+#             (sing-box 的 ech.config 只认内联 PEM, 见 sb_ech_json_client),
+#             mihomo/Clash 这类内核完全不支持, 实际没人用。
+# 所以直连一律不问 ECH, 避免给出一个"看着能用、换个内核就废"的选项。
 sb_ech_supported() {
-    # 直连也支持了: 自己就是 TLS 终点, ECH 密钥由本机 sing-box 持有。
-    # cdn / cdn-nginx → CDN ECH; direct → 直连 ECH。
     case "${1:-}" in
-        cdn|cdn-nginx|direct) return 0 ;;
+        cdn|cdn-nginx) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -883,48 +901,30 @@ sb_ech_dns_published() { # <域名>
     printf '%s' "$out" | grep -q 'ech="'
 }
 
-# 直连 ECH: 生成或复用 <域名> 的密钥对。
-# 结果写进全局: SB_ECH_KEY_FILE (ECH KEYS, 服务端) / SB_ECH_CONFIG_FILE (ECH CONFIGS, 客户端)
-sb_ech_generate() { # <域名>
-    local domain="$1" dir="$SB_ROOT/ech"
-    SB_ECH_KEY_FILE="" SB_ECH_CONFIG_FILE=""
-    [[ -n "$domain" ]] || return 1
-    command -v "$SB_BIN" >/dev/null 2>&1 || return 1
-    mkdir -p "$dir" || return 1
-    local safe; safe=$(printf '%s' "$domain" | tr -c 'A-Za-z0-9._-' '_')
-    local kf="$dir/${safe}_ech.key.pem" cf="$dir/${safe}_ech.config.pem"
-    if [[ -s "$kf" && -s "$cf" ]]; then
-        SB_ECH_KEY_FILE="$kf"; SB_ECH_CONFIG_FILE="$cf"; return 0
-    fi
-    local out
-    out=$("$SB_BIN" generate ech-keypair "$domain" 2>/dev/null) || return 1
-    # 输出是两段 PEM, 按 BEGIN 头切成两份
-    printf '%s\n' "$out" | awk '
-        /-----BEGIN ECH CONFIGS-----/ {m="c"} /-----BEGIN ECH KEYS-----/ {m="k"}
-        m=="c" {print > "'"$cf"'"} m=="k" {print > "'"$kf"'"}
-    ' 2>/dev/null || return 1
-    [[ -s "$kf" && -s "$cf" ]] || return 1
-    chmod 600 "$kf"
-    SB_ECH_KEY_FILE="$kf"; SB_ECH_CONFIG_FILE="$cf"; return 0
-}
+# 直连 ECH 的密钥生成已移除。
+# 以前它给"直连 ECH"准备密钥, 但那条路走不通: ECHConfigList 的私钥必须由
+# 真正终结 TLS 的那一端持有。直连时我们自己终结, 但客户端 (mihomo/Clash/
+# 大多数 sing-box 以外的实现) 都不认内联 PEM 的 ech.config, 等于只有自己
+# 能用自己。CDN 模式下私钥在 Cloudflare 手里, 客户端从 DNS 自取, 才是通用做法。
+# 所以 ECH 现在只在 CDN 接入下开放 (见 sb_ech_supported)。
 
-# 只问一次。结果写进 SB_ECH_ON / SB_ECH_MODE (cdn|direct)。
-# 调用点: 服务端建节点时问一次, 客户端渲染时读全局, 不再问第二次。
+# 只问一次, 且**只在 CDN 接入下才问** (sb_ech_supported 决定)。
+# ECHConfigList 由 Cloudflare 发布、私钥在 Cloudflare 手里, 客户端从 DNS 自取;
+# 源站不需要任何证书材料, 也不需要改配置。
+# 结果写进 SB_ECH_ON / SB_ECH_MODE, 调用点: 服务端建节点时问一次,
+# 客户端渲染时读全局, 不再问第二次。
 sb_ask_ech() { # <域名> <ACCESS_MODE>
     local domain="$1" mode="$2"
     SB_ECH_ON=0; SB_ECH_KEY_FILE=""; SB_ECH_CONFIG_FILE=""; SB_ECH_MODE=""
     # 客户端渲染要用 (CDN 模式的 query_server_name), 所以即便后面判定为
     # 不开启也要留下域名, 否则客户端片段会拼出一个空的 query_server_name
     SB_ECH_DOMAIN="$domain"
+    # 直连场景不问: 前面没有 CDN 终结 TLS, 自己持密钥的 ECH 只有
+    # sing-box 客户端认 (还要求内联整份 PEM), mihomo/Clash 全不支持。
     sb_ech_supported "$mode" || return 0
     if [[ -n "${SB_BATCH:-}" ]]; then
         [[ "${SB_BATCH_ECH:-0}" == "1" ]] || return 0
-        SB_ECH_ON=1
-        if [[ "$mode" == "direct" ]]; then
-            sb_ech_generate "$domain" && SB_ECH_MODE="direct" || { SB_ECH_ON=0; return 0; }
-        else
-            SB_ECH_MODE="cdn"
-        fi
+        SB_ECH_ON=1; SB_ECH_MODE="cdn"
         return 0
     fi
 
@@ -932,33 +932,16 @@ sb_ask_ech() { # <域名> <ACCESS_MODE>
     local pdef=1
     [[ "${SB_PRESET_ECH:-0}" == "1" ]] && pdef=2
     echo >&2
-    if [[ "$mode" == "direct" ]]; then
-        echo -e "${CYAN}  ECH (加密 ClientHello)${RESET} ${CYAN}— 隐藏真实 SNI${RESET}" >&2
-        echo -e "    ${GREEN}1)${RESET} 关闭" >&2
-        echo -e "    ${GREEN}2)${RESET} 开启  (由本机 sing-box 终结 TLS, 密钥本机生成)" >&2
-        echo -e "    ${MAGENTA}注意: 直连时 IP 已经暴露, 加密 SNI 只挡域名探测这一层。${RESET}" >&2
-    else
-        echo -e "${CYAN}  ECH (加密 ClientHello)${RESET} ${CYAN}— 隐藏真实 SNI, 只对 CDN 生效${RESET}" >&2
-        echo -e "    ${GREEN}1)${RESET} 关闭 (推荐)" >&2
-        echo -e "    ${GREEN}2)${RESET} 开启  (用 Cloudflare 发布的 ECHConfigList)" >&2
-        echo -e "    ${MAGENTA}密钥在 Cloudflare 手里, 客户端从 DNS 自动取; 源站不需要任何配置。${RESET}" >&2
-    fi
+    echo -e "${CYAN}  ECH (加密 ClientHello)${RESET} ${CYAN}— 隐藏真实 SNI, 只对 CDN 有效${RESET}" >&2
+    echo -e "    ${GREEN}1)${RESET} 关闭 (推荐)" >&2
+    echo -e "    ${GREEN}2)${RESET} 开启  (用 Cloudflare 发布的 ECHConfigList)" >&2
+    echo -e "    ${MAGENTA}密钥在 Cloudflare 手里, 客户端从 DNS 自动取; 源站不需要任何证书${RESET}" >&2
     local c
     read -r -p "    请选择 [1-2, 回车=${pdef}]: " c || { echo; return 0; }
     c=$(clean_input "$c"); [[ -z "$c" ]] && c=$pdef
     [[ "$c" == "2" ]] || return 0
 
-    if [[ "$mode" == "direct" ]]; then
-        if sb_ech_generate "$domain"; then
-            SB_ECH_ON=1; SB_ECH_MODE="direct"
-            print_ok "ECH 已启用 (直连模式, 密钥: $(basename "$SB_ECH_KEY_FILE"))"
-        else
-            print_warn "ECH 密钥生成失败, 继续用未加密 SNI (节点不受影响)"
-        fi
-        return 0
-    fi
-
-    # CDN 模式: 先确认域名确实发布了 ech= 参数, 否则开了也是白开
+    # 先确认域名确实发布了 ech= 参数, 否则开了也是白开
     if sb_ech_dns_published "$domain"; then
         SB_ECH_ON=1; SB_ECH_MODE="cdn"
         print_ok "ECH 已启用 (CDN 模式, 客户端将从 DNS 获取 Cloudflare 的 ECHConfigList)"
@@ -973,55 +956,57 @@ sb_ask_ech() { # <域名> <ACCESS_MODE>
 # CDN 模式返回空: TLS 在 Cloudflare 终止, 源站根本看不到 ClientHello,
 # 写 key_path 只会误导排障。
 sb_ech_json_server() {
-    [[ "${SB_ECH_ON:-0}" == "1" && "${SB_ECH_MODE:-}" == "direct" ]] || return 0
-    [[ -s "${SB_ECH_KEY_FILE:-}" ]] || return 0
-    printf '"ech": { "enabled": true, "key_path": "%s" }' "$SB_ECH_KEY_FILE"
+    # 恒空: ECH 现在只在 CDN 接入下开放, 而 CDN 模式下 TLS 在 Cloudflare
+    # 终结, 源站根本看不到 ClientHello, 写 key_path 只会误导排障。
+    return 0
 }
 
 # 客户端 TLS 里的 ech 片段 (供各协议并进 outbound.tls)
-# CDN: 留空 config/config_path → sing-box 走 query_server_name 从 DNS 取。
-# 直连: 指向本地 ECH CONFIGS 文件 (由客户端部署脚本放到客户端上)。
+# CDN 模式: 只写 query_server_name, sing-box 自己去 DNS 取 Cloudflare 的
+# ECHConfigList。**不写 config/config_path** —— 那是本机文件路径, 客户端
+# 那边不存在, 曾导致所有 ECH 节点实测 0/3。
 sb_ech_json_client() {
     [[ "${SB_ECH_ON:-0}" == "1" ]] || return 0
-    case "${SB_ECH_MODE:-}" in
-        cdn)
-            printf '"ech": { "enabled": true, "query_server_name": "%s" }' "$SB_ECH_DOMAIN"
-            ;;
-        direct)
-            [[ -s "${SB_ECH_CONFIG_FILE:-}" ]] || return 0
-            # 必须内联 configs, 不能给 config_path —— 那是**服务端**机器上的
-            # 绝对路径, 写进客户端产物后客户端当然打不开 (实测 ECH 节点在
-            # 客户端 0/3, 报 open /root/catmi/sing-box/ech/... no such file)。
-            # sing-box 客户端的 ECHConfigs 有内联字段, 直接把 PEM 正文塞进去。
-            # 必须内联完整 PEM (含 BEGIN/END ECH CONFIGS 头尾行) —— sing-box
-            # 客户端的 ech.config 字段要的是 PEM 文本, 只给 base64 正文会报
-            # "invalid ECH configs pem"。
-            #   ech.config_path   = 本地文件路径 (服务端机器上的绝对路径,
-            #                       写进客户端产物客户端必然打不开)
-            #   ech.config        = 内联 PEM  ← 用这个
-            #   ech.configs       = 内核 1.14 不认 (unknown field)
-            local cf; cf=$(jq -Rs . < "$SB_ECH_CONFIG_FILE")
-            [[ "$cf" != '""' ]] || return 0
-            printf '"ech": { "enabled": true, "config": %s }' "$cf"
-            ;;
-    esac
+    [[ "${SB_ECH_MODE:-}" == "cdn" ]] || return 0
+    [[ -n "${SB_ECH_DOMAIN:-}" ]] || return 0
+    printf '"ech": { "enabled": true, "query_server_name": "%s" }' "$SB_ECH_DOMAIN"
 }
 
-# 分享链接参数
-#   CDN 模式: 走 DNS 查询形式 (&ech=public_name+DNS上游), 客户端自取 Cloudflare 的 ECHConfigList
-#   直连模式: 带本机生成的 ECHCONFIGS (客户端无 DNS 可依赖时仍可用)
+# 分享链接参数: 同样只有 CDN 形式 (客户端从 DNS 自取 ECHConfigList)
 sb_ech_link_params() {
     [[ "${SB_ECH_ON:-0}" == "1" ]] || return 0
-    case "${SB_ECH_MODE:-}" in
-        cdn)
-            [[ -n "${SB_ECH_DOMAIN:-}" ]] || return 0
-            printf '&ech=%s' "$(sb_urlencode "$SB_ECH_QUERY_PARAM")"
-            ;;
-        direct)
-            [[ -s "${SB_ECH_CONFIG_FILE:-}" ]] || return 0
-            printf '&ech=%s' "$(tr -d '\n' < "$SB_ECH_CONFIG_FILE" | grep -v -- "-----")"
-            ;;
+    [[ "${SB_ECH_MODE:-}" == "cdn" ]] || return 0
+    [[ -n "${SB_ECH_DOMAIN:-}" ]] || return 0
+    printf '&ech=%s' "$(sb_urlencode "$SB_ECH_QUERY_PARAM")"
+}
+
+# 节点名的**最终裁决**。必须在 ECH / 接入方式都确定之后调用。
+#
+# 为什么需要: 预置表的标签是在"选方案"那一刻定下的, 但里面最关键的两个
+# 特征 —— CDN 与 ECH —— 要到后面才确定:
+#   - 预置说是 CDN, 用户在"接入方式"那一步改成直连了
+#   - ECH 菜单默认开, 但 sb_ech_dns_published 查到这个域名的 HTTPS 记录里
+#     没有 ech= 参数, 于是没开成
+# 这两种情况下, 早先拼进名字的 "CDN" / "ECH" 就是**假话** —— 而用户在
+# 客户端列表里唯一的线索就是名字, 看到 "…-ECH" 却发现没加密, 比不给提示更糟。
+# 所以这里按实际生效的开关重算标签, 而不是相信预置表。
+sb_resolve_tag() { # <基础形态: reality|tls|plain> -> 追加到 SB_TAG_EXTRA
+    local form="${1:-plain}"
+    local extra="$SB_PRESET_TAG"
+    # CDN: 以实际接入方式为准
+    case "${ACCESS_MODE:-direct}" in
+        cdn|cdn-nginx) ;;
+        *) extra="${extra//CDN/}" ;;
     esac
+    # ECH: 以实际是否开启为准 (可能是预置要求开但 DNS 里没有 ech= 参数)
+    [[ "${SB_ECH_ON:-0}" == "1" ]] || extra="${extra//ECH/}"
+    # 把 "CDN+ECH" 这样的连接写法换成 "-", 而不是直接删 "+"。
+    # 直接删会把两段贴成一个词 (CDN+ECH → CDNECH), 名字里就看不出是两项了。
+    extra="${extra//+/-}"
+    # 收拾首尾多余的 "-"
+    while [[ "$extra" == -* ]]; do extra="${extra#-}"; done
+    while [[ "$extra" == *- ]]; do extra="${extra%-}"; done
+    SB_TAG_EXTRA="$extra"
 }
 
 # ---------- CDN 站点片段清理 ----------
@@ -1292,26 +1277,29 @@ SB_PRESETS=(
     "vless|grpc-video|② gRPC 伪装 · REALITY|grpc|video||reality|gRPC 套一层正常 HTTP/2 流量; 两个内核都验证过|REALITY|"
     "vless|grpc-dl|③ gRPC 高并发 · REALITY|grpc|download||reality|多路复用扛并发, 适合爬虫/大量小请求|REALITY|"
     "vless|h2-video|④ HTTP/2 伪装 · REALITY|h2|video||reality|HTTP/2 传输, 对 CDN 面板最友好的形状|REALITY|"
-    "vless|tcp-ech|⑤ 隐匿优先 · ECH|tcp|video||selfsign|ECH 加密 ClientHello 藏住真实 SNI; 直连也不暴露域名|ECH|ech"
-    "vless|grpc-ech|⑥ gRPC + ECH|grpc|video||selfsign|gRPC 伪装再叠 ECH; 抗探测最彻底, 仅 sing-box 客户端|ECH|ech"
+    "vless|ws-cdn|⑤ CDN 网页党 · 真证书|ws|web||真证书|走 Cloudflare 回源; 网页浏览档, 最省资源|CDN|"
+    "vless|ws-cdn-ech|⑥ CDN + ECH · 网页党|ws|web||真证书|ECH 加密真实 SNI, CDN 回源; 域名探测也挡得住|CDN+ECH|ech"
+    "vless|h2-cdn-ech|⑦ CDN + ECH · 视频党|h2|video||真证书|HTTP/2 + ECH; 看视频档, ECH 全程生效|CDN+ECH|ech"
     "vmess|tcp-video|① 隐匿优先 · REALITY|tcp|video||reality|裸TCP, 不带任何 Web 特征|REALITY|"
     "vmess|grpc-video|② gRPC 伪装 · REALITY|grpc|video||reality|gRPC 套一层正常 HTTP/2 流量|REALITY|"
     "vmess|grpc-dl|③ gRPC 高并发 · REALITY|grpc|download||reality|多路复用扛并发|REALITY|"
     "vmess|h2-video|④ HTTP/2 伪装 · REALITY|h2|video||reality|HTTP/2 传输|REALITY|"
-    "vmess|tcp-ech|⑤ 隐匿优先 · ECH|tcp|video||selfsign|ECH 加密 ClientHello; 客户端需 insecure|ECH|ech"
+    "vmess|ws-cdn-ech|⑤ CDN + ECH · 网页党|ws|web||真证书|ECH 加密真实 SNI, CDN 回源|CDN+ECH|ech"
     "trojan|tcp-video|① 隐匿优先 · REALITY|tcp|video||reality|裸TCP, 不带任何 Web 特征|REALITY|"
     "trojan|grpc-video|② gRPC 伪装 · REALITY|grpc|video||reality|gRPC 套一层正常 HTTP/2 流量|REALITY|"
     "trojan|grpc-dl|③ gRPC 高并发 · REALITY|grpc|download||reality|多路复用扛并发|REALITY|"
     "trojan|h2-video|④ HTTP/2 伪装 · REALITY|h2|video||reality|HTTP/2 传输|REALITY|"
-    "trojan|tcp-ech|⑤ 隐匿优先 · ECH|tcp|video||selfsign|ECH 加密 ClientHello; 客户端需 pin 钉扎|ECH|ech"
+    "trojan|ws-cdn-ech|⑤ CDN + ECH · 网页党|ws|web||真证书|ECH 加密真实 SNI, CDN 回源|CDN+ECH|ech"
     "anytls|reality|① 隐匿优先 · REALITY|无|无||reality|Reality 免证书; AnyTLS 本身已带一层 TLS 伪装|REALITY|"
     "anytls|reality-pad|② REALITY + padding|无|无|pad|reality|开 padding 填充实包大小, 抗流量分析|REALITY+pad|pad"
-    "anytls|ech|③ ECH + padding|无|无|pad|selfsign|ECH + padding; AnyTLS 无证书身份, 只能靠 ECH 藏 SNI|ECH+pad|ech pad"
+    "anytls|tls-pad|③ TLS + padding|无|无|pad|selfsign|自签 + padding; 无 CDN 无 Reality 时的稳选|TLS+pad|pad"
     "shadowsocks|ss-web|① 网页党 (省资源)|无|web||无|网页浏览; 单连接流数压到 1, 内存占用最低|网页|"
     "shadowsocks|ss-video|② 视频党 (均衡)|无|video||无|默认档; 看视频 + 日常网页都够用|视频|"
     "shadowsocks|ss-dl|③ 下载党 (高吞吐)|无|download||无|大文件/长连接; 单连接多流并行|下载|"
     "hysteria2|h2-default|① 推荐默认|无|无||真证书|Hysteria2 参数已是最优默认 (BBR + Salamander)|默认|"
     "tuic|tuic-default|① 推荐默认|无|无||真证书|TUIC 参数已是最优默认 (BBR + Salamander)|默认|"
+    "naive|naive-real|① 真证书 (推荐)|无|无||真证书|naiveproxy 走真证书, 客户端无需 insecure|真证书|"
+    "naive|naive-self|② 自签 + 伪装域名|无|无||selfsign|自签证书 + 伪装域名; 客户端需 pin 钉扎||"
 )
 
 # <协议> 的预置行数
@@ -1348,7 +1336,10 @@ sb_preset_get() {
 sb_ask_preset() { # <协议> [菜单标题]
     local proto="$1" title="${2:-预置方案}"
     SB_PRESET_TR=""; SB_PRESET_MUX=""; SB_PRESET_FLOW=""; SB_PRESET_CERT=""
-    SB_PRESET_TAG=""; SB_PRESET_ECH=0; SB_PRESET_PAD=0
+    SB_PRESET_TAG=""; SB_PRESET_ECH=0; SB_PRESET_PAD=0; SB_PRESET_CDN=0
+    # 每个节点都要从干净的状态起算, 否则批量或连开时会把上一个节点的选择
+    # 带过来 (SB_ECH_ON / SB_TAG_FORM 都是全局变量)
+    SB_ECH_ON=0; SB_ECH_MODE=""; SB_TAG_FORM=""; SB_TAG_EXTRA=""
     if [[ -n "${SB_BATCH:-}" ]]; then return 0; fi
     local n; n=$(sb_preset_count "$proto")
     (( n == 0 )) && return 0
@@ -1388,9 +1379,23 @@ sb_ask_preset() { # <协议> [菜单标题]
         [[ "$mux" == "off" ]] && SB_PRESET_MUX=""
         # 方案标识写进节点名 —— 用户在客户端列表里只能看到名字, 这是唯一的区分线索
         SB_PRESET_TAG="$tag"
-        SB_PRESET_ECH=0; SB_PRESET_PAD=0
+        SB_PRESET_ECH=0; SB_PRESET_PAD=0; SB_PRESET_CDN=0
         [[ "$extra" == *ech* ]] && SB_PRESET_ECH=1
         [[ "$extra" == *pad* ]] && SB_PRESET_PAD=1
+        # 标签里带 CDN 的方案 (走 Cloudflare 回源)
+        [[ "$tag" == *CDN* ]] && SB_PRESET_CDN=1
+        # 防呆: ECH 是 **CDN 专属**。ECH 的意义在于让客户端连 CDN 时把真实
+        # SNI 加密掉, ECHConfigList 的私钥在 Cloudflare 手里 —— 直连场景
+        # 前面没有 CDN 终结 TLS, 我们自己持密钥加密 ClientHello (direct 模式)
+        # 只有 sing-box 客户端认, 且要求客户端内联整份 PEM, 兼容性很差。
+        # 所以直连方案一律不带 ECH, ECH 只在 CDN 接入下才问。
+        if [[ "$SB_PRESET_ECH" == "1" && "$SB_PRESET_CDN" != "1" ]]; then
+            SB_PRESET_ECH=0
+            SB_PRESET_TAG="${SB_PRESET_TAG//ECH/}"
+            while [[ "$SB_PRESET_TAG" == *+* ]]; do SB_PRESET_TAG="${SB_PRESET_TAG//+/}"; done
+            while [[ "$SB_PRESET_TAG" == *CDN* ]]; do SB_PRESET_TAG="${SB_PRESET_TAG//CDN/}"; done
+            print_warn "ECH 只在 CDN 接入下有意义, 该方案是直连, 已关闭 ECH"
+        fi
         # 防呆: ECH 与 Reality 是两套不同的藏 SNI 手段, 不能叠加 ——
         # Reality 借的是真实站点的证书, 本来就没有"自己的 SNI" 可加密。
         # 表里已经把它们分到不同行, 这里再兜一层底, 防止以后改表时踩进去。
@@ -1399,10 +1404,10 @@ sb_ask_preset() { # <协议> [菜单标题]
             print_warn "ECH 不能与 Reality 同开, 已改为自签证书 + ECH"
         fi
         # 防呆: ECH 必须有证书可终结 TLS, 没有证书身份就没有 ClientHello 可加密
-        if [[ "$SB_PRESET_ECH" == "1" && "$SB_PRESET_CERT" != "selfsign" && "$SB_PRESET_CERT" != "real" ]]; then
-            SB_PRESET_ECH=0
-            print_warn "该协议没有可终结 TLS 的证书身份, ECH 已关闭"
-        fi
+        # 注意: 这里**不能**再加一条"证书必须能终结 TLS"的判断。真证书当然
+        # 能终结 TLS, 而且 CDN + ECH 恰恰就是配真证书用的 —— 之前那条防呆
+        # 只放行 selfsign/real, 把 CDN 预置的真证书判成"没有证书身份",
+        # 直接把 ECH 关了。属于自己加的、且与实际语义相反的规则。
         print_ok "预置方案: $(echo "${SB_PRESETS[@]}" | grep "^${proto}|" | sed -n "${c}p" | cut -d'|' -f3)"
         print_info "下面仍会逐项确认, 想改直接选别的即可"
     fi
@@ -1710,8 +1715,14 @@ ask_access_mode() {
     echo "    1) 直连 (推荐, 最简单, 无需 Nginx)" >&2
     echo "    2) CDN 直连 (Cloudflare 回源到本节点端口, 不经 Nginx)" >&2
     echo "    3) CDN + Nginx (推荐: 源站端口不暴露, 隐藏源站 IP)" >&2
-    local c; c=$(safe_read "选择" "3")
-    [[ -z "$c" ]] && c=3
+    # 预置方案指定了 CDN 就把默认值落到 CDN 接入 (3), 用户仍可改回直连
+    local c def=3 ahint=""
+    if [[ "${SB_PRESET_CDN:-0}" == "1" ]]; then
+        ahint=" (预置方案指定 CDN 接入)"; def=3
+    fi
+    [[ -n "$ahint" ]] && echo -e "    ${MAGENTA}${ahint}${RESET}" >&2
+    c=$(safe_read "选择 (回车=${def})" "$def")
+    [[ -z "$c" ]] && c=$def
     case "$c" in
         1) ACCESS_MODE="direct" ;;
         2) ACCESS_MODE="cdn" ;;
