@@ -1397,14 +1397,27 @@ SB_PRESETS=(
     "trojan|ws-cdn-ech|⑤ CDN + ECH · 网页党|ws|web||真证书|ECH 加密真实 SNI, CDN 回源|CDN+ECH|ech"
     "trojan|grpc-cdn|⑥ CDN · gRPC 档|grpc|video||真证书|Cloudflare 回源; gRPC 走 HTTP/2, 与网页档的 WebSocket 形态不同, 便于分散流量特征|CDN|"
     "trojan|grpc-cdn-ech|⑦ CDN + ECH · gRPC 档|grpc|video||真证书|gRPC + ECH; Cloudflare 回源; gRPC 走 HTTP/2, 与网页档的 WebSocket 形态不同, 便于分散流量特征|CDN+ECH|ech"
-    "anytls|reality|① 隐匿优先 · REALITY|无|无||reality|Reality 免证书; AnyTLS 本身已带一层 TLS 伪装|REALITY|"
-    # anytls 只有 REALITY 一种可用形态。实测 (2026-10): anytls 出站配普通
-    # TLS (certificate_path/key_path) 时, 服务端在 ClientHello 阶段就 reset,
-    # sing-box 与 mihomo 客户端都连不上 (mihomo 偶发 2/3); 换 REALITY 立刻
-    # 3/3。与面板代码无关 —— 完全手写的配置同样复现, 内核字段也不报
-    # unknown field。所以 TLS/padding/ECH 那几个基于 TLS 的预置全部撤掉了,
-    # 留着只会让用户建出连不上的节点。padding 可以叠在 REALITY 上。
-    "anytls|reality-pad|② REALITY + padding|无|无|pad|reality|开 padding 填充实包大小, 抗流量分析|REALITY+pad|pad"
+    # anytls 的预置表 (2026-10 更正两次)。
+    #
+    # 第一次误判: 写着"anytls 只有 REALITY 一种可用形态", 撤掉了全部 TLS 预置。
+    #   错因是当时���测试环境有问题: 临时起的端口没在防火墙放行, CC 连过去是
+    #   i/o timeout, 我把这个现象当成了"服务端在 ClientHello 阶段 reset"。
+    #   (中途还误以为是 ALPN 的问题, 同样被推翻 —— 见下。)
+    #
+    # 复核结论 (RN 起服务端, CC 上 sing-box 与 mihomo 双内核实测):
+    #   anytls 原生 TLS + 自签/真证书          -> 两端都正常, 稳定 8/8
+    #   anytls + REALITY                       -> 两端正常 (仅 sing-box 客户端)
+    #   alpn 有无、服务端有无 alpn             -> 四种组合**全部 8/8**, 与 ALPN 无关
+    #   把 ufw 放行规则删掉                    -> 立刻退回 0/6 i/o timeout
+    #   交叉验证: fscarmen/sing-box 的 anytls 服务端与客户端也都不写 alpn, 照常工作
+    #
+    # 所以 anytls 的原生 TLS 形态完全可用, 与 ALPN 无关, 与防火墙有关。
+    # 本项目的 anytls.sh 一直给两端写死 alpn=[h2, http/1.1] —— 那是可选项,
+    # 留着无妨 (与服务端一致), 但**不要**把它当成"缺了就连不上"。
+    "anytls|tls-self|① 自签 (pin) · 通用|无|无||selfsign|自签证书 + SPKI pin; mihomo/sing-box 都能用; 推荐|自签|"
+    "anytls|tls-real|② 真证书|无|无||真证书|CA 可信证书, 客户端无需 insecure/pin; 需先备好 crt/key|真证书|"
+    "anytls|reality|③ 隐匿优先 · REALITY|无|无||reality|Reality 免证书; 仅 sing-box 客户端 (mihomo 不支持 AnyTLS+Reality)|REALITY|"
+    "anytls|reality-pad|④ REALITY + padding|无|无|pad|reality|在 REALITY 基础上开 padding 填充, 改变流量形状|REALITY+pad|pad"
     
         "shadowsocks|ss-web|① 网页党 (省资源)|无|web||无|网页浏览; 单连接流数压到 1, 内存占用最低|网页|"
     "shadowsocks|ss-video|② 视频党 (均衡)|无|video||无|默认档; 看视频 + 日常网页都够用|视频|"
@@ -3261,6 +3274,27 @@ sb_menu_utls_fingerprint() {
     fi
     local pick="${SB_UTLS_FINGERPRINTS[$((c-1))]}"
     sb_switch_utls_fingerprint "$pick"
+}
+
+# REALITY 的 dest 站点必须实测 —— 2026-10 的教训。
+#
+# 同一份配置 (同密钥/同端口/同协议), 只改 .tls.reality.handshake.server:
+#     openjdk.org                      -> 5/5 通
+#     images-na.ssl-images-amazon.com  -> 0/5, 客户端 connection reset by peer
+# 两个站点从服务端都可达、TLS1.3 正常、HTTP 200、时延 0.2s, short_id 与公钥
+# 也完全匹配 —— 纯粹是 REALITY 与该 dest 的握手兼容性。
+#
+# 本项目的 REALITY dest 直接取证书域名 (见 trojan.sh / vless.sh), 没有独立
+# 的候选池, 所以用户拿哪个证书做 REALITY, 就会踩哪个 dest。这里给出实测
+# 可靠的名单供参考, 不做硬性限制 —— 站点可用性会随时间变化, 名单会过期。
+SB_REALITY_DEST_KNOWN_GOOD="openjdk.org www.mysql.com www.apple.com www.cloudflare.com"
+SB_REALITY_DEST_KNOWN_BAD="images-na.ssl-images-amazon.com"
+
+sb_reality_dest_hint() { # 在选证书时提示 REALITY dest 的风险
+    print_info "REALITY 提示: dest 取你的证书域名。站点可用性需实测 ——"
+    print_info "  实测可用: openjdk.org / www.mysql.com / www.apple.com"
+    print_info "  实测不通: images-na.ssl-images-amazon.com (配置全对也 0/N)"
+    print_info "  若 REALITY 节点连不上, 先换证书域名再排查其他"
 }
 
 sb_menu_addr_family() {

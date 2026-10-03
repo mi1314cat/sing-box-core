@@ -127,12 +127,46 @@ add_config() {
     server_ip=$(ask_server_addr)
     listen_ip=$(ask_listen_addr)
     listen_port=$(safe_read_port)
-    read -r -p "是否开启 UDP 端口跳跃? [y/N]: " yn
-    local hop=""
-    if [[ "$(clean_input "$yn")" =~ ^[yY] ]]; then
-        hop=$(clean_input "$(safe_read "跳跃范围 (如 30000-31000)" "30000-31000")")
+    # 端口跳跃: 交互问, 批量读 SB_BATCH_HOP (空=不开)。
+    # 之前这两问 (跳跃 + obfs) 只在交互路径存在, 批量生成 (stdin 是 /dev/null)
+    # 永远拿到空值 -> 等于恒定关闭, 用户在批量里根本选不到。
+    local yn hop=""
+    if [[ -n "${SB_BATCH:-}" ]]; then
+        hop="${SB_BATCH_HOP:-}"
+        [[ -n "$hop" ]] && yn=y || yn=n
+    else
+        read -r -p "是否开启 UDP 端口跳跃? [y/N]: " yn
+    fi
+    if [[ "$(clean_input "${yn:-}")" =~ ^[yY] ]]; then
+        # 批量下 SB_BATCH_HOP 已经在上面赋过值, 这里不能再走 safe_read ——
+        # SB_BATCH 模式下 safe_read 直接返回默认值且不消费输入, 会把用户
+        # 选的跳跃范围覆盖成 30000-31000。
+        if [[ -n "${SB_BATCH:-}" ]]; then
+            hop=$(clean_input "$hop")
+            [[ -z "$hop" ]] && hop="30000-31000"
+        else
+            hop=$(clean_input "$(safe_read "跳跃范围 (如 30000-31000)" "30000-31000")")
+        fi
         if [[ "$hop" =~ ^[0-9]+-[0-9]+$ ]]; then
             local s="${hop%-*}" e="${hop#*-}"
+            # 建节点前先清掉**同跳跃范围的旧 DNAT 规则**。
+            # 否则每建一个节点就多一条指向不同 --to-ports 的规则, 而它们匹配
+            # 的是同一个 dport 范围 —— 客户端往跳跃端口发包时 netfilter 取第一
+            # 条匹配的规则改道, 包被送到**上一个**节点的真实端口。表现是: 配置
+            # 全对、服务端在监听、日志里一条连接都没有, 只有开了跳跃的 HY2
+            # 100% 连不通 (实测踩过: 连开 4 个节点后其他节点都正常)。
+            while iptables -t nat -C PREROUTING -p udp --dport "$s:$e" -j REDIRECT 2>/dev/null; do
+                local _l1
+                _l1=$(iptables -t nat -S PREROUTING 2>/dev/null | grep -- "--dport $s:$e -j REDIRECT" | head -1 | sed 's/^-A //')
+                [[ -z "$_l1" ]] && break
+                iptables -t nat -D $_l1 2>/dev/null || break
+            done
+            while iptables -t nat -C OUTPUT -p udp --dport "$s:$e" -j REDIRECT 2>/dev/null; do
+                local _l2
+                _l2=$(iptables -t nat -S OUTPUT 2>/dev/null | grep -- "--dport $s:$e -j REDIRECT" | head -1 | sed 's/^-A //')
+                [[ -z "$_l2" ]] && break
+                iptables -t nat -D $_l2 2>/dev/null || break
+            done
             if command -v iptables >/dev/null && ! iptables -C INPUT -p udp --dport "$s:$e" -j ACCEPT 2>/dev/null; then
                 # 吸附到 DNAT
                 if iptables -t nat -C PREROUTING -p udp --dport "$s:$e" -j REDIRECT --to-ports "$listen_port" 2>/dev/null; then
@@ -143,6 +177,18 @@ add_config() {
                         iptables -t nat -A OUTPUT -p udp --dport "$s:$e" -j REDIRECT --to-ports "$listen_port" 2>/dev/null
                     print_ok "端口跳跃 DNAT 已添加: $hop -> $listen_port"
                 fi
+            fi
+            # 防火墙放行整个跳跃范围。ufw 开着 INPUT DROP 时, DNAT 规则
+            # 装上了但端口没放行 = 客户端照样连不上 —— 实测踩过: 规则齐全、
+            # 服务端监听正常, 客户端就是 timeout, 因为 ufw 把包丢了。
+            # 这里只**增加**跳跃范围的放行规则, 不动其他规则。
+            if command -v ufw >/dev/null 2>&1 && [[ "$(ufw status 2>/dev/null | head -1)" == "Status: active" ]]; then
+                # ufw 支持 "起始:终止" 一条规则覆盖整个范围
+                ufw allow "$s:$e/udp" >/dev/null 2>&1 \
+                    && print_ok "防火墙已放行 UDP $s:$e" \
+                    || print_warn "防火墙放行失败 ($s:$e), 需手动: ufw allow $s:$e/udp"
+            else
+                print_info "ufw 未启用, 无需放行跳跃端口"
             fi
         else
             print_warn "范围格式错误，未开启跳跃"; hop=""
@@ -159,12 +205,32 @@ add_config() {
     # 这三个协议只走直连, 没有 CDN 在中间终结 TLS, 所以固定 direct。
     sb_ask_ech "$CERT_DOMAIN" direct
     local password="" mask="none"
-    read -r -p "是否启用 obfs 混淆? [y/N]: " oyn
-    if [[ "$(clean_input "$oyn")" =~ ^[yY] ]]; then
+    local oyn
+    if [[ -n "${SB_BATCH:-}" ]]; then
+        oyn=$(clean_input "${SB_BATCH_OBFS:-}")
+        [[ -n "$oyn" ]] && oyn=y || oyn=n
+    else
+        read -r -p "是否启用 obfs 混淆? [y/N]: " oyn
+    fi
+    if [[ "$(clean_input "${oyn:-}")" =~ ^[yY] ]]; then
         mask=$(openssl rand -hex 12)
         print_ok "obfs password: $mask"
     fi
     local auth; auth=$(openssl rand -hex 16)
+
+    # 端口跳跃的客户端侧字段: 开了跳跃就要让客户端知道往哪个范围发, 否则
+    # 客户端一直打真实端口, 服务端 iptables 的 DNAT 规则形同虚设。
+    # sing-box hysteria2 出站用 server_ports (数组, "起:止"), mihomo 用 ports。
+    local hop_field=""
+    if [[ -n "$hop" && "$hop" =~ ^[0-9]+-[0-9]+$ ]]; then
+        # 内核要 "起:止", 不是 "起-止" —— 写成后者直接
+        # "initialize outbound[0]: bad port range" (实测)。
+        # 用户输入和分享链接的 mport 都用 "起-止", 这里转换一下。
+        # 跳跃间隔也写进去。参考 fscarmen/sing-box 的做法: 只给 server_ports
+        # 而不给间隔时, sing-box 用内核默认值; 显式给 30s/60s 与分享链接的
+        # mport&hop_interval=30s 保持一致, 也让两端行为可预期。
+        hop_field=", \"server_ports\": [\"${hop%-*}:${hop#*-}\"], \"hop_interval\": \"30s\", \"hop_interval_max\": \"60s\""
+    fi
 
     local idx file tag json
     idx=$(get_next_index "$PROTO")
@@ -239,7 +305,7 @@ EOF
       "type": "hysteria2",
       "tag": "$tag",
       "server": "$server_ip",
-      "server_port": $listen_port,
+      "server_port": $listen_port${hop_field},
       "password": "$auth",
       "up_mbps": 100,
       "down_mbps": 500,

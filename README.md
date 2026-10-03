@@ -11,7 +11,7 @@
 > **本文档里所有"支持 / 不支持"的结论都是实测得来的，不是抄文档。**
 > 判断某个组合能不能用，一律以 `sing-box check` **加上真实连接**为准 ——
 > 本项目反复遇到 `check` 放行、运行时才失败的情况（hysteria2/tuic 的 uTLS、
-> naive 的 Cronet、anytls 的普通 TLS），详见下文各节的说明。
+> naive 的 CGO、anytls 的防火墙放行），详见下文各节的说明。
 
 ---
 
@@ -107,9 +107,9 @@ bash <(curl -Ls https://github.com/mi1314cat/sing-box-core/raw/refs/heads/main/i
 | VLESS | 9 | `vless.sh` | REALITY ×4 + CDN(ws/grpc/h2) ×3 + CDN+ECH ×2 |
 | VMess | 8 | `vmess.sh` | REALITY ×4 + CDN(ws/grpc) ×2 + CDN+ECH ×2 |
 | Trojan | 7 | `trojan.sh` | REALITY + CDN(ws/grpc) ×2 + CDN+ECH ×2 + TLS |
-| AnyTLS | 2 | `anytls.sh` | REALITY、REALITY+padding（**只有这两种，见下文**） |
+| AnyTLS | 4 | `anytls.sh` | 自签(pin)、真证书、REALITY、REALITY+padding |
 | Shadowsocks | 3 | `shadowsocks.sh` | SS-2022 blake3 + multiplex |
-| Hysteria2 | 2 | `hysteria2.sh` | 默认、+内核 ECH |
+| Hysteria2 | 2 | `hysteria2.sh` | 默认、+内核 ECH（端口跳跃 / obfs 为全局选项） |
 | TUIC | 2 | `tuic.sh` | 默认、+内核 ECH |
 | NaiveProxy | 2 | `naive.sh` | 自签（默认）、真证书 |
 | Reality | — | `reality.sh` | 独立的 VLESS+Reality 入口 |
@@ -139,7 +139,39 @@ bash src/conf/vless.sh list|del     # 查看 / 删除
 | | 端口范围 | `20000-25000` 格式，回车 = 自动分配 |
 | | CDN 模式 | 1) 开启（vless/vmess 走 CDN） 2) 全部直连 |
 | ③ | 多路复用 | 1) 不开 2) 网页档(web) 3) 视频党(video) 4) 下载档(download) |
+| ③b | Hysteria2 专属 | 1) 端口跳跃 2) obfs 混淆 3) 两个都开 4) 都不开（默认） |
 | ④ | CDN 传输 | 1) ws（3 个节点） 2) gRPC（3 个） 3) ws + gRPC（6 个） |
+
+### Hysteria2 的端口跳跃与 obfs
+
+这两个只对 `hysteria2` 有意义（UDP 协议 + salamander obfs），其他协议内核
+没有对应字段，所以不做逐协议勾选，直接问一次"要不要开"。
+**之前它们只挂在交互路径上**，批量生成时 `stdin` 是 `/dev/null`，永远拿到
+空值 —— 等于恒定关闭，用户在批量里根本选不到。现已接入批量。
+
+**端口跳跃** 开启后做四件事：
+
+1. 服务端装 iptables DNAT：`udp dport 起:止 → REDIRECT --to-ports 真实端口`
+2. **防火墙放行整个跳跃范围**（`ufw allow 起:止/udp`）—— 这一步漏了会
+   出现"配置全对、服务端在监听、日志里一条连接都没有"，因为 ufw 把包丢了
+3. 客户端出站写 `server_ports: ["起:止"]`，sing-box 的分隔符是 `:`，
+   写 `-` 会直接报 `bad port range`
+4. 分享链接带 `mport=起-止`；mihomo YAML 里叫 `ports`，且**必须是字符串**，
+   写成数组会报 `'ports' expected type 'string'`
+
+间隔参数对齐 [fscarmen/sing-box](https://github.com/fscarmen/sing-box) 的做法，
+客户端出站一并写 `hop_interval: 30s` / `hop_interval_max: 60s`。
+
+> **建新节点前会先清掉同跳跃范围的旧 DNAT 规则**。否则每建一个节点就多一条
+> 指向不同 `--to-ports` 的规则，而这些规则匹配的是同一个 dport 范围 ——
+> 客户端往跳跃端口发包时 netfilter 取第一条匹配的改道，包被送进**上一个**
+> 节点。表现同样是"只有开了跳跃的 HY2 连不通"，但根因是规则堆积，
+> 换协议、重启服务都找不到。（实测连开 4 个节点后复现。）
+
+**obfs 混淆** 开启后服务端与客户端都带
+`obfs: {type: salamander, password: <24位hex>}`，mihomo 侧对应
+`obfs: salamander` + `obfs-password`。fscarmen 那一版**没有** obfs
+（他的 `HY2_REALM_CONFIG` 是 hy2 realm 中转，不是混淆层）。
 
 ### 设计取舍：为什么是单选而不是逐协议勾选
 
@@ -156,7 +188,7 @@ bash src/conf/vless.sh list|del     # 查看 / 删除
 选「真证书 + 网页党 + ws+gRPC」，RN 上实测产出 15 个节点：
 
 ```
-anytls01/02-REALITY        直连
+anytls01/02-TLS             直连
 hysteria201-TLS            直连
 reality01-REALITY          直连
 shadowsocks01-plain        直连  mux
@@ -467,51 +499,73 @@ sing-box generate ech-keypair <你的域名>
 这些是实测确认**连不通**的组合。项目里已经撤掉相关预置或加了警告，
 但结论值得写在这里，避免后人重新踩一遍。
 
-### AnyTLS + 普通 TLS：服务端在 ClientHello 阶段就 reset
+### ~~AnyTLS + 普通 TLS：服务端在 ClientHello 阶段就 reset~~（**已推翻**）
 
-**现象**：AnyTLS 出站配 `certificate_path` / `key_path`（而非 REALITY）时，
-连接在 TLS 握手第一步就被服务端断开，客户端报：
+> **本节原结论是错的，2026-10 更正并撤回。保留文字是为了说明这个坑是怎么踩的。**
 
-```
-failed to create session: read tcp ...: read: connection reset by peer
-```
+**原结论**：AnyTLS 配普通 TLS（`certificate_path`/`key_path`）时连接必挂，
+于是撤掉了全部 TLS 预置、批量强制走 REALITY。
 
-服务端侧对应：
+**实际情况**：AnyTLS 原生 TLS **完全可用**，`check` 通过、真实连接稳定 8/8
+（sing-box 与 mihomo 双内核各验一轮）。
 
-```
-inbound/anytls[...]: process connection from ...: TLS handshake: read tcp ...: read: connection reset by peer
-```
+**错因**：当时在测试机上临时起服务，那个端口**没在防火墙放行**，
+CC 连过去是 `i/o timeout`。我把这个现象读成了"服务端在 ClientHello 阶段
+reset connection by peer"，当成内核限制写进了文档 —— 实际上
+`connection reset by peer` 和 `i/o timeout` 是两回事，前者才是应用层拒绝。
 
-**排查过程**（每一步都排除了）：
+**复核方式**（可重复验证）：
 
-| 验证项 | 结果 |
+| 条件 | 结果 |
 |---|---|
-| 去掉客户端 `ech` 字段 | 0/3，仍不通 |
-| 去掉 `utls` | 0/3 |
-| 去掉 `alpn` | 0/3 |
-| 换成 `insecure: true`（跳过证书校验） | 0/3 |
-| **服务端也关掉 ech** | **0/3** |
-| 完全手写配置（不经面板） | **0/3，同样复现** |
-| 改用 mihomo 客户端连同一个服务端 | 偶发 2/3，不是稳定可用 |
-| 服务端密码 / 客户端密码 | 一致（23 位） |
-| SPKI pin 与服务端证书真值 | 完全一致 |
-| `sing-box check` | **通过，不报 unknown field** |
-| 同一个客户端连 AnyTLS + REALITY | **3/3 稳定通过** |
+| anytls + 自签/真证书，防火墙已放行 | 8/8 |
+| 服务端有无 alpn × 客户端有无 alpn（四种组合） | 全部 8/8 |
+| **删掉 ufw 放行规则，其余配置一字不改** | **0/6 `i/o timeout`** |
 
-**结论**：与面板代码无关 —— 完全手写的配置同样复现，内核字段校验也放行。
-AnyTLS 的**普通 TLS 形态在本内核上不可用**，只有 REALITY 可用。
+变量是防火墙，不是 alpn，也不是任何协议限制。中途还误判过一次「必须带
+ALPN」，同样被这张表推翻 —— ALPN 在四种组合下都通。
 
-因此：
+**交叉验证**：[fscarmen/sing-box](https://github.com/fscarmen/sing-box)
+（6852 行、社区使用量最大的一版）的 anytls 服务端与客户端**都不写 alpn**，
+照常工作，与本项目实测一致。本项目仍给两端写 `alpn: [h2, http/1.1]`
+（与服务端一致，无副作用），但那**不是**连不上的原因。
 
-- AnyTLS 的预置只剩 `① REALITY` 和 `② REALITY + padding`
-- 批量生成时 AnyTLS 强制走 REALITY（`conf/anytls.sh` 里 `c=3`）
-- **AnyTLS 的内核 ECH 也就不可用了** —— REALITY 借用真实站点证书，
-  没有自己的 SNI 可加密，ECH 无从谈起
+**代码影响**：已恢复 `lib.sh` 预置表里的
+`① 自签 (pin)` / `② 真证书` 两项，移除了 `conf/anytls.sh` 里批量强制
+`c=3` 的逻辑，并在 `to_mihomo.py` 补齐 anytls 的
+`udp` / `idle-session-*` 字段。
 
-> 这是本项目"以真实连接为准"的又一个例子：`check` 通过、服务能起、
-> 配置看着完全正常，唯独连不通。
+### REALITY 的 dest 站点必须实测（**配置全对也可能 0/N**）
 
-### NaiveProxy：缺少 Cronet 库
+同样一份配置，**只改 dest 站点**，REALITY 节点可以从 5/5 变成 0/5：
+
+| dest | 结果 |
+|---|---|
+| `openjdk.org` | **5/5** |
+| `images-na.ssl-images-amazon.com` | **0/5**（客户端报 `connection reset by peer`） |
+
+验证方式是**只改一个变量**：同一份密钥、同一端口、同一协议，只替换
+`.tls.reality.handshake.server`，其余一字不动。已排除的变量：
+
+- 服务端 `short_id` / 公钥与客户端完全匹配
+- dest 站点从服务端可达、TLS1.3 正常、HTTP 200、时延 0.2s
+- `multiplex` 开关、ws/TCP 传输、协议类型（trojan / vless 均复现）
+- 对照组 `reality01`（dest = `openjdk.org`）同一时刻稳定 5/5
+
+所以**不是配置错误，也不是内核限制**，是 REALITY 与该 dest 的握手兼容性。
+`connection reset by peer` 在这里是服务端 REALITY 校验不过的表现。
+
+**排查顺序建议**：先用已知可用 dest（`openjdk.org`）确认基础链路，再逐个
+替换 dest 定位。整批节点如果都 0/N，第一个要怀疑的就是 dest —— 批量生成
+会复用同一批 dest，一个不可用就拖垮全部 REALITY 节点。
+
+> **教训**：判定"内核不支持某组合"之前，先确认端口在防火墙上是通的。
+> 本项目已在多处踩过，**每次的真凶都是防火墙，不是内核**。
+> 排查时用 `i/o timeout`（网络层没通）和 `connection reset by peer`
+> （应用层拒绝）区分，前者一律先查防火墙。
+
+
+### NaiveProxy：取决于内核是否用 CGO 编译（**原写"缺少 Cronet 库"，已更正**）
 
 `sing-box check` 对服务端入站**通过**，节点能建、服务能起，但客户端产物连不上：
 
@@ -519,10 +573,19 @@ AnyTLS 的**普通 TLS 形态在本内核上不可用**，只有 REALITY 可用�
 FATAL initialize outbound[0]: cronet: library not found
 ```
 
-原因是构建标签：`sing-box version` 的 Tags 里有 `with_naive_outbound`，
-但**没有 `with_cronet`** —— naive 依赖的 Cronet 库不在官方发布版里。
-与配置写法无关，换任何 naive 参数都会得到同一句报错。
-客户端需自行使用带 cronet 的 sing-box 构建。
+**原判断**：构建标签里有 `with_naive_outbound` 却没有 `with_cronet`，
+所以官方发布版不含 Cronet 库。这条是**错的** —— 两个平台的
+`sing-box version` 输出的 Tags 完全相同，naive 却一个能用一个不能用。
+
+**真实条件是 CGO**。Cronet 需要 CGO，而官方发布版的 CGO 取舍按平台不同：
+
+| 平台 | `sing-box version` 里的 CGO | naive 实测 |
+|---|---|---|
+| ARM64 客户端 | `CGO: enabled` | **可用**，`NaiveProxy started, version: 150.0.7871.63`，连通 5/5 |
+| AMD64 服务端 | `CGO: disabled` | `cronet: library not found` |
+
+与配置写法无关，换任何 naive 参数都是同一句报错。**客户端要用带 CGO 的
+sing-box 构建** —— 官方 ARM64 发布版就是。
 
 ### Hysteria2 / TUIC + uTLS
 
@@ -545,6 +608,22 @@ YAML 仍然会生成（只是少了 ech 字段），连得上但**没有 ECH 保
 - **ShadowTLS** —— mihomo 无此独立出站类型（它只是 ss/vmess 的包装插件）
 
 这些组合不会产出对应文件，并打印原因。
+
+**Trojan / VMess + REALITY 也跳过**（2026-10 实测新增）。同一个节点
+sing-box 客户端稳定 5/5 通，只有 mihomo 不通：
+
+| 节点 | sing-box | mihomo | mihomo 日志 |
+|---|---|---|---|
+| vless + REALITY | 5/5 | **5/5** | — |
+| trojan + REALITY | 5/5 | **0/8** | `REALITY Authentication: true` 之后静默 |
+| vmess + REALITY | 5/5 | **0/8** | `connect error: unexpected status: 404` |
+
+排除过的变量（逐个 A/B 都不影响结果）：`smux` 开关、`flow` 字段、
+`udp: true`、`network: ws`。端口可达、服务端监听正常、REALITY 公钥与
+short-id 完全匹配。认证成功后无任何数据传输，属于内核在该组合下的实现问题。
+
+> 与其产出一份**看着正常、实际连不上的** YAML，不如跳过并写明原因。
+> 服务端配置照常生成 —— 换 sing-box 客户端是能用的。
 
 ---
 

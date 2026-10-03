@@ -387,6 +387,32 @@ batch_main() {
         print_ok "多路复用: 不开"
     fi
 
+    # --- 功能选项 A2: hysteria2 专属 (端口跳跃 + 混淆加密) ---
+    # 这两个只对 hysteria2 有意义 (UDP 协议 + salamander obfs), 其他协议
+    # 内核没有对应字段, 所以不做逐协议勾选, 直接问"要不要开"。
+    # 之前它们只在交互路径里问, 批量生成 (stdin 是 /dev/null) 恒定拿到空值
+    # 等于永远关闭 —— 用户在批量里根本选不到, 现在补上。
+    local SB_BATCH_HOP="" SB_BATCH_OBFS=""
+    echo >&2
+    echo -e "${CYAN}③b Hysteria2 专属选项 —— 只影响 hysteria2 节点${RESET}" >&2
+    echo -e "   ${CYAN}1)${RESET} 端口跳跃  ${MAGENTA}(UDP 端口跳跃, 抗封锁; 需要 iptables)${RESET}" >&2
+    echo -e "   ${CYAN}2)${RESET} obfs 混淆 ${MAGENTA}(salamander, 再加一层加密)${RESET}" >&2
+    echo -e "   ${GREEN}3)${RESET} 两个都开   ${MAGENTA}4) 都不开 (默认)${RESET}" >&2
+    local _h=""
+    read -r -p "   请选择 [1-4, 回车=4]: " _h
+    _h=$(clean_input "${_h:-}")
+    case "${_h:-4}" in
+        1) read -r -p "   跳跃范围 (如 30000-31000) [默认 30000-31000]: " SB_BATCH_HOP
+           SB_BATCH_HOP=$(clean_input "${SB_BATCH_HOP:-}")
+           [[ -z "$SB_BATCH_HOP" ]] && SB_BATCH_HOP="30000-31000"
+           SB_BATCH_OBFS=y; print_ok "HY2: 端口跳跃 $SB_BATCH_HOP + obfs" ;;
+        2) SB_BATCH_OBFS=y; print_ok "HY2: 只开 obfs 混淆" ;;
+        3) SB_BATCH_HOP="${SB_HOP_DEF:-30000-31000}"; SB_BATCH_OBFS=y
+           print_ok "HY2: 端口跳跃 $SB_BATCH_HOP + obfs" ;;
+        *) print_ok "HY2: 端口跳跃与 obfs 都不开" ;;
+    esac
+    export SB_BATCH_HOP SB_BATCH_OBFS
+
     # --- 功能选项 B: CDN 传输 ---
     # 现状: SB_BATCH_TRANSPORT 恒为 ws, 所以批量最多只能出 ws 一种 CDN 形态。
     # gRPC 在 Cloudflare 侧也支持 (面板需开 gRPC), 与 ws 的流量特征不同,
@@ -475,6 +501,7 @@ batch_main() {
         SB_BATCH_PORT_START="$SB_BATCH_PORT_START" SB_BATCH_PORT_END="$SB_BATCH_PORT_END" \
         SB_BATCH_TRANSPORT="${SB_BATCH_TRANSPORT:-ws}" \
         SB_BATCH_MUX="${SB_BATCH_MUX:-0}" SB_BATCH_MUX_PROFILE="${SB_BATCH_MUX_PROFILE:-}" \
+        SB_BATCH_HOP="${SB_BATCH_HOP:-}" SB_BATCH_OBFS="${SB_BATCH_OBFS:-}" \
         timeout 240 bash "$SELF_DIR/conf/${proto}.sh" add </dev/null >/tmp/batch-$proto.log 2>&1
         local mod_rc=$?
         if [[ $mod_rc -eq 0 ]]; then
