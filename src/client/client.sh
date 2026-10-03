@@ -136,6 +136,21 @@ PORT_CLASH="${PORT_CLASH:-19090}"                        # 避碰: mihomo/clash 
 BIND_LAN="${BIND_LAN:-0.0.0.0}"                          # LAN 支持; 127.0.0.1=仅本机
 CLASH_LISTEN="${CLASH_LISTEN:-0.0.0.0}"                  # LAN Web UI(ui 由 secret 保护)
 CLASH_SECRET_FILE="${CLASH_SECRET_FILE:-$CLIENT_ROOT/.clash-secret}"
+
+# ---------- DNS (防泄露) ----------
+# 目标: 客户端所有域名解析都走代理, 不给"明文 53 走直连"留口子。
+# sing-box 侧的防泄露由三层构成, 缺一层就有泄露面:
+#   1. dns.servers 全部是 DoH (HTTPS, 本身走代理) —— 没有明文 53
+#   2. route 规则 hijack 掉所有 protocol=dns 与 port=53 的流量,
+#      强制它们进 sing-box 内置 DNS, 应用自己发的 53 也拦得住
+#   3. 拒绝 QUIC (udp/443), 避免应用用 DoQ/QUIC 绕开我们指定的解析器
+# 默认两条 DoH: 国内阿里 (走代理快) + Cloudflare (兜底, 走代理)。
+DNS_ENABLED="${DNS_ENABLED:-1}"
+DNS_MAIN="${DNS_MAIN:-223.5.5.5}"          # 阿里 DoH, IP 直连避免引导解析
+DNS_MAIN_HOST="${DNS_MAIN_HOST:-dns.alidns.com}"
+DNS_FALLBACK="${DNS_FALLBACK:-1.1.1.1}"   # Cloudflare DoH
+DNS_FALLBACK_HOST="${DNS_FALLBACK_HOST:-cloudflare-dns.com}"
+DNS_STRATEGY="${DNS_STRATEGY:-ipv4_only}" # 防 IPv6 泄露: 只解析 A 记录
 UI_ZIP_URL="${UI_ZIP_URL:-https://github.com/MetaCubeX/metacubexd/archive/refs/heads/gh-pages.zip}"
 SB_UNIT_NAME="sb-client"        # 常驻 unit
 SB_UNIT_ADHOC="sb-client-adhoc" # 临时 unit (仅当未安装常驻 unit 时)
@@ -449,12 +464,57 @@ write_clash_conf() { # $1=host:port $2=ui_dir(空=不启用) $3=secret
 }
 EOF
 }
+# ---------- DNS 配置 (防泄露) ----------
+# 单独一个片段 02-dns.json, 便于单独改/删; 服务端用 -C 目录合并加载。
+write_dns_conf() {
+    if [[ "$DNS_ENABLED" != "1" ]]; then
+        rm -f "$CLIENT_CONF/02-dns.json"
+        print_warn "DNS 防泄露已关闭 (DNS_ENABLED=0), 域名会走直连解析"
+        return 0
+    fi
+    # DoH 一律用 **IP + tls.server_name** 而不是域名:
+    #   用域名的话, 为了拿到 dns.alidns.com 的 IP, 内核还得先做一次解析 ——
+    #   那一次就是泄露点 (走直连 UDP/53 或系统解析器)。
+    #   写 IP + server_name 则 TLS 校验照常 (SNI 对), 但不需要引导解析。
+    cat > "$CLIENT_CONF/02-dns.json" <<EOF
+{
+  "dns": {
+    "servers": [
+      {
+        "type": "https",
+        "tag": "doh-main",
+        "server": "$DNS_MAIN",
+        "server_port": 443,
+        "path": "/dns-query",
+        "tls": { "enabled": true, "server_name": "$DNS_MAIN_HOST" }
+      },
+      {
+        "type": "https",
+        "tag": "doh-fallback",
+        "server": "$DNS_FALLBACK",
+        "server_port": 443,
+        "path": "/dns-query",
+        "tls": { "enabled": true, "server_name": "$DNS_FALLBACK_HOST" }
+      }
+    ],
+    "final": "doh-fallback",
+    "strategy": "$DNS_STRATEGY"
+  },
+  "experimental": {
+    "cache_file": { "enabled": true, "store_fakeip": false }
+  }
+}
+EOF
+    print_ok "DNS 防泄露已写入: DoH $DNS_MAIN (主) / $DNS_FALLBACK (兜底), 劫持 53 与 DoQ"
+}
+
 do_init() {
     mkdir -p "$CLIENT_CONF" "$CLIENT_NODE_DIR" "$CLIENT_ROOT/share-state" "$CLIENT_UI"
     gen_clash_secret "$CLASH_LISTEN"
     local secret=""; [[ -s "$CLASH_SECRET_FILE" ]] && secret=$(cat "$CLASH_SECRET_FILE")
     write_mixed_conf "$BIND_LAN" "$PORT_MIXED"
     write_clash_conf "$CLASH_LISTEN:$PORT_CLASH" "$CLIENT_UI" "$secret"
+    write_dns_conf
     regen_selector
     do_service_install
     print_ok "基础配置完成 ($CLIENT_CONF): mixed=$BIND_LAN:$PORT_MIXED clash_api=$CLASH_LISTEN:$PORT_CLASH"
@@ -478,9 +538,14 @@ regen_selector() {
 import json,sys,glob,os
 ndir,ofile=sys.argv[1],sys.argv[2]
 obs=[]
+# 按 tag 去重: 同名 outbound 出现两次, 内核会直接拒绝启动
+# ("duplicate outbound/endpoint tag"), 表现为配置检查 FATAL 而查不出原因。
+seen=set()
 for f in sorted(glob.glob(os.path.join(ndir,"node-*.json"))):
     j=json.load(open(f))
-    obs.extend(j.get("outbounds",[]))
+    for o in j.get("outbounds",[]):
+        if o.get("tag") in seen: continue
+        seen.add(o.get("tag")); obs.append(o)
 htags=set(o["detour"] for o in obs if o.get("detour"))
 tags=[o["tag"] for o in obs if o.get("type")!="direct" and o["tag"] not in htags]
 tags=tags or [o["tag"] for o in obs]
@@ -490,7 +555,29 @@ else:
     cfg={"outbounds":obs+[
        {"type":"selector","tag":"PROXY","outbounds":tags,"default":tags[0]},
        {"type":"urltest","tag":"AUTO","outbounds":tags,"url":"https://www.gstatic.com/generate_204","interval":"3m"}],
-       "route":{"final":"PROXY"}}
+       # route 只写 final —— rules 全部由 02-dns.json 提供。
+       # sing-box -C 合并时同名字段后者覆盖前者, 这里若也写 rules,
+       # 加载顺序一变就会把防泄露规则冲掉。
+       # route 里除了 final 还要给 default_domain_resolver, 指向 02-dns.json
+       # 里定义的 "doh-main"。两个坑都踩过:
+       #   1. 位置是 route.default_domain_resolver —— 放顶层或 dns 里都报
+       #      unknown field;
+       #   2. 它只接受**引用 dns.servers 里的 tag**, 不能内联一份完整解析器 ——
+       #      内联会报 "default domain resolver not found: 223.5.5.5"。
+       # 防泄露规则与 final/resolver 必须写在**同一个** route 对象里:
+       # sing-box -C 合并是按顶层键覆盖的, 分两个片段各写 route, 后加载的
+       # 会把前一个的 rules 整个冲掉 (实测: rules 变成 0 条, 劫持全失效)。
+       # 加载顺序还会随文件名变动, 所以不能靠"放前面"解决。
+       "route":{"final":"PROXY",
+                "default_domain_resolver":{"server":"doh-main"},
+                "auto_detect_interface":True,
+                "rules":[
+                  {"ip_is_private":True,"outbound":"direct"},
+                  {"protocol":"dns","action":"hijack-dns"},
+                  {"port":53,"action":"hijack-dns"},
+                  {"port":[135,137,138,139,5353],"action":"reject"},
+                  {"network":"udp","port":443,"action":"reject"}
+                ]}}
 json.dump(cfg,open(ofile,"w"),indent=2)
 PYGEN
 }
