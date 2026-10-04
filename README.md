@@ -930,6 +930,37 @@ rebuild with -tags with_gvisor
 **为什么 `/tun` 版会自动插入 `sniff` 规则**：TUN 进来的流量只有 IP 没有
 域名，没有 sniff 就只能按 IP 分流，规则会失准。sniff 必须排在规则最前面。
 
+**为什么 `/tun` 版会重排 `hijack-dns` 规则**：这是让手机「图标出来但完全
+没网」的真正原因。面板生成的规则顺序是：
+
+```
+[0] ip_is_private -> direct
+[1] protocol=dns  -> hijack-dns
+[2] port=53       -> hijack-dns
+```
+
+在 mixed 入站下这个顺序没问题（客户端自己解析域名，sing-box 看不到 DNS
+查询）。但 TUN 模式下会彻底断网：
+
+- TUN 的 DNS 地址是 `172.19.0.2`（`address` 里第一个 IPv4 条目的下一个地址，
+  官方文档的默认行为）
+- `172.19.0.0/12` 是私有地址段
+- 于是**每一个 DNS 查询都先命中 `[0] ip_is_private -> direct`**，被当作
+  「内网流量」直连出去，发到 `172.19.0.2` —— 而那里什么都没有
+
+现象是 VPN 图标正常出来，但一个网页都打不开，因为连域名都解析不了。
+`/tun` 版因此把 `hijack-dns` 提到 `ip_is_private` 之前：
+
+```
+[0] sniff
+[1] hijack-dns  dns
+[2] hijack-dns  53
+[3] ip_is_private -> direct
+```
+
+注意这个重排**只发生在 `/tun` 版**。面板自己跑在 mixed 入站上，那个顺序
+对它是对的 —— 所以不去动 `regen_selector`，只在分发时调整。
+
 **为什么去掉 `experimental`**：`clash_api.external_ui` 是本机绝对路径
 （`/opt/sb-client/ui`），在别的设备上根本不存在，保留只会报错。
 

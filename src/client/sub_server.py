@@ -96,11 +96,50 @@ def load_config(confdir, with_tun=False):
     if with_tun:
         merged["inbounds"] = [dict(TUN_INBOUND)]
         rules = merged.setdefault("route", {}).setdefault("rules", [])
-        # sniff 必须在最前面: 否则 TUN 进来的流量只有 IP 没有域名, 分流失准
-        if not any(r.get("action") == "sniff" for r in rules):
-            rules.insert(0, {"action": "sniff"})
+        _fix_rules_for_tun(rules)
 
     return json.dumps(merged, ensure_ascii=False, indent=2).encode("utf-8")
+
+
+def _fix_rules_for_tun(rules):
+    """把 TUN 模式下会坏掉的两条规则挪到正确的位置。
+
+    面板生成的规则顺序是:
+        [0] ip_is_private -> direct
+        [1] protocol=dns -> hijack-dns
+        [2] port=53      -> hijack-dns
+    在 mixed 入站下这个顺序没问题(客户端自己解析域名, sing-box 看不到
+    DNS 查询)。但在 TUN 模式下会彻底断网:
+
+    TUN 的 DNS 地址是 172.19.0.2(address 里第一个 IPv4 条目的下一个地址,
+    官方文档的默认行为), 而 172.19.0.0/12 是私有地址段。于是每一个 DNS
+    查询都先命中 [0] ip_is_private -> direct, 被当���"内网流量"直连出去,
+    发到 172.19.0.2 —— 而那个地址上什么都没有。
+
+    现象是: VPN 图标正常出来, 但一个网页都打不开, 因为连域名都解析不了。
+    更隐蔽的是就算不用 DNS(纯 IP 访问)也可能因为 sniff/分流链断掉而异常。
+
+    所以把 hijack-dns 提到 ip_is_private 前面。dns_mode 默认是 hijack,
+    这些规则必须最先命中才有机会接管 DNS。
+
+    顺带说明: 这条规则顺序问题只影响 TUN 变体, 所以放在这里改而不是
+    去动面板的 regen_selector —— 面板自己跑在 mixed 入站上, 那个顺序
+    对它是对的, 改坏了反而影响本机。
+    """
+    # sniff 必须在最前面: 否则 TUN 进来的流量只有 IP 没有域名, 分流失准
+    if not any(r.get("action") == "sniff" for r in rules):
+        rules.insert(0, {"action": "sniff"})
+
+    hijack = [r for r in rules if r.get("action") == "hijack-dns"]
+    if not hijack:
+        return
+    for r in hijack:
+        rules.remove(r)
+
+    # 插到 sniff 之后、所有其它规则之前
+    pos = 1 if any(r.get("action") == "sniff" for r in rules) else 0
+    for r in reversed(hijack):
+        rules.insert(pos, r)
 
 
 class Handler(BaseHTTPRequestHandler):
