@@ -51,7 +51,6 @@ extract_cert_domain() {
 }
 
 ask_cert() {  # 输出 CERT_FILE/KEY_FILE/CERT_DOMAIN/CERT_TRUSTED, 或 TLS_TYPE=reality + T_RE_*
-    local c
     echo "TLS 模式: 1) 真证书  2) 自签(pin)  3) Reality [默认 2]" >&2
     echo "  (选 3 = AnyTLS+REALITY, 仅 sing-box 客户端可用; mihomo/Clash 不支持该组合)" >&2
     local c
@@ -59,7 +58,16 @@ ask_cert() {  # 输出 CERT_FILE/KEY_FILE/CERT_DOMAIN/CERT_TRUSTED, 或 TLS_TYPE
     # 原来是 "SB_BATCH 就 c=2" 在前, 于是 batch 补齐 Reality 变体时
     # (SB_BATCH=1 SB_FORCE_TLS_REALTY=1) 仍然取自签, Reality 变体永远产不出来。
     # 这也是 batch 的 variant_list 里一直只有 vmess/trojan 的原因。
-    if [[ "${SB_FORCE_TLS_REALTY:-}" == "1" ]]; then c=3
+    if [[ "${SB_FORCE_TLS_REALTY:-}" == "1" ]]; then
+        # batch.sh 的变体补齐循环专走这条: 定死 Reality, 一个问题都不问。
+        # 注意这里必须**独占一个分支**。曾经写成
+        #   `if SB_FORCE_TLS_REALTY; then c=3` 后面直接跟批量提示的代码
+        # (中间的 `elif [[ -n "$SB_BATCH" ]]` 整行丢了), 于是 c=3 刚设上
+        # 就被下面的批量提示框覆盖 —— 节点看着"生成成功", 实则又是一个
+        # 原生 TLS 副本, Reality 形态一个都没产出来。anytls01/anytls02
+        # 长得一模一样就是那次留下的。
+        c=3
+    elif [[ -n "${SB_BATCH:-}" ]]; then
         # 批量下不再强制 c=3 (Reality)。
         # 原来这里写死"批量只出 Reality", 依据是"anytls 配普通 TLS 连不通"
         # —— 该结论已被推翻 (真凶是测试时端口没放行防火墙, 不是内核限制;
