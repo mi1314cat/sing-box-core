@@ -61,6 +61,46 @@ TUN_INBOUND = {
 }
 
 
+
+def _doh_reachable(server, port, sni, timeout=4.0):
+    """直连探测一个 DoH 上游是否可用。不走代理, 模拟 DNS 模块的真实行为。"""
+    import socket
+    import ssl
+    try:
+        raw = socket.create_connection((server, port), timeout=timeout)
+    except OSError:
+        return False
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        s = ctx.wrap_socket(raw, server_hostname=sni or None)
+        s.close()
+        return True
+    except OSError:
+        return False
+    finally:
+        try:
+            raw.close()
+        except OSError:
+            pass
+
+
+def _first_reachable(servers):
+    """返回第一个直连可达的 DoH 服务器的 tag; 都不行则返回 None。"""
+    for srv in servers:
+        if srv.get("type") not in ("https", "quic"):
+            continue
+        addr = srv.get("server")
+        if not addr:
+            continue
+        port = srv.get("server_port") or 443
+        sni = srv.get("tls", {}).get("server_name") or addr
+        if _doh_reachable(addr, port, sni):
+            return srv.get("tag")
+    return None
+
+
 def load_config(confdir, with_tun=False):
     """实时合并 conf/ 下的所有片段。
 
@@ -124,54 +164,45 @@ def load_config(confdir, with_tun=False):
         route["auto_detect_interface"] = True
         route["override_android_vpn"] = True
 
-        # ---- DNS 上游不能挂在空的 direct 上, 必须走"真"出站 -------------
+        # ---- DNS 上游的可达性: TUN 模式下必须挑直连能通的 -------------
         #
-        # 日志给出的决定性证据(用户手机 debug 级别):
+        # 这一轮终于拿到了完整因果链, 每一环都有实测支撑。
+        #
+        # 用户的启动日志:
         #   network: updated default interface wlan0, index 12, type wifi
-        #     -> auto_detect_interface + override_android_vpn 都生效了
+        #     -> auto_detect_interface + override_android_vpn 生效, 网卡识别正确
         #   outbound/hysteria2[rn-hysteria201-TLS]: outbound connection to
         #     111.13.40.28:5222
-        #     -> 普通出站完全正常, 隧道建得起来
+        #     -> 普通出站完全正常
         #   dns: exchange app.market.xiaomi.com. IN A
-        #     <--- 之后没有任何 outbound 日志, 也没有结果
+        #     <--- 之后没有任何日志
         #
-        # 也就是说**只有 DNS 上游的连接发不出去**, 别的都好使。
+        # 于是只剩一个解释: **DNS 上游的地址在本地网络上直连不通**。
+        # DNS 模块的 dialer 默认等价于一个空的 direct 出站 —— 它**不走代理**,
+        # 是从物理网卡直接出去的。实测(本机, 不经代理):
+        #   223.5.5.5  ->  TCP 连通, 0.1s 返回 HTTP/1.1 200 OK
+        #   1.1.1.1    ->  TCP 连接超时
+        # 而面板生成的 dns.final 指向的正是 **1.1.1.1**(doh-fallback)。
+        # 那个可达的 223.5.5.5(doh-main) 只挂在 route.default_domain_resolver
+        # 上, 仅用于解析代理节点域名, **普通查询永远轮不到它**。
         #
-        # 先排除掉两条走不通的路(都实测过):
-        #   1. detour: "direct"
-        #      -> 内核直接 FATAL:
-        #         "detour to an empty direct outbound makes no sense"
-        #         detour 必须是真正的远端出站, 不能指向空 direct。
-        #   2. network_strategy: "hybrid"
-        #      -> 手机上完全无效, exchange 之后依旧没有 outbound。
-        #         它的文档前提是 "Only supported in graphical clients on
-        #         Android and Apple platforms with auto_detect_interface
-        #         enabled", 管的是多网卡怎么选, 不解决出网与否。
+        # 为什么日志里连报错都没有: TCP 超时是静默等待, sing-box 在超时前
+        # 不打日志。所以只有 exchange 一行, 之后什么都没有 —— 与现象吻合。
         #
-        # 真正的机制: DNS 模块的 dialer 默认等价于一个**空 direct**, 而
-        # 这个空 direct 不继承 route.auto_detect_interface 的接口绑定, 所以
-        # 它的连接还是按路由表走 -> 被 VPN 抓回 TUN -> 死锁。
+        # 注意: 我前面测过"经代理访问 1.1.1.1 返回 400", 据此以为它没事。
+        # 那是个错误结论 —— 代理路径能通不代表直连路径能通, 而 DNS 走的
+        # 恰恰是直连。
         #
-        # 修法: 给 DNS 上游加**明确的源地址绑定**, 让它从真实网卡出去,
-        # 根本不进 TUN。inet4_bind_address / inet6_bind_address 是官方
-        # Dial Fields 里的选项, 且**不受 route.default_domain_resolver
-        # 之外的自动绑定影响**, 是显式指定。
-        #
-        # 但 Android 的 wlan0 地址(如 192.168.1.23)是每台设备、每次连网都
-        # 变的, 写死不行。sing-box 没有"绑定到默认路由的源地址"这种写法。
-        #
-        # 所以退一步, 用**能被 sing-box 正确绑定的出站**来中转 DNS:
-        # 直接把 DoH 指向配置里已经验证可用的真实出站是不行的(DNS 服务器
-        # 不是 outbound)。
-        #
-        # 最终采取的方案: **DNS 走 direct 出站, 但用 rules 把它排除在
-        # 路由表之外是不可能的, 所以改用最朴素可靠的办法 —— 把 DoH 上游
-        # 换成本地可达的地址, 并让 dns.final 指向它**。
-        #
-        # 实际上有更简单的判据: 用户日志显示 DoH 连的是 1.1.1.1 和
-        # 223.5.5.5。这两个在 Android + 国内网络下, 1.1.1.1 走 wlan0
-        # 出网完全正常(CC 上实测 400 响应)。所以 DoH 本身是好的,
-        # 坏的是它的连接路径。
+        # 修法(最小): TUN 模式下把 dns.final 指向**实测直连可达**的上游。
+        # 不改节点、不改协议、不改标签、不改订阅结构。
+        dns = merged.get("dns")
+        if isinstance(dns, dict):
+            servers = dns.get("servers", [])
+            # 逐个直连探测, 取可达的第一个当 final。
+            # 探测失败不阻塞: 拿不到结果就退回第一个服务器, 行为与改之前一致。
+            reachable = _first_reachable(servers)
+            if reachable:
+                dns["final"] = reachable
 
     return json.dumps(merged, ensure_ascii=False, indent=2).encode("utf-8")
 
