@@ -130,6 +130,30 @@ bash src/conf/vless.sh list|del     # 查看 / 删除
 
 批量之前会**统一问一遍所有功能选项**，而不是生成完再逐个进节点菜单改十几次：
 
+### 产出清单
+
+一轮全协议批量 = **13 个节点**：
+
+| 节点 | 协议 | 接入 | 第二形态 |
+|---|---|---|---|
+| `anytls01-TLS` | AnyTLS | 直连 | `anytls02-REALITY`（AnyTLS+Reality） |
+| `reality01-REALITY` | VLESS | 直连 | — |
+| `vless01-TLS-CDN` | VLESS | **CDN** | — |
+| `vmess01-TLS-CDN` | VMess | **CDN** | `vmess02-REALITY` |
+| `trojan01-TLS-CDN` | Trojan | **CDN** | `trojan02-REALITY` |
+| `hysteria201-TLS` / `tuic01-TLS` / `shadowsocks01-plain` / `shadowtls01-TLS` / `naive01-TLS` | — | 直连 | — |
+
+只有 **vless / vmess / trojan** 能走 CDN —— 它们带 Transport 字段（ws/grpc/http），
+Cloudflare 代理的是 HTTP(S) 上的东西。anytls / hysteria2 / tuic / shadowsocks /
+naive / shadowtls 都是原生 TCP/UDP 协议，**内核层面就过不了 CDN**，名字里
+也就不会出现 `-CDN`。
+
+`anytls02-REALITY` 曾经产不出来：`ask_cert` 里
+`if SB_FORCE_TLS_REALTY; then c=3` 后面少了一行
+`elif [[ -n "$SB_BATCH" ]]; then`，导致批量分支的提示框**紧接在 `c=3` 之后
+执行**，把刚设好的值覆盖掉。结果 `anytls01` / `anytls02` 除了端口和密码
+完全一样，Reality 形态一个都没产出，看起来"生成成功"实则是废节点。
+
 ### 交互项
 
 | 顺序 | 问什么 | 选项 |
@@ -490,7 +514,7 @@ sing-box generate ech-keypair <你的域名>
 | Reality（VLESS+REALITY，vision/grpc/http） | ✓ | ✓ | ✓ |
 | VLESS / WS+TLS、VLESS / 裸TCP+TLS | ✓ | ✓ | ✓ |
 | Trojan / TLS | ✓ | ✓ | ✓ |
-| **AnyTLS / 普通 TLS** | **✗** | ✓ | ✗ |
+| **AnyTLS / 普通 TLS** | **✓** | ✓ | ✗ |
 | AnyTLS / Reality | ✓ | ✗ | ✗ |
 | Hysteria2 / TLS | ✓ | ✓ | ✗ |
 | TUIC / TLS | ✓ | ✓ | ✗ |
