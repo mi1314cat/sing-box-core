@@ -667,9 +667,18 @@ rest=[t for t in tags if t not in matched]
 if rest: groups.append(["其它", rest, True])  # 末尾 True = 不是订阅组, 只是收容
 
 def gtag(name):
-    # 组 tag 必须是唯一且不与节点 tag 撞; 去掉非 ASCII 字符 (国旗等)
+    # 组 tag 必须唯一, 且不能和任何 outbound 的 tag 撞 (撞了内核直接拒绝启动)。
+    # 同名订阅 (两条记录都叫 srv1) 不再靠字母前缀硬凑 —— 那是掩盖问题。
+    # 同名意味着这两条订阅指向同一台服务器, 节点前缀也一样, 建出来是
+    # 两个装着同样一批节点的组, 用户看到"大写的 G-srv1 为什么会多了一个
+    # 这个"却找不到原因。真正的修法在登记阶段: 同一个节点前缀只允许存在
+    # 一条订阅记录 (见 add_node 里按 prefix 去重), 走到这里就不该再有重名。
+    # 万一还是撞了, 退回数字后缀, 至少可预测。
     t="".join(c for c in name if c.isalnum() or c in "-_.") or "grp"
-    if t in seen or t in tags: t="G-"+t
+    if t in seen or t in tags:
+        n=2
+        while "%s-%d" % (t,n) in seen or "%s-%d" % (t,n) in tags: n+=1
+        t="%s-%d" % (t,n)
     seen.add(t); return t
 
 # 只要**有**订阅记录就建组, 跟订阅是一条还是多条无关。
@@ -830,7 +839,14 @@ add_node() {
 
         # 登记订阅, 供「订阅管理」页列出/更新
         if [[ -n "$prefix" && "$src" =~ ^https?:// ]]; then
-            local sid; sid=$(subs_id "$src")
+            # 同样按**前缀**去重, 不是按 URL。
+            # 同一个外部订阅换个域名/加个参数就是另一个 id, 会被登记两次,
+            # 于是配置里出现两个装着同一批节点的组 (见 gtag 那里的说明)。
+            local sid old
+            old=$(jq -r --arg p "$prefix" '[(.subs//[])[]|select(.prefix==$p)|.id]|first // empty' \
+                  "$SUBS_FILE" 2>/dev/null | head -1)
+            [[ -n "$old" ]] && subs_del "$old"
+            sid=$(subs_id "$src")
             subs_put "$(jq -n --arg id "$sid" --arg url "$src" --arg pre "$prefix" \
                 --arg nm "$prefix" --argjson n "$cnt" --arg ts "$(date -Is)" \
                 '{id:$id,name:$nm,prefix:$pre,url:$url,kind:"external",nodes:$n,added_at:$ts}')"
@@ -893,21 +909,35 @@ add_node() {
     if [[ -n "${PENDING_SUB_URL:-}" ]]; then
         local _sid _pre
         # 前缀必须和节点名里的完全一致。不能用"砍掉最后一段"来猜:
-        # der-anytls01-TLS -> der-anytls01, 和 der-vless01-TLS-CDN ->
-        # der-vless01-TLS 对不上, 同一个订阅会散成好几堆 (补登记那边已经踩过)。
+        # srv1-anytls01-TLS -> srv1-anytls01, 和 srv1-vless01-TLS-CDN ->
+        # srv1-vless01-TLS 对不上, 同一个订阅会散成好几堆 (补登记那边已经踩过)。
         # 取所有 tag 里出现次数最多的第一段 —— 服务端生成的节点名都以
         # "<服务器标识>-<协议>-<模式>" 开头, 第一段就是订阅前缀。
         # 前缀只能从**本次导入**的节点名里取, 不能扫全部节点。
-        # 扫全量在"老节点已经存在"时会取错: rn 和 der 各出现一次时按字母序
-        # 挑到 rn, 于是新加的 der 被登记成前缀 rn, 配置里 der-* 匹配不上,
+        # 扫全量在"老节点已经存在"时会取错: srv1 和 srv2 各出现一次时按字母序
+        # 挑到 srv1, 于是新加的 srv2 被登记成前缀 srv1, 配置里 srv2-* 匹配不上,
         # 还是掉进「其它」。
         _pre=$(printf '%s' "${IMPORTED_TAGS:-}" | tr ' ' '\n' | grep -E '^[^-]+-' \
                | cut -d- -f1 | sort | uniq -c | sort -rn | head -1 | awk '{print $2}')
         if [[ -n "$_pre" ]]; then
             _sid=$(subs_id "$PENDING_SUB_URL")
             # 已经登记过就别重复写 (更新订阅时会再走一遍这里)。
-            [[ -n "$(subs_get "$_sid")" ]] || \
-                subs_register "$PENDING_SUB_URL" self "$_pre"
+        if [[ -n "$_pre" ]]; then
+            # 同一个节点前缀只允许存在**一条**订阅记录。
+            # 分享链接换了一次 token 就是另一个 URL, subs_id (URL 的 md5)
+            # 也就不同, 于是被当成两条新订阅 —— 但它们指向同一台服务器,
+            # 节点前缀一模一样, 结果是两个装着同样一批节点的组。
+            # 用户的原话是"为什么会多出一个改名过的组"。
+            # 去重依据必须是**节点前缀**, 不是 URL。
+            local _old; _old=$(jq -r --arg p "$_pre" \
+                '[(.subs//[])[]|select(.prefix==$p)|.id]|first // empty' "$SUBS_FILE" 2>/dev/null | head -1)
+            if [[ -n "$_old" ]]; then
+                # 已有同前缀的订阅 -> 换掉它的 URL, 不新增记录
+                subs_del "$_old"
+                print_msg "前缀「$_pre」已有订阅记录, 已更新其链接 (不重复登记)"
+            fi
+            subs_register "$PENDING_SUB_URL" self "$_pre"
+        fi
         fi
         unset PENDING_SUB_URL
         # 登记完必须重建: 上面 regen_selector 生成配置时这条订阅还不存在。
@@ -1012,7 +1042,7 @@ sub_update_one() {
     # 以前是"先删该前缀的节点 -> 再拉", 看起来干净 (避免改名后的孤儿节点),
     # 但链接失效时拉不回来, 旧节点已经被删了 —— 订阅记录还在, 节点却归零,
     # 而且没法从面板恢复 (只能重新导入 URL, 而它是 max_uses=1 的分享链接,
-    # 用过一次就废了)。实测就把自己 13 个 rn 节点弄没了。
+    # 用过一次就废了)。实测就把自己一批节点弄没了。
     # 分享链接本来就用一次就失效, 这个顺序等于把用户的节点押在"下次还能拉到"
     # 这个假设上, 而那个假设不成立。
     local bdir; bdir=$(mktemp -d "$CLIENT_ROOT/share-state/.upd.XXXXXX")
@@ -1080,8 +1110,8 @@ sub_backfill() {
     names=("${clean[@]}")
     (( ${#names[@]} == 0 )) && { print_warn "还没有节点"; return 0; }
     # 前缀树聚类。
-    # 简单砍尾不行: rn-anytls01-TLS -> rn-anytls01, 而 rn-anytls02-REALITY
-    # -> rn-anytls02, 同一个订阅的节点被切得七零八落 (踩过)。
+    # 简单砍尾不行: srv1-anytls01-TLS -> srv1-anytls01, 而 srv1-anytls02-REALITY
+    # -> srv1-anytls02, 同一个订阅的节点被切得七零八落 (踩过)。
     # 正确做法: 按 '-' 分段, 逐层往下, 只有当"整组节点都在这一层之下"时才
     # 继续细分; 某个节点名在这里到头或与同组不一致, 就停在上一层。
     local -a pres=()
@@ -1331,7 +1361,7 @@ list_nodes() {
         # 一个节点文件里可能有多个 outbound, 比如 shadowtls 的外层 vless
         # 和被它 detour 引用的内层 "<tag>-out"。内层不是独立节点, 界面上
         # 也选不到, 以前这里取 .outbounds[0] 恰好会读到内层 —— 表现为
-        # 文件叫 rn-shadowtls01-TLS.json, 列表里却显示 rn-shadowtls01-TLS-out,
+        # 文件叫 srv1-shadowtls01-TLS.json, 列表里却显示 srv1-shadowtls01-TLS-out,
         # 而且"共 N 个可用节点"凭空多一个。改成: 有 detour 依赖的取剩下的那个。
         local -a tgs
         mapfile -t tgs < <(jq -r '
