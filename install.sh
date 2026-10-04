@@ -361,6 +361,11 @@ do_client() {
     # 会让那个文件凭空多几百行, 而且没法单独更新。
     mkdir -p "$CLI_ROOT/share-state"
     cp -f "$SRC_DIR/src/client/to_sb.py" "$CLI_ROOT/share-state/to_sb.py" 2>/dev/null || true
+    # 配置分发服务: 让局域网其他设备通过 URL 拉取本客户端的完整配置。
+    # 缺了它菜单 19 会起不来 —— 单独抽成文件而不是塞进 client.sh, 就是
+    # 为了它只有几十行、但需要能单独读单独改。
+    cp -f "$SRC_DIR/src/client/sub_server.py" "$CLI_ROOT/share-state/sub_server.py" 2>/dev/null || true
+    chmod +x "$CLI_ROOT/share-state/sub_server.py" 2>/dev/null || true
     ok "项目文件"
     if [[ ! -x "$CLI_ROOT/core/sing-box" ]]; then
         info "正在安装 Sing-box 内核..."

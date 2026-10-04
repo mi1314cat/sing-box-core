@@ -213,6 +213,9 @@ CLASH_SECRET_FILE="${CLASH_SECRET_FILE:-$CLIENT_ROOT/.clash-secret}"
 # 所以既列不出订阅、也没法只更新某一条 —— update_node 只能把所有来源挨个
 # 重拉一遍, 用户根本不知道自己在更新什么。
 SUBS_FILE="${SUBS_FILE:-$CLIENT_ROOT/subscriptions.json}"
+# 配置分发服务 (给局域网其他设备拉取本客户端的完整配置)
+SUB_PORT="${SUB_PORT:-9293}"
+SUB_SERVER="${SUB_SERVER:-$CLIENT_ROOT/share-state/sub_server.py}"
 # 订阅格式转换器 (install.sh 随 client.sh 一起复制过来)
 SB_TO_SB="${SB_TO_SB:-$CLIENT_ROOT/share-state/to_sb.py}"
 
@@ -744,11 +747,246 @@ apply_change() { # $1=说明 ; 0=成功
         return 1
     fi
     rm -f /tmp/.sbapply.$$
+    # 分发订阅文件跟着一起刷新。add_node / 删除 / 更新订阅都会走到这里,
+    # 不在这里同步的话, 别人下一次拉取拿到的还是旧配置。
+    if [[ -f "$SUB_STATE_DIR/sub.json" ]]; then
+        gen_sub_config >/dev/null 2>&1 || \
+            print_warn "配置分发订阅文件刷新失败 (不影响本机服务)"
+    fi
     if [[ -n "$(find_sb_pid || true)" ]]; then
         do_reload && { print_ok "$what 已生效 (已重启)"; return 0; }
         print_warn "软重载未成功, 改为重启"
     fi
     do_start && print_ok "$what 已生效 (已启动服务)" || { print_err "启动失败"; return 1; }
+}
+
+#!/bin/bash
+# ---------- 配置分发 (给局域网其他设备拉取用) ----------
+#
+# 用途: 把本客户端**正在用的这份完整配置** (出站 + DNS + 路由) 以 URL
+# 形式提供给局域网里的其他设备, 让它们导入后直接可用。
+# 不是中转代理 —— 别的设备拿到配置后自己连服务器、自己解析 DNS。
+#
+# 为什么单独起一个 HTTP 服务, 而不是复用 Clash API 的端口:
+#   - Clash API 只暴露 /proxies 这类运行时接口, 不提供任意文件下载;
+#   - 2080 是 mixed 入站, 走它的是代理流量, 不能混;
+#   - 端口独立, 换端口不影响客户端本身。
+
+SUB_TOKEN_FILE="${CLIENT_ROOT:-/opt/sb-client}/share-state/sub-token"
+SUB_STATE_DIR="${CLIENT_ROOT:-/opt/sb-client}/share-state"
+
+# 生成订阅文件: 合并 conf/ 下所有片段, **去掉入站和 experimental**。
+# 去掉入站的理由: 别的设备要用 TUN 还是 SOCKS 入站、监听哪个端口, 是它
+# 自己的事; 把 2080 硬塞过去既可能端口冲突, 也可能把它本机代理暴露出去。
+# 去掉 experimental 的理由: clash_api 的 external_ui 是本机绝对路径
+# (/opt/sb-client/ui), 在别的设备上根本不存在。
+gen_sub_config() { # 写一份快照, 仅供状态页显示节点数/DNS。
+    # **不是服务的数据源** —— sub_server.py 每次请求都直接合并 $CLIENT_CONF,
+    # 不读这个文件。这样才不会出现"节点早删了、快照还没刷新"。
+    python3 - "$CLIENT_CONF" "$SUB_STATE_DIR/sub.json" <<'PYSUB'
+import json, glob, os, sys
+confdir, out = sys.argv[1], sys.argv[2]
+m = {}
+# sing-box -C 是按顶层键覆盖, 这里用同样的语义合并
+for f in sorted(glob.glob(os.path.join(confdir, "*.json"))):
+    try:
+        m.update(json.load(open(f)))
+    except Exception as e:
+        sys.stderr.write("跳过 %s: %s\n" % (f, e))
+m.pop("inbounds", None)
+m.pop("experimental", None)
+if not m.get("outbounds"):
+    sys.stderr.write("没有出站, 无法分发\n")
+    sys.exit(1)
+tmp = out + ".tmp"
+with open(tmp, "w") as fh:
+    json.dump(m, fh, indent=2, ensure_ascii=False)
+os.replace(tmp, out)
+n = len(m["outbounds"])
+servers = [s.get("tag") for s in m.get("dns", {}).get("servers", [])]
+sys.stderr.write("已生成: %d 个出站, DNS %s\n" % (n, ",".join(servers) or "无"))
+PYSUB
+}
+
+sub_token() { # 取 token, 没有就生成
+    mkdir -p "$SUB_STATE_DIR"
+    if [[ ! -s "$SUB_TOKEN_FILE" ]]; then
+        # 32 位十六进制随机
+        local t=""
+        if [[ -r /dev/urandom ]]; then
+            t=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+        fi
+        [[ -z "$t" ]] && t=$(date +%s%N | tail -c 17)
+        printf '%s' "${t:0:32}" > "$SUB_TOKEN_FILE"
+        chmod 600 "$SUB_TOKEN_FILE"
+    fi
+    cat "$SUB_TOKEN_FILE"
+}
+
+sub_reset_token() {
+    rm -f "$SUB_TOKEN_FILE"
+    sub_token >/dev/null
+}
+
+sub_host_ip() { # 局域网可达的本机地址
+    local ip
+    ip=$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oE 'src [0-9.]+' | awk '{print $2}')
+    [[ -z "$ip" ]] && ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    printf '%s' "${ip:-127.0.0.1}"
+}
+
+sub_url() {
+    printf 'http://%s:%s/sub/%s' "$(sub_host_ip)" "$SUB_PORT" "$(sub_token)"
+}
+
+SUB_UNIT="sb-client-sub"
+
+sub_unit_installed() { [[ -f "/etc/systemd/system/$SUB_UNIT.service" ]]; }
+
+sub_unit_write() { # 生成 unit 文件
+    have_systemd || return 1
+    mkdir -p /etc/systemd/system "$SUB_STATE_DIR"
+    cat > "/etc/systemd/system/$SUB_UNIT.service" <<EOF
+[Unit]
+Description=SB-Panel config distribution (LAN subscription)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env python3 $SUB_SERVER --port $SUB_PORT --token-file $SUB_TOKEN_FILE --config-dir $CLIENT_CONF
+Restart=on-failure
+RestartSec=3
+WorkingDirectory=$SUB_STATE_DIR
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    return 0
+}
+
+sub_start() {
+    mkdir -p "$SUB_STATE_DIR"
+    gen_sub_config || return 1
+    if ! sub_unit_installed; then
+        sub_unit_write || {
+            print_err "无 systemd, 无法常驻。改用临时进程 (面板退出后即失效)"
+            sub_start_ephemeral
+            return $?
+        }
+        print_ok "已安装 systemd 服务: $SUB_UNIT.service"
+    fi
+    systemctl enable -q "$SUB_UNIT" 2>/dev/null || true
+    if systemctl start "$SUB_UNIT" 2>/dev/null; then
+        sleep 1
+        if systemctl is-active -q "$SUB_UNIT"; then
+            print_ok "配置分发服务已启动 (端口 $SUB_PORT, 开机自启)"
+            return 0
+        fi
+        print_err "服务启动失败"
+        systemctl status "$SUB_UNIT" --no-pager -n 5 2>/dev/null \
+            | sed 's/^/    /' >&2
+        return 1
+    fi
+    print_err "systemctl start 失败"
+    return 1
+}
+
+# 无 systemd 时的退路。用 setsid 让它脱离当前会话, 否则面板一退出
+# 进程就被连带回收 (之前用 `&` + disown 就是踩了这个坑)。
+sub_start_ephemeral() {
+    setsid "$SUB_SERVER" --port "$SUB_PORT" --token-file "$SUB_TOKEN_FILE" \
+        --config-dir "$CLIENT_CONF" >"$SUB_STATE_DIR/sub.log" 2>&1 < /dev/null &
+    local p=$!
+    disown 2>/dev/null || true
+    sleep 1
+    if kill -0 "$p" 2>/dev/null; then
+        printf '%s' "$p" > "$SUB_PID_FILE"
+        print_ok "配置分发服务已启动 (临时进程 PID $p, 面板退出后仍会运行)"
+        return 0
+    fi
+    print_err "启动失败"
+    tail -2 "$SUB_STATE_DIR/sub.log" 2>/dev/null | sed 's/^/    /'
+    return 1
+}
+
+sub_stop() {
+    if sub_unit_installed; then
+        systemctl stop "$SUB_UNIT" 2>/dev/null
+        systemctl disable -q "$SUB_UNIT" 2>/dev/null || true
+        rm -f "$SUB_PID_FILE"
+        print_ok "配置分发服务已停止 (开机自启已关闭)"
+        return 0
+    fi
+    local p
+    p=$(sub_server_pid) || { print_msg "配置分发服务未运行"; return 0; }
+    kill "$p" 2>/dev/null
+    sleep 1
+    kill -0 "$p" 2>/dev/null && kill -9 "$p" 2>/dev/null
+    rm -f "$SUB_PID_FILE"
+    print_ok "配置分发服务已停止"
+}
+
+sub_status() {
+    if sub_unit_installed && systemctl is-active -q "$SUB_UNIT" 2>/dev/null; then
+        ST="运行中"; p=$(systemctl show -p MainPID --value "$SUB_UNIT" 2>/dev/null)
+    elif p=$(sub_server_pid); then
+        ST="运行中"
+    else
+        ST="未运行"; p=""
+    fi
+    printf "  ${CYAN}局域网配置分发${RESET}\n"
+    if [[ "$ST" == "运行中" ]]; then
+        ui_kv_ascii "状态" "${GREEN}● 运行中${RESET} (PID $p)"
+    else
+        ui_kv_ascii "状态" "${YELLOW}○ 未运行${RESET}"
+    fi
+    ui_kv_ascii "端口" "$SUB_PORT"
+    ui_kv_ascii "本机地址" "$(sub_host_ip)"
+    if [[ -s "$SUB_STATE_DIR/sub.json" ]]; then
+        local n
+        n=$(jq '[.outbounds[]?|select(.type!="selector" and .type!="urltest")]|length' \
+            "$SUB_STATE_DIR/sub.json" 2>/dev/null || echo "?")
+        ui_kv_ascii "可分发节点" "$n 个"
+        ui_kv_ascii "DNS" "$(jq -r '[.dns.servers[]?.tag]|join(", ")' "$SUB_STATE_DIR/sub.json" 2>/dev/null || echo '-')"
+    else
+        ui_kv_ascii "可分发节点" "${YELLOW}未生成${RESET}"
+    fi
+    echo
+    if [[ "$ST" == "运行中" ]]; then
+        printf "  ${CYAN}订阅地址${RESET}  ${DIM}(把这个填进别的设备的「添加订阅」)${RESET}\n"
+        printf "    %s\n" "$(sub_url)"
+        printf "    http://%s:%s/sub/%s\n" "$(sub_host_ip)" "$port" "$(sub_token)"
+        echo
+        printf "  ${DIM}这个地址带 token, 局域网里没有它的人拉不到配置。${RESET}\n"
+        printf "  ${DIM}泄露了就在下面「重置 token」换一个新的。${RESET}\n"
+    fi
+}
+
+sub_menu() {
+    while true; do
+        sub_status
+        echo
+        ui_menu 1 "启动"
+        ui_menu 2 "停止"
+        ui_menu 3 "重启"
+        ui_menu 4 "重新生成订阅文件"
+        ui_menu 5 "重置 token (旧链接立即失效)"
+        ui_menu 0 "返回主菜单"
+        ui_rule
+        read -r -p "请输入选项 [0-5]: " c || return 0
+        case "$c" in
+            1) sub_start ;;
+            2) sub_stop ;;
+            3) sub_stop; sub_start ;;
+            4) gen_sub_config && print_ok "订阅文件已更新" ;;
+            5) sub_reset_token && print_ok "token 已重置, 旧链接立即失效" ;;
+            0) return ;;
+            *) print_err "无效选项 $c" ;;
+        esac
+        echo; read -r -p "按回车键返回..." _ || return 0
+    done
 }
 
 # ---------- add: share URL / 本地文件导入 ----------
@@ -1875,6 +2113,7 @@ show_panel() {
     ui_menu 11 "停止服务"
     ui_menu 12 "重启服务"
     ui_menu 13 "查看运行状态"
+    ui_menu 19 "局域网配置分发 (URL 拉取完整配置)"
     echo
     printf "  %s配置%s\n" "$DIM" "$RESET"
     ui_menu 14 "Web UI / Clash API"
@@ -1907,6 +2146,7 @@ show_panel() {
         16) settings_menu ;;
         17) do_reload ;;
         18) do_uninstall ;;
+        19) sub_menu ;;
         0) ui_clear; exit 0 ;;
         *) print_err "无效选项 $c" ;;
     esac
