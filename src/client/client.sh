@@ -624,9 +624,10 @@ do_init() {
 
 # 读 nodes/*.json 聚合 selector + urltest
 regen_selector() {
-    python3 - "$CLIENT_ROOT/nodes" "$CLIENT_CONF/90-outbounds.json" <<'PYGEN'
+    python3 - "$CLIENT_ROOT/nodes" "$CLIENT_CONF/90-outbounds.json" "$SUBS_FILE" <<'PYGEN'
 import json,sys,glob,os
 ndir,ofile=sys.argv[1],sys.argv[2]
+subfile=sys.argv[3] if len(sys.argv)>3 else ""
 obs=[]
 # 按 tag 去重: 同名 outbound 出现两次, 内核会直接拒绝启动
 # ("duplicate outbound/endpoint tag"), 表现为配置检查 FATAL 而查不出原因。
@@ -639,12 +640,50 @@ for f in sorted(glob.glob(os.path.join(ndir,"node-*.json"))):
 htags=set(o["detour"] for o in obs if o.get("detour"))
 tags=[o["tag"] for o in obs if o.get("type")!="direct" and o["tag"] not in htags]
 tags=tags or [o["tag"] for o in obs]
+
+# ---- 按订阅分组 ----
+# 节点一多 (自家 + 好几条外部订阅, 轻松 60+), PROXY 里平铺着选起来很痛苦。
+# 现在一条订阅一个组: PROXY 只放组, 组里才是那条订阅的节点。
+# sing-box 的 selector 允许嵌套 (PROXY -> 组 -> 节点), 实测内核 check 通过。
+subs=[]
+if subfile:
+    try: subs=json.load(open(subfile)).get("subs",[])
+    except Exception: subs=[]
+groups=[]; matched=set()
+for sb in subs:
+    pre=(sb.get("prefix") or "").strip()
+    if not pre: continue
+    gt=[t for t in tags if t.startswith(pre+"-")]
+    if not gt: continue
+    groups.append([sb.get("name") or pre, gt]); matched.update(gt)
+rest=[t for t in tags if t not in matched]
+if rest: groups.append(["其它", rest])
+
+def gtag(name):
+    # 组 tag 必须是唯一且不与节点 tag 撞; 去掉非 ASCII 字符 (国旗等)
+    t="".join(c for c in name if c.isalnum() or c in "-_.") or "grp"
+    if t in seen or t in tags: t="G-"+t
+    seen.add(t); return t
+
+# 只有一组时不再套一层 —— 那样 PROXY 里只剩一项, 纯属多绕一层。
+# 没有订阅记录的老用户也走这条路, 行为和改动前完全一致。
+use_groups = len(groups)>1
+if use_groups:
+    gsel=[]
+    for name,gt in groups:
+        g=gtag(name)
+        gsel.append({"type":"selector","tag":g,"outbounds":gt,"default":gt[0]})
+    proxy_items=[g["tag"] for g in gsel]
+    auto_items=tags
+else:
+    gsel=[]; proxy_items=tags; auto_items=tags
+
 if not tags:
     cfg={"outbounds":[]}
 else:
-    cfg={"outbounds":obs+[
-       {"type":"selector","tag":"PROXY","outbounds":tags,"default":tags[0]},
-       {"type":"urltest","tag":"AUTO","outbounds":tags,"url":"https://www.gstatic.com/generate_204","interval":"3m"}],
+    cfg={"outbounds":obs+gsel+[
+       {"type":"selector","tag":"PROXY","outbounds":proxy_items,"default":proxy_items[0]},
+       {"type":"urltest","tag":"AUTO","outbounds":auto_items,"url":"https://www.gstatic.com/generate_204","interval":"3m"}],
        # route 只写 final —— rules 全部由 02-dns.json 提供。
        # sing-box -C 合并时同名字段后者覆盖前者, 这里若也写 rules,
        # 加载顺序一变就会把防泄露规则冲掉。
@@ -712,6 +751,12 @@ add_node() {
         esac
         print_ok "分享配置已获取"
         IF_SOURCE="$src"
+        # 自家 share 也要登记进订阅表。
+        # 以前只有走"格式转换"那条路的外部订阅才登记, 而自家 share 返回的
+        # 本来就是 sing-box JSON, 内核直接认 -> 压根不进那个分支 -> 永远
+        # 没被登记。后果是「一个订阅一个组」做出来, 自家那 16 个节点会跟
+        # 手动加的一起掉进「其它」组里, 分组等于没分。
+        PENDING_SUB_URL="$src"
     else
         cp "$src" "$tmp" || { rm -f "$tmp"; print_err "无法读取 $src"; return 1; }
         export IF_SOURCE="$src"
@@ -817,6 +862,21 @@ add_node() {
         regen_selector
         print_ok "已导入 $n 个节点 (单个链接全量分享); 现 $(node_count) 个可用节点"
     fi
+
+    # 自家 share 的登记补在这里 (外部订阅在转换分支里已经登记过了)。
+    # 前缀从**刚落盘的节点名**里取 —— 单节点/多节点两条路径落盘后
+    # 第一个 tag 都带同一个服务端前缀, 这里用它反过来建订阅记录。
+    if [[ -n "${PENDING_SUB_URL:-}" ]]; then
+        local _sid _pre
+        _pre=$(list_nodes 2>/dev/null | awk -F'\t' '{print $1}' | sort | head -1)
+        _pre="${_pre%%-[^-]*}"
+        if [[ -n "$_pre" ]]; then
+            _sid=$(subs_id "$PENDING_SUB_URL")
+            [[ -n "$(subs_get "$_sid")" ]] || \
+                subs_register "$PENDING_SUB_URL" self "$_pre"
+        fi
+        unset PENDING_SUB_URL
+    fi
 }
 
 import_one_outbound() {
@@ -844,7 +904,7 @@ subs_menu() {
             return 0
         fi
         echo
-        printf "  ${CYAN}%4s  %-22s %-10s %-8s %s${RESET}\n" "序号" "名称(前缀)" "节点数" "状态" "来源"
+        printf "  ${CYAN}%4s  %-22s %-10s %-8s %s${RESET}\n" "序号" "名称(前缀)" "节点数" "分组" "来源"
         printf "  %s\n" "──────────────────────────────────────────────────────────────────"
         local i=1 id nm pre cnt url
         while IFS=$'\t' read -r id nm pre cnt url; do
@@ -853,39 +913,46 @@ subs_menu() {
             i=$((i+1))
         done < <(jq -r '.subs[]?|[.id,.name,.prefix,(.nodes|tostring),.url]|@tsv' "$SUBS_FILE" 2>/dev/null)
         echo
-        printf "  ${CYAN}%d)${RESET} 更新选中的订阅 (输入它的编号, 重拉并重建节点)\n" "$i"
-        i=$((i+1)); printf "  ${CYAN}%d)${RESET} 删除选中的订阅 (输入它的编号, 连同节点一起删)\n" "$i"
+        printf "  ${CYAN}%d)${RESET} 补登记未登记的节点组 (把已有节点按前缀建成订阅)${RESET}\n" "$i"
         i=$((i+1)); printf "  ${CYAN}%d)${RESET} 更新全部订阅\n" "$i"
+        printf "  ${CYAN}%d)${RESET} 只删某订阅的节点 (${DIM}保留订阅, 之后可再更新拉回)${RESET}\n" "$((i+1))"
+        printf "  ${YELLOW}%d)${RESET} ${YELLOW}删除某订阅${RESET} (连订阅记录和 URL 一起删)${RESET}\n" "$((i+2))"
         printf "  ${RED}0)${RESET} 返回\n"
         # 菜单上显示成连续编号: 1..N 是订阅, N+1 更新选中, N+2 删除选中,
         # N+3 更新全部, 0 返回。
         # 之前这里显示的是 "2]U) 2]D) 2]A)" —— $i 是循环结束后的值, 三行
         # 全打成同一个数字, 看着像坏掉的索引; 而派发却只认字母, 输 2 反而
         # 报"无法识别的操作"。显示和实际接受的东西对不上。
-        local nsub="$n" c sel sid act_total act_del act_all
-        act_total=$((nsub+1)); act_del=$((nsub+2)); act_all=$((nsub+3))
-        read -r -p "  请输入操作 [0-$act_all]: " c || { echo; return 0; }
+        # 菜单编号:
+        #   1..N        更新这一条 (最常用, 做成最顺手)
+        #   N+1         更新全部
+        #   N+2         只删这一条的**节点**, 保留订阅记录
+        #   N+3         删这一条的**订阅**(连记录和 URL 一起没)
+        #   0           返回
+        # N+2 和 N+3 必须分开: 服务器重置 / 订阅过期, 想先把节点清掉但留着
+        # URL, 之后点"更新"就能重拉; 连记录一起删的话 URL 就没了, 得重新填。
+        local nsub="$n" c sel sid
+        local a_reg=$((nsub+1)) a_all=$((nsub+2)) a_deln=$((nsub+3)) a_dels=$((nsub+4))
+        local top=$a_dels
+        read -r -p "  请输入操作 [0-$top]: " c || { echo; return 0; }
         c="${c// /}"
         [[ -z "$c" || "$c" == "0" ]] && return 0
-        [[ "$c" =~ ^[0-9]+$ ]] || { print_err "请输入编号 (1-$act_all) 或 0 返回"; continue; }
-        if [[ "$c" == "$act_all" ]]; then
-            sub_update_all; continue
+        if ! [[ "$c" =~ ^[0-9]+$ ]] || (( c > top )); then
+            print_err "请输入编号 (0-$top)"; continue
         fi
-        if [[ "$c" == "$act_total" || "$c" == "$act_del" ]]; then
-            # 这两个还要再问一次"哪一条", 因为它们带参数
+        if [[ "$c" == "$a_reg" ]]; then sub_backfill; continue; fi
+        if [[ "$c" == "$a_all" ]]; then sub_update_all; continue; fi
+        # 带参数的两个动作要先问是哪一条
+        if [[ "$c" == "$a_deln" || "$c" == "$a_dels" ]]; then
             read -r -p "  哪一条订阅? 编号 [1-$nsub]: " sel || { echo; continue; }
             sel="${sel// /}"
             [[ "$sel" =~ ^[0-9]+$ ]] || { print_err "请输入 1-$nsub"; continue; }
             sid=$(jq -r --argjson i "$sel" '(.subs//[])[$i-1].id // empty' "$SUBS_FILE" 2>/dev/null)
             [[ -n "$sid" ]] || { print_err "没有编号 $sel"; continue; }
-            if [[ "$c" == "$act_total" ]]; then
-                sub_update_one "$sid" && regen_selector && apply_change "订阅已更新"
-            else
-                sub_delete_one "$sid"
-            fi
+            if [[ "$c" == "$a_deln" ]]; then sub_delete_nodes "$sid"; else sub_delete_one "$sid"; fi
             continue
         fi
-        # 其余都当"更新这一条"处理 (最常用的操作, 让它最顺手)
+        # 1..N: 更新这一条
         sid=$(jq -r --argjson i "$c" '(.subs//[])[$i-1].id // empty' "$SUBS_FILE" 2>/dev/null)
         [[ -n "$sid" ]] || { print_err "没有编号 $c"; continue; }
         sub_update_one "$sid" && regen_selector && apply_change "订阅已更新"
@@ -922,10 +989,100 @@ sub_update_all() {
     (( n > 0 )) && { regen_selector; apply_change "订阅已更新"; }
 }
 
+# 补登记: 把**已经存在但没登记**的节点按前缀分组建成订阅条目。
+# 为什么需要: 自家 share 早于"订阅登记"这个功能导入, 那批节点从来没进过
+# subscriptions.json。分组靠前缀匹配, 它们匹配不到任何订阅 -> 全掉进「其它」,
+# "一个订阅一个组"就等于没分。这个动作把存量补齐, 不用重装。
+# URL 留空 —— 补出来的条目只知道节点从哪来, 不知道订阅地址, 所以不能"更新",
+# 但"只删节点"可用。要能更新的话重新导入一次那个分享链接即可。
+sub_backfill() {
+    local -a names=() pres=()
+    # 用 mapfile 直接读整个输出, 不要 while read 配多个字段 ——
+    # list_nodes 只取第 1 列时 read 的占位字段行为不可靠, 实测整轮读成空,
+    # 结果明明有 59 个节点却报"还没有节点"。
+    mapfile -t names < <(list_nodes 2>/dev/null | cut -f1)
+    # 去掉可能的空行
+    local -a clean=()
+    local x
+    for x in "${names[@]}"; do [[ -n "$x" ]] && clean+=("$x"); done
+    names=("${clean[@]}")
+    (( ${#names[@]} == 0 )) && { print_warn "还没有节点"; return 0; }
+    # 前缀树聚类。
+    # 简单砍尾不行: rn-anytls01-TLS -> rn-anytls01, 而 rn-anytls02-REALITY
+    # -> rn-anytls02, 同一个订阅的节点被切得七零八落 (踩过)。
+    # 正确做法: 按 '-' 分段, 逐层往下, 只有当"整组节点都在这一层之下"时才
+    # 继续细分; 某个节点名在这里到头或与同组不一致, 就停在上一层。
+    local -a pres=()
+    mapfile -t pres < <(printf '%s\n' "${names[@]}" | python3 -c '
+import sys
+from collections import defaultdict
+names=[l.rstrip("\n") for l in sys.stdin if l.strip()]
+groups=defaultdict(list)
+for n in names:
+    parts=n.split("-")
+    # 先按第 0 段粗分 (没有 - 的单独成组)
+    groups["-".join(parts[:1])].append(n)
+out=[]
+for head, mem in groups.items():
+    if len(mem)<2: continue
+    depth=1                      # 已确认的段数 (含第 0 段)
+    segs=len(head.split("-"))
+    while True:
+        if all(len(m.split("-"))>segs for m in mem):
+            nxt=set(m.split("-")[segs] for m in mem)
+            if len(nxt)<2: break # 这一层开始就分叉了, 停在这
+            segs+=1
+        else:
+            break
+    out.append("-".join(head.split("-")[:segs]))
+print("\n".join(out))
+')
+    local added=0 p cnt grp
+    for p in "${pres[@]}"; do
+        [[ -n "$p" ]] || continue
+        # 已有同名订阅就跳过
+        jq -e --arg p "$p" '(.subs//[])|any(.prefix==$p)' "$SUBS_FILE" >/dev/null 2>&1 && continue
+        cnt=0
+        for t in "${names[@]}"; do [[ "$t" == "$p"-* ]] && cnt=$((cnt+1)); done
+        (( cnt == 0 )) && continue
+        grp="$p"
+        jq -e --arg g "$grp" '(.subs//[])|any(.name==$g)' "$SUBS_FILE" >/dev/null 2>&1 && grp="${grp}-2"
+        subs_put "$(jq -n --arg id "local-$(printf '%s' "$p" | md5sum | cut -c1-10)" \
+            --arg url "" --arg pre "$p" --arg nm "$grp" --argjson n "$cnt" \
+            --arg ts "$(date -Is)" \
+            '{id:$id,name:$nm,prefix:$pre,url:"",kind:"local",nodes:$n,added_at:$ts}')"
+        print_ok "已登记「$grp」($cnt 个节点)"
+        added=$((added+1))
+    done
+    (( added > 0 )) || { print_msg "没有需要补登记的 (都已有订阅记录)"; return 0; }
+    regen_selector
+    print_ok "补登记 $added 个分组, 已重建 PROXY"
+}
+
+# 只删节点, **保留订阅记录**。
+# 和 sub_delete_one 的区别: 那���个连 URL 一起删, 用户想再拉回来就得重新
+# 把订阅地址输一遍。这个保留 subscriptions.json 里那条, 之后在同一个菜单
+# 点"更新"就能重拉 —— 服务器重置、订阅过期两种场景都是这个需求。
+sub_delete_nodes() {
+    local sid="$1" pre t n=0
+    pre=$(subs_get "$sid" | jq -r '.prefix // empty')
+    [[ -n "$pre" ]] || { print_err "订阅记录异常 (无前缀)"; return 1; }
+    for t in "$CLIENT_NODE_DIR"/node-"$pre"-*; do
+        [[ -f "$t" ]] && { rm -f "${t%.json}".*; n=$((n+1)); }
+    done
+    if (( n == 0 )); then
+        print_warn "订阅「$pre」当前没有节点 (可能已被删除)"
+        return 0
+    fi
+    print_warn "已删除订阅「$pre」的 $n 个节点; 订阅记录保留, 可随时「更新」重新拉取"
+    regen_selector
+    print_ok "现 $(node_count) 个可用节点"
+}
+
 sub_delete_one() {
     local sid="$1" pre t
     pre=$(subs_get "$sid" | jq -r '.prefix // empty')
-    print_warn "删除订阅「$pre」并同时删除它带的节点"
+    print_warn "删除订阅「$pre」并同时删除它带的节点 (订阅记录和 URL 也会消失)"
     local w
     read -r -p "  确认? 输入 yes, 其它任何输入=取消: " w
     [[ "$w" == "yes" ]] || { print_msg "已取消"; return 0; }
@@ -1052,6 +1209,25 @@ subs_del() {
     jq --arg i "$1" '.subs = ((.subs // []) | map(select(.id != $i)))' \
         "$SUBS_FILE" > "$SUBS_FILE.tmp" 2>/dev/null && mv -f "$SUBS_FILE.tmp" "$SUBS_FILE"
 }
+# 登记一个订阅。
+# 前缀必须和节点名里的一模一样 —— 「一个订阅一个组」就是靠 tag 前缀匹配的,
+# 猜错一点整组就空了。所以这里只接受**调用方明确传进来的**前缀, 不去反推:
+# 外部订阅的前缀是用户导入时自己填的, 天然已知; 自家 share 的前缀来自服务端
+# 的"服务器标识", 客户端只能从**配置里已经带前缀的节点名**取 —— 那是 sing-box
+# 聚合时写好的, 比从 URL 猜靠谱得多。
+subs_register() { # <url> <kind> <prefix> [显示名]
+    local url="$1" kind="$2" pre="$3" name="${4:-$3}" cnt sid
+    [[ "$url" =~ ^https?:// ]] || return 1
+    [[ -n "$pre" ]] || return 1
+    cnt=$(node_file_count)
+    sid=$(subs_id "$url")
+    subs_put "$(jq -n --arg id "$sid" --arg url "$url" --arg pre "$pre" \
+        --arg nm "$name" --argjson n "$cnt" --arg ts "$(date -Is)" --arg kind "$kind" \
+        '{id:$id,name:$nm,prefix:$pre,url:$url,kind:$kind,nodes:$n,added_at:$ts}')"
+    print_msg "已登记订阅「$name」($cnt 个节点)"
+    return 0
+}
+
 # 从 URL 猜默认前缀: sub.example.com -> sub。猜不出用 sub,
 # 用户回车就有合理默认, 想改再手打。
 subs_guess_prefix() {
@@ -1082,6 +1258,10 @@ list_nodes() {
         NODE_LIST+="$tag"$'\t'"$typ"$'\t'"$srv"$'\n'
     done
     [[ -n "$NODE_LIST" ]]
+    # 同时吐到 stdout。sub_backfill 这类调用方是 `list_nodes | cut -f1` 直接
+    # 接管道的, 之前只填全局变量不出声, 那边的 mapfile 拿到的是空的 ——
+    # 明明有 59 个节点却报"还没有节点"。
+    printf '%s' "$NODE_LIST"
 }
 print_nodes() {
     list_nodes || { print_warn "还没有任何节点"; return 1; }
