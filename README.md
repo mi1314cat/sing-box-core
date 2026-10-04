@@ -199,8 +199,12 @@ SB_BATCH_PORT_START=30000 SB_BATCH_PORT_END=31000 bash conf/batch.sh
 🇺🇸 myserver-anytls01-TLS
 ```
 
-交互时问一次，可以改成任意名字。**只问一次** —— 答案存在 `share-state/server-name`，
-之后单独再加节点不会重复问。批量模式下不打扰，直接用默认值；想指定就设 `SB_SERVER_NAME`。
+交互时**每次都会问**，回车即默认，可以改成任意名字。答案同时存在
+`share-state/server-name`，供聚合产物等只需要取值、不该交互的场合使用。
+
+批量（全协议生成 / 全协议快速生成）同样会问这一步 —— 注意批量里每个协议都是
+`bash conf/xxx.sh add` 起的独立子进程，在那里问传不回主进程，所以是在
+`batch_main` 里统一问一次，再传给各协议。
 
 | 位置 | 表现 |
 |---|---|

@@ -74,8 +74,15 @@ def slug(s):
     # 避免空格/中文/斜杠/emoji 把配置搞坏。
     # 国旗 emoji 在这里被剥掉是**有意的**: tag 必须是稳定的 ASCII 标识,
     # 靠它区分服务器。旗帜给用户看的地方是分享链接的 # 片段。
-    s=re.sub(r'[^A-Za-z0-9._-]+','-',s).strip('-')
-    return s[:32]
+    t=re.sub(r'[^A-Za-z0-9._-]+','-',s).strip('-')
+    if t: return t[:32]
+    # 名字里一个 ASCII 都没有 (纯中文/纯 emoji) 时上面会得到空串,
+    # 于是前缀整个消失, 多服务器防冲突又白做了 —— 而用户完全可能就
+    # 输入"我的香港"这种中文名。回退到 hostname, 保证前缀永远非空。
+    import socket
+    h=socket.gethostname().split('.')[0]
+    h=re.sub(r'[^A-Za-z0-9._-]+','-',h).strip('-') or "server"
+    return h[:32]
 
 pref=slug(SRV) if SRV else ""
 obs=[]; seen=set()

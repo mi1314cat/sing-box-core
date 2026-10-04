@@ -392,36 +392,41 @@ _sb_hostname() {
 # 结果写进 SB_SERVER_NAME, 同时落盘到 share-state/ 供后续 add 复用 ——
 # 用户只该被问一次, 不是每加一个节点问一遍。
 sb_ask_server_name() {
-    if [[ -z "${SB_SERVER_NAME:-}" ]]; then
-        local state="$SB_OUT_DIR/../share-state/server-name"
-        if [[ -s "$state" ]]; then SB_SERVER_NAME=$(cat "$state"); fi
-    fi
-    if [[ -z "${SB_SERVER_NAME:-}" ]]; then
-        local flag; flag=$(sb_flag_emoji)
-        local def="${flag:+${flag} }$(_sb_hostname)"
-        [[ -n "$def" ]] || def="Sing-Box"
-        if [[ -n "${SB_BATCH:-}" ]]; then
-            SB_SERVER_NAME="$def"
-        else
-            local v; v=$(safe_read "服务器标识 (节点名前缀)" "$def")
-            [[ -n "$v" ]] || v="$def"
-            SB_SERVER_NAME="$v"
-        fi
-        # 目录可能还不存在 (首次生成时), mkdir -p 顺手建了。
-        # 之前这里直接写文件 + || true 吞掉失败, 结果标识存不住, 用户每加
-        # 一个节点就要被重新问一遍。
-        local sdir="$SB_OUT_DIR/../share-state"
-        mkdir -p "$sdir" 2>/dev/null
-        printf '%s' "$SB_SERVER_NAME" > "$sdir/server-name" 2>/dev/null \
-            || print_warn "服务器标识未能保存, 下次添加节点会重新询问"
-    fi
+    # 已经明确给过 (环境变量 / 父进程) 就不问。
+    if [[ -n "${SB_SERVER_NAME:-}" ]]; then export SB_SERVER_NAME; return 0; fi
+    # 每次都问, 默认值 = 国旗 + hostname。
+    #
+    # 以前这里会先读 share-state/server-name, 有缓存就直接返回, 批量模式
+    # (SB_BATCH 非空) 则干脆跳过提问直接用默认。两个问题:
+    #   1) 批量不提示, 用户没机会自定义 —— 用户明确要求"全协议也是"要问;
+    #   2) 缓存让第二次运行连单协议也不问, 用户想改名字都没机会。
+    # 现在: 一律问, 回车即默认。分享链接里能看到结果, 改错了重跑一次就行。
+    local flag; flag=$(sb_flag_emoji)
+    local def="${flag:+${flag} }$(_sb_hostname)"
+    [[ -n "$def" ]] || def="Sing-Box"
+    local v; v=$(safe_read "服务器标识 (节点名前缀)" "$def")
+    [[ -n "$v" ]] || v="$def"
+    SB_SERVER_NAME="$v"
     export SB_SERVER_NAME
+    # 存一份, 供分享/聚合等只需要读不需要问的地方兜底。
+    local sdir="$SB_OUT_DIR/../share-state"
+    mkdir -p "$sdir" 2>/dev/null
+    printf '%s' "$SB_SERVER_NAME" > "$sdir/server-name" 2>/dev/null || true
 }
 
+# 只**读**, 不问。给 gen_full_profile 这类"需要值但不该交互"的场合用。
+# 读取顺序: 环境变量 → share-state/server-name (上次用户答的) → 旗帜+hostname。
+# 中间那一步是必须的: 批量主流程在**自己这个进程**里问过用户, 但生成
+# 聚合产物时可能已经是另一个 shell (share.sh 的 CLI 派发), 变量传不过去,
+# 只剩这个文件能把它带过去。之前漏了它, 结果用户自定义的名字在聚合环节
+# 完全没被采用。
 sb_server_name() {
     if [[ -n "${SB_SERVER_NAME:-}" ]]; then printf '%s' "$SB_SERVER_NAME"; return 0; fi
-    local h; h=$(_sb_hostname)
-    if [[ -n "$h" ]]; then printf '%s' "$h"; return 0; fi
+    local state="$SB_OUT_DIR/../share-state/server-name"
+    if [[ -s "$state" ]]; then printf '%s' "$(cat "$state")"; return 0; fi
+    local flag h
+    flag=$(sb_flag_emoji); h=$(_sb_hostname)
+    if [[ -n "$h" ]]; then printf '%s' "${flag:+${flag} }$h"; return 0; fi
     local a="${SB_SERVER_ADDR:-}"; [[ -n "$a" ]] && printf '%s' "$a"
 }
 
