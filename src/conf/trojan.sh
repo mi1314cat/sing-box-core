@@ -200,6 +200,8 @@ EOF
     local server_ip pin="" mode_tls="tls"
     [[ "${TLS_TYPE:-}" == "reality" ]] && mode_tls="reality"
     server_ip=$(ask_server_addr)
+    # 节点名前缀: 紧跟地址选择问一次, 全部协议统一入口
+    sb_ask_server_name_hook
     if [[ "$CERT_TRUSTED" == "false" ]]; then pin=$(cert_spki_pin_base64 "$CERT_FILE"); fi
     # 命令替换提前算好: 放在双引号字符串里出错时归因困难, 串联多个替换时行为也不确定
     local mux_link ech_link
@@ -210,12 +212,12 @@ EOF
     # CDN 只在 443 上提供服务; 沿用源站端口会得到连不通的 域名:源站端口
     sb_node_is_cdn "$file" && listen_port=443
     if [[ "$mode_tls" == "reality" ]]; then
-        link="trojan://$password@$server_ip:$listen_port?sni=$CERT_DOMAIN&security=reality&pbk=$T_RE_PUB&sid=$T_RE_SID$(sb_transport_link_params "$TR_TYPE" "$TR_PATH" "$TR_SVC" "$TR_HOST")$mux_link$ech_link$fr_link#$tag"
+        link="trojan://$password@$server_ip:$listen_port?sni=$CERT_DOMAIN&security=reality&pbk=$T_RE_PUB&sid=$T_RE_SID$(sb_transport_link_params "$TR_TYPE" "$TR_PATH" "$TR_SVC" "$TR_HOST")$mux_link$ech_link$fr_link#$(sb_tag_display "$tag")"
     else
         # alpn 必须跟着传输走: grpc / http(H2) 要 h2, 写死 http/1.1 会
         # 让客户端在 TLS 握手时与需要 h2 的服务端协商失败。
         local link_alpn; link_alpn=$(sb_transport_alpn "$TR_TYPE" | tr -d '[]"')
-        link="trojan://$password@$server_ip:$listen_port?sni=$CERT_DOMAIN&alpn=$link_alpn${pin:+&pinSHA256=$pin}$(sb_transport_link_params "$TR_TYPE" "$TR_PATH" "$TR_SVC" "$TR_HOST")$mux_link$ech_link$fr_link#$tag"
+        link="trojan://$password@$server_ip:$listen_port?sni=$CERT_DOMAIN&alpn=$link_alpn${pin:+&pinSHA256=$pin}$(sb_transport_link_params "$TR_TYPE" "$TR_PATH" "$TR_SVC" "$TR_HOST")$mux_link$ech_link$fr_link#$(sb_tag_display "$tag")"
     fi
     local utls_fp; utls_fp=$(ask_utls_fingerprint)
     local ctr_json ctr_sep="" alpn_json

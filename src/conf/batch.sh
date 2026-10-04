@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==============================================================
 # batch.sh — 全协议一键生成 (Batch Generator)
-#   * 公共参数只问一次: 对外地址 / 证书方案 / 端口范围 / CDN 策略,
+#   * 公共参数只问一次: 对外地址 / 证书方案 / CDN 策略 / 服务器标识,
 #     其余全用各协议自带默认生成逻辑
 #   * 证书: SB_BATCH_CERT=real|self 配 SB_BATCH_CERT_CRT/KEY/DOMAIN 下发;
 #     选真证书时 CDN 自动沿用同一张, 选自签时 CDN 需另选一张可信证书
@@ -200,7 +200,7 @@ batch_main() {
 
     echo >&2
     print_title "全协议一键生成"
-    echo -e "${CYAN}交互项: 对外地址 → 证书方案 → 端口范围 → CDN. 其余沿用各协议默认值.${RESET}" >&2
+    echo -e "${CYAN}交互项: 对外地址 → 证书方案 → CDN → 服务器标识. 端口区间自动分配. 其余沿用各协议默认值.${RESET}" >&2
     echo -e "${CYAN}如端口被占用或配置失败, 会自动清理; 收尾统一 check + reload.${RESET}" >&2
 
     # --- 服务端监听: 不问, 统一双栈 ---
@@ -273,25 +273,17 @@ batch_main() {
     esac
     export SB_BATCH_CERT SB_BATCH_CERT_CRT SB_BATCH_CERT_KEY SB_BATCH_CERT_DOMAIN
 
-    # --- 第三次交互: 端口范围 ---
-    local r
-    if [[ -n "${SB_BATCH_AUTO:-}" ]]; then
+    # --- 端口区间: 不再问, 直接随机 ---
+    # 以前这里是一次交互 ("端口范围 如 20000-25000, 回车=自动")。批量生成要占
+    # 十几个端口, 让用户先想好一整段没什么意义 —— 回车的人占绝大多数, 真正
+    # 填的人又常和已有节点撞上。要指定就用环境变量:
+    #   SB_BATCH_PORT_START=30000 SB_BATCH_PORT_END=31000 bash conf/batch.sh
+    if [[ -n "${SB_BATCH_PORT_START:-}" && -n "${SB_BATCH_PORT_END:-}" ]]; then
+        print_ok "批量端口区间 (预设): $SB_BATCH_PORT_START-$SB_BATCH_PORT_END"
+    else
         SB_BATCH_PORT_START=$(( 20000 + RANDOM % 10000 ))
         SB_BATCH_PORT_END=$(( SB_BATCH_PORT_START + 5000 ))
         print_ok "批量自动端口区间: $SB_BATCH_PORT_START-$SB_BATCH_PORT_END"
-    else
-        echo >&2
-        read -r -p "端口范围 (如 20000-25000, 回车=自动): " r
-        r=$(clean_input "$r")
-        if [[ -z "$r" ]]; then
-            SB_BATCH_PORT_START=$(( 20000 + RANDOM % 10000 ))
-            SB_BATCH_PORT_END=$(( SB_BATCH_PORT_START + 5000 ))
-            print_ok "批量自动端口区间: $SB_BATCH_PORT_START-$SB_BATCH_PORT_END"
-        else
-            SB_BATCH_PORT_START="${r%%-*}"; SB_BATCH_PORT_END="${r##*-}"
-            [[ "$SB_BATCH_PORT_START" =~ ^[0-9]+$ && "$SB_BATCH_PORT_END" =~ ^[0-9]+$ ]] || { print_error "格式: 起始-结束"; return 1; }
-            (( SB_BATCH_PORT_START < SB_BATCH_PORT_END && SB_BATCH_PORT_END <= 65535 )) || { print_error "范围无效 (beg<g_end<=65535)"; return 1; }
-        fi
     fi
     export SB_BATCH_PORT_START SB_BATCH_PORT_END
 
@@ -710,8 +702,8 @@ show_service() {
 main() {
     while true; do
         print_title "全协议一键生成 (Batch Generator)"
-        echo -e "${CYAN}1)${RESET} 全协议生成 (默认形态; 唯一交互: 端口范围)"
-        echo -e "${CYAN}2)${RESET} 全协议生成 (自动端口, 完全无交互)"
+        echo -e "${CYAN}1)${RESET} 全协议生成 (默认形态)"
+        echo -e "${CYAN}2)${RESET} 全协议脚本 (一条命令跑完, 直接给脚本用)"
         echo -e "${CYAN}3)${RESET} 全协议生成 (强制覆盖已有协议, 重新生成全部)"
         echo -e "${RED}4)${RESET} 清空全部节点 (批量删除 + 吊销所有分享链接)"
         echo -e "${CYAN}0)${RESET} 返回"

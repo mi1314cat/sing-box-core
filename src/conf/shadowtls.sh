@@ -55,7 +55,9 @@ EOF
     cleanup_node_shares "$tag"
     sb_reload || true
     server_ip=$(ask_server_addr)
-    local link="shadowtls://$st_password@$server_ip:$listen_port?sni=$rnd&version=3#$tag"
+    # 节点名前缀: 紧跟地址选择问一次, 全部协议统一入口
+    sb_ask_server_name_hook
+    local link="shadowtls://$st_password@$server_ip:$listen_port?sni=$rnd&version=3#$(sb_tag_display "$tag")"
     local utls_fp; utls_fp=$(ask_utls_fingerprint)
     python3 - "$utls_fp" "$SB_OUT_DIR/sb_client-$tag.json" "$tag" "$server_ip" "$listen_port" "$st_password" "$ss_password" "$rnd" <<'PYGEN'
 import json,sys

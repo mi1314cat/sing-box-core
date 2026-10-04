@@ -88,6 +88,8 @@ add_config() {
     print_title "新增 VLESS 节点 ($PROTO-NN.json)"
     local server_ip listen_ip listen_port uuid idx file tag json
     server_ip=$(ask_server_addr)
+    # 节点名前缀: 紧跟地址选择问一次, 全部协议统一入口
+    sb_ask_server_name_hook
     listen_port=$(safe_read_port)
     uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen)
     # 预置方案放在最前面: 它同时决定传输层/流控/证书, 先问它, 后面
@@ -230,10 +232,10 @@ EOF
     fi
     if [[ "${CERT_MODE:-}" == "reality" ]]; then
         tls_cli="\"enabled\": true, \"server_name\": \"$CERT_DOMAIN\", \"utls\": { \"enabled\": true, \"fingerprint\": \"$utls_fp\" }, \"reality\": { \"enabled\": true, \"public_key\": \"$REAL_PUB\", \"short_id\": \"$REAL_SID\" }${frag_cli:+, $frag_cli}"
-        link="vless://$uuid@$server_ip:$listen_port?encryption=none&security=reality&sni=$CERT_DOMAIN&fp=$utls_fp&pbk=$REAL_PUB&sid=$REAL_SID$link_params$flow_link$fr_link#$tag"
+        link="vless://$uuid@$server_ip:$listen_port?encryption=none&security=reality&sni=$CERT_DOMAIN&fp=$utls_fp&pbk=$REAL_PUB&sid=$REAL_SID$link_params$flow_link$fr_link#$(sb_tag_display "$tag")"
     else
         tls_cli="\"enabled\": true, \"server_name\": \"$CERT_DOMAIN\", \"insecure\": $( [[ "$CERT_TRUSTED" == "true" ]] && echo false || echo true ), \"utls\": { \"enabled\": true, \"fingerprint\": \"$utls_fp\" }${ech_cli:+, $ech_cli}${frag_cli:+, $frag_cli}"
-        link="vless://$uuid@$server_ip:$listen_port?encryption=none&security=tls&sni=$CERT_DOMAIN$link_params$mux_link$ech_link$fr_link#$tag"
+        link="vless://$uuid@$server_ip:$listen_port?encryption=none&security=tls&sni=$CERT_DOMAIN$link_params$mux_link$ech_link$fr_link#$(sb_tag_display "$tag")"
     fi
     cat > "$SB_OUT_DIR/sb_client-$tag.json" <<EOF
 {

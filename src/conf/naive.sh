@@ -87,9 +87,11 @@ EOF
     sb_reload || true
 
     server_ip=$(ask_server_addr)
+    # 节点名前缀: 紧跟地址选择问一次, 全部协议统一入口
+    sb_ask_server_name_hook
     local pin=""
     [[ "$CERT_TRUSTED" == "false" ]] && pin=$(cert_spki_pin_base64 "$CERT_FILE")
-    local link="naive+https://$user:$pass@$server_ip:$listen_port?sni=$CERT_DOMAIN${pin:+&pinSHA256=$pin}#$tag"
+    local link="naive+https://$user:$pass@$server_ip:$listen_port?sni=$CERT_DOMAIN${pin:+&pinSHA256=$pin}#$(sb_tag_display "$tag")"
     local pin_json="" cert_json_jq=""
     if [[ "$CERT_TRUSTED" == "false" ]]; then
         # sing-box naive 出站走 Chrome cronet, 不接受 SPKI pin; 自签证书通过 tls.certificate (PEM) 信任

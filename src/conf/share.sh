@@ -62,9 +62,22 @@ share_url_for() {
 # 聚合全部节点 outbound → 一份 client profile (selector PROXY + urltest AUTO + route.final)
 gen_full_profile() {
     local out="$SB_OUT_DIR/sb_client-all.json"
-    python3 - "$SB_OUT_DIR" "$out" <<'PY'
-import json,glob,sys,os
+    local srvname; srvname="$(sb_server_name)"
+    python3 - "$SB_OUT_DIR" "$out" "$srvname" <<'PY'
+import json,glob,sys,os,re
 odir,ofile=sys.argv[1],sys.argv[2]
+SRV=sys.argv[3] if len(sys.argv)>3 else ""
+
+def slug(s):
+    # tag 会进配置文件、分享链接的 # 片段、Clash API 的节点名, 还是
+    # 客户端的节点**文件名** (node-<tag>.json) —— 只保留安全字符,
+    # 避免空格/中文/斜杠/emoji 把配置搞坏。
+    # 国旗 emoji 在这里被剥掉是**有意的**: tag 必须是稳定的 ASCII 标识,
+    # 靠它区分服务器。旗帜给用户看的地方是分享链接的 # 片段。
+    s=re.sub(r'[^A-Za-z0-9._-]+','-',s).strip('-')
+    return s[:32]
+
+pref=slug(SRV) if SRV else ""
 obs=[]; seen=set()
 for f in sorted(glob.glob(os.path.join(odir,"sb_client-*.json"))):
     base=os.path.basename(f)
@@ -73,6 +86,21 @@ for f in sorted(glob.glob(os.path.join(odir,"sb_client-*.json"))):
         if o.get("type") in ("selector","urltest","direct","block","dns"): continue
         if o.get("tag") in seen: continue
         seen.add(o.get("tag")); obs.append(o)
+
+# 加服务器前缀 (解决多台服务器节点同名冲突)。
+# shadowtls 是两层结构: shadowsocks(tag=X) detour→ shadowtls(tag=X-out),
+# 引用和被引用**都要**改。之前的实现只改了 outbound["tag"], 没改 detour 字段,
+# 主节点于是指向一个不存在的前缀名, 客户端切节点后内核启动即 FATAL:
+#   dependency[shadowtls01-TLS-out] not found
+# 所以这里先建 旧tag→新tag 的映射, 再统一改写 tag 与 detour。
+    if pref:
+        mapping={o["tag"]: pref+"-"+o["tag"] for o in obs
+                 if o.get("tag") and not o["tag"].startswith(pref+"-")}
+        for o in obs:
+            if o.get("tag") in mapping: o["tag"]=mapping[o["tag"]]
+            d=o.get("detour")
+            if d and d in mapping: o["detour"]=mapping[d]
+
 helper=set(o["detour"] for o in obs if o.get("detour"))
 taglist=[o["tag"] for o in obs if o["tag"] not in helper]
 if not taglist:

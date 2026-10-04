@@ -338,6 +338,101 @@ ask_server_addr() {
     esac
 }
 
+# 问一次服务器标识 (节点名前缀)。紧跟 ask_server_addr 之后调用 ——
+# 全部 10 个协议模块都会走 ask_server_addr, 挂在这里等于一次接入全覆盖。
+# 批量模式下不打扰 (用默认的 旗帜+hostname), 用户要改就设 SB_SERVER_NAME。
+# ---- 服务器标识 (节点名前缀) ----
+# 为什么需要: 用户常在多台服务器 (RN / DS / ...) 上各跑一份全协议, 再把它们的
+# 订阅全拉进**同一个**客户端。两台的节点 tag 完全一样 (都是 anytls01-TLS),
+# 而客户端的节点文件名就是 node-<tag>.json, 导入第二条时直接 `>` 覆盖第一条 ——
+# 静默丢节点, 面板还报 "[OK] 已导入 13 个节点"。加上前缀后
+# myserver-anytls01-TLS 与另一台的前缀不同, 天然不会撞。
+#
+# 默认值 = 国旗 emoji + 系统 hostname (学 fscarmen/sing-box 的做法):
+# 它调 https://ip.cloudflare.now 拿 {"emoji":"🇺🇸",...} 再拼 hostname,
+# 节点列表里一眼能看出是哪台、哪个地区。
+sb_flag_emoji() { # 拿不到就输出空 (不影响功能, 只是没有旗帜)
+    [[ -n "${SB_SKIP_FLAG:-}" ]] && return 0
+    local iso=""
+    # 多源回退。fscarmen 用的是 ip.cloudflare.now, 那域名现在已经解析不了
+    # (RN 上实测 curl: (6) Could not resolve host), 所以换掉并保留多个源。
+    for u in "http://ip-api.com/json/?fields=countryCode" \
+             "https://ifconfig.co/json" \
+             "http://ip-api.com/json/"; do
+        iso=$(curl -fsS --max-time 4 "$u" 2>/dev/null \
+              | python3 -c '
+import sys,json
+try:
+    d=json.load(sys.stdin)
+    print(d.get("countryCode") or d.get("country_iso") or d.get("country_code") or "")
+except Exception: pass' 2>/dev/null)
+        [[ -n "$iso" ]] && break
+    done
+    iso=$(printf '%s' "$iso" | tr 'a-z' 'A-Z' | tr -cd 'A-Z')
+    [[ ${#iso} -eq 2 ]] || return 0
+    # ISO 3166-1 alpha-2 → 区域指示符号 (U+1F1E6 + 字母偏移)。
+    # 用 python 生成而不是 printf \U —— bash 的 printf 不认 \U, 会报
+    # "missing unicode digit"。本项目本来就硬依赖 python3, 不算新增依赖。
+    printf '%s' "$iso" | python3 -c '
+import sys
+c=sys.stdin.read().strip().upper()
+if len(c)==2 and c.isalpha():
+    print("".join(chr(0x1F1E6+ord(x)-65) for x in c))' 2>/dev/null
+}
+
+_sb_hostname() {
+    local h=""
+    command -v hostname >/dev/null 2>&1 && h=$(hostname 2>/dev/null | tr -d '\r\n')
+    [[ -z "$h" && -r /etc/hostname ]] && h=$(tr -d '\r\n' < /etc/hostname)
+    [[ -z "$h" && -r /proc/sys/kernel/hostname ]] && h=$(tr -d '\r\n' < /proc/sys/kernel/hostname)
+    printf '%s' "$h"
+}
+
+# 交互式问一次。批量/非交互时直接用默认值, 不多问。
+# 结果写进 SB_SERVER_NAME, 同时落盘到 share-state/ 供后续 add 复用 ——
+# 用户只该被问一次, 不是每加一个节点问一遍。
+sb_ask_server_name() {
+    if [[ -z "${SB_SERVER_NAME:-}" ]]; then
+        local state="$SB_OUT_DIR/../share-state/server-name"
+        if [[ -s "$state" ]]; then SB_SERVER_NAME=$(cat "$state"); fi
+    fi
+    if [[ -z "${SB_SERVER_NAME:-}" ]]; then
+        local flag; flag=$(sb_flag_emoji)
+        local def="${flag:+${flag} }$(_sb_hostname)"
+        [[ -n "$def" ]] || def="Sing-Box"
+        if [[ -n "${SB_BATCH:-}" ]]; then
+            SB_SERVER_NAME="$def"
+        else
+            local v; v=$(safe_read "服务器标识 (节点名前缀)" "$def")
+            [[ -n "$v" ]] || v="$def"
+            SB_SERVER_NAME="$v"
+        fi
+        # 目录可能还不存在 (首次生成时), mkdir -p 顺手建了。
+        # 之前这里直接写文件 + || true 吞掉失败, 结果标识存不住, 用户每加
+        # 一个节点就要被重新问一遍。
+        local sdir="$SB_OUT_DIR/../share-state"
+        mkdir -p "$sdir" 2>/dev/null
+        printf '%s' "$SB_SERVER_NAME" > "$sdir/server-name" 2>/dev/null \
+            || print_warn "服务器标识未能保存, 下次添加节点会重新询问"
+    fi
+    export SB_SERVER_NAME
+}
+
+sb_server_name() {
+    if [[ -n "${SB_SERVER_NAME:-}" ]]; then printf '%s' "$SB_SERVER_NAME"; return 0; fi
+    local h; h=$(_sb_hostname)
+    if [[ -n "$h" ]]; then printf '%s' "$h"; return 0; fi
+    local a="${SB_SERVER_ADDR:-}"; [[ -n "$a" ]] && printf '%s' "$a"
+}
+
+# 问一次服务器标识 (节点名前缀)。紧跟 ask_server_addr 之后调用 ——
+# 全部 10 个协议模块都会走 ask_server_addr, 挂在这里等于一次接入全覆盖。
+# 批量模式下不打扰 (用默认的 旗帜+hostname), 用户要改就设 SB_SERVER_NAME。
+sb_ask_server_name_hook() {
+    [[ -n "${SB_NO_NAME_PROMPT:-}" ]] && return 0
+    sb_ask_server_name
+}
+
 default_server_ip() { # 优先公网网卡 IPv4; 无 v4 则回退 IPv6
     local local_ip public_ip
     local_ip=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 |
@@ -484,6 +579,12 @@ pick_trusted_cert_verbose() {
 sb_batch_tls_override() { # sb_batch_tls_override <真证书分支编号> <变量名>
     local n="$1" var="$2"
     [[ -n "${SB_BATCH:-}" ]] || return 0
+    # 变体补齐循环 (batch.sh 的 variant_list) 会传 SB_FORCE_TLS_REALTY=1,
+    # 目的是把 c 定死成 3。ask_cert 里这句是无条件调用的, 于是批量选了真证书
+    # (SB_BATCH_CERT=real) 时, 它会把刚设好的 c=3 又推回 1 —— 变体又变回
+    # 真证书节点, Reality 形态照样产不出来。
+    # "强制形态"比"批量证书偏好"优先, 所以这里直接让路。
+    [[ "${SB_FORCE_TLS_REALTY:-}" == "1" ]] && return 0
     [[ "${SB_BATCH_CERT:-self}" == "real" ]] || return 0
     printf -v "$var" '%s' "$n"
     return 0
@@ -721,6 +822,24 @@ sb_transport_json_client() { # <type> <path> <svc> <host> <ua>
         grpc)          printf '{"type":"grpc","service_name":"%s"}' "$3" ;;
         http)          printf '{"type":"http","path":"%s","host":["%s"]}' "$2" "$4" ;;
         *)             print_error "未知传输类型: ${1:-<空>}"; return 1 ;;
+    esac
+}
+
+# 分享链接 # 片段里显示的名字。
+# tag 是 ASCII (国旗 emoji 被剥掉了, 见 share.sh 的 slug), 但用户是**看**这个名字
+# 的 —— 列表里分不清两台服务器就没意义了。所以显示名把 emoji 加回去:
+#   tag: myserver-anytls01-TLS
+#   显示: 🇺🇸 myserver · anytls01-TLS
+# 没配过标识 (SB_SERVER_NAME 空) 就原样返回, 行为与从前一致。
+sb_tag_display() { # <tag>
+    local tag="$1" sn="${SB_SERVER_NAME:-}"
+    [[ -n "$sn" ]] || { printf '%s' "$tag"; return 0; }
+    local ascii; ascii=$(printf '%s' "$sn" | sed 's/[^A-Za-z0-9._-]//g')
+    [[ -n "$ascii" ]] || { printf '%s' "$tag"; return 0; }
+    # tag 已经带前缀的话只换前缀那部分, 后面原样保留
+    case "$tag" in
+        "$ascii"-*) printf '%s %s' "$sn" "${tag#"$ascii"-}" ;;
+        *)printf '%s %s' "$sn" "$tag" ;;
     esac
 }
 

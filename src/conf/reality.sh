@@ -55,6 +55,8 @@ add_config() {
 
     local server_ip listen_ip listen_port idx
     server_ip=$(ask_server_addr)
+    # 节点名前缀: 紧跟地址选择问一次, 全部协议统一入口
+    sb_ask_server_name_hook
     listen_ip=$(ask_listen_addr)
     listen_port=$(safe_read_port)
     echo -n "" >&2
@@ -140,7 +142,7 @@ EOF
         http) tparam="&type=h2" ;;
         *)    tparam="&type=tcp" ;;
     esac
-    local link="vless://$uuid@$server_ip:$listen_port?encryption=none&security=reality&sni=$sni&fp=chrome&pbk=$REAL_PUB&sid=$sid$tparam$flow_extra#$tag"
+    local link="vless://$uuid@$server_ip:$listen_port?encryption=none&security=reality&sni=$sni&fp=chrome&pbk=$REAL_PUB&sid=$sid$tparam$flow_extra#$(sb_tag_display "$tag")"
     write_out "$idx" "$tag" "$link" "$uuid" "$listen_port" "$sni" "$REAL_PUB" "$sid" "$server_ip" "$TRANSPORT" "$svc_name"
     open_port "$listen_port"
     print_ok "Reality 节点添加完成: $file"

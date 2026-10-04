@@ -60,11 +60,13 @@ EOF
     sb_reload || print_warn "请确认服务状态"
 
     local server_ip; server_ip=$(ask_server_addr)
+    # 节点名前缀: 紧跟地址选择问一次, 全部协议统一入口
+    sb_ask_server_name_hook
     sb_ask_multiplex shadowsocks client; local mux_json=$(sb_mux_json_client)
     local mux_sep=""
     [[ -n "$mux_json" ]] && mux_sep=",
       $mux_json"
-    local link="ss://$(printf '%s' "$method:$key" | base64 -w0)@$server_ip:$listen_port#$tag"
+    local link="ss://$(printf '%s' "$method:$key" | base64 -w0)@$server_ip:$listen_port#$(sb_tag_display "$tag")"
     cat > "$SB_OUT_DIR/sb_client-$tag.json" <<EOF
 {
   "outbounds": [

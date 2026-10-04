@@ -101,7 +101,9 @@ EOF
     sb_reload || print_warn "请确认服务状态"
 
     local server_ip; server_ip=$(ask_server_addr)
-    local link="tuic://$uuid:$password@$server_ip:$listen_port?sni=$CERT_DOMAIN&congestion_control=$congestion&alpn=h3$( [[ "$CERT_TRUSTED" == "false" ]] && echo "&allow_insecure=1" )#$tag"$(sb_ech_link_params)
+    # 节点名前缀: 紧跟地址选择问一次, 全部协议统一入口
+    sb_ask_server_name_hook
+    local link="tuic://$uuid:$password@$server_ip:$listen_port?sni=$CERT_DOMAIN&congestion_control=$congestion&alpn=h3$( [[ "$CERT_TRUSTED" == "false" ]] && echo "&allow_insecure=1" )#$(sb_tag_display "$tag")"$(sb_ech_link_params)
     # 客户端 ech 片段 (内联完整 ECHCONFIGS PEM; 只有 sing-box 客户端认)。
     # 必须在本 heredoc **之前**算好 —— heredoc 展开时变量若还没赋值就是空的。
     local ech_cli; ech_cli=$(sb_ech_json_client)

@@ -207,6 +207,8 @@ EOF
 
     # server对外IP / 客户端
     local server_ip; server_ip=$(ask_server_addr)
+    # 节点名前缀: 紧跟地址选择问一次, 全部协议统一入口
+    sb_ask_server_name_hook
 
     local DOM="$CERT_DOMAIN"; [[ "${CERT_MODE:-}" == "reality" ]] && DOM="$rnd"
     local pbk sidq urlsec secpin=""
@@ -237,7 +239,7 @@ EOF
     if [[ "$CERT_MODE" == "selfsign" ]]; then
         secpin=$(cert_spki_pin_base64 "$CERT_FILE")
     fi
-    url="$url#$tag"
+    url="$url#$(sb_tag_display "$tag")"
     local utls_fp; utls_fp=$(ask_utls_fingerprint)
     export SB_UTLS_FP="$utls_fp"
     # 公共参数已在服务端那一步问过, 这里只渲染, 不重复提问。

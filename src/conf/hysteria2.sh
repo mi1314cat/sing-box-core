@@ -125,6 +125,8 @@ add_config() {
     print_title "新增 Hysteria2 节点 ($PROTO-NN.json)"
     local server_ip listen_ip listen_port idx
     server_ip=$(ask_server_addr)
+    # 节点名前缀: 紧跟地址选择问一次, 全部协议统一入口
+    sb_ask_server_name_hook
     listen_ip=$(ask_listen_addr)
     listen_port=$(safe_read_port)
     # 端口跳跃: 交互问, 批量读 SB_BATCH_HOP (空=不开)。
@@ -291,7 +293,7 @@ EOF
     fi
     local link="hysteria2://$auth@$server_ip:$listen_port?${hop:+mport=$hop&}sni=$CERT_DOMAIN&obfs=$( [[ $mask != none ]] && echo salamander || echo none )&obfs-password=$( [[ $mask != none ]] && echo $mask )&alpn=h3"
     [[ "$CERT_TRUSTED" == "false" ]] && link="$link&pinSHA256=$pin"
-    link="$link$(sb_ech_link_params)#$tag"
+    link="$link$(sb_ech_link_params)#$(sb_tag_display "$tag")"
     # 简化: 对标准客户端, 自签统一用 insecure=1 提示, 或者 pin=hex (v2rayN 等)
     # 客户端 ech 片段 (内联完整 ECHCONFIGS PEM; 只有 sing-box 客户端认)。
     # 必须在本 heredoc **之前**算好 —— heredoc 展开时变量若还没赋值就是空的。

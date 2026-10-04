@@ -275,6 +275,8 @@ EOF
     sb_reload || true
 
     server_ip=$(ask_server_addr)
+    # 节点名前缀: 紧跟地址选择问一次, 全部协议统一入口
+    sb_ask_server_name_hook
     [[ "$CERT_TRUSTED" == "false" ]] && pin=$(cert_spki_pin_base64 "$CERT_FILE")
     local fp=""; [[ "$CERT_TRUSTED" == "false" ]] && fp=$(cert_fingerprint_hex "$CERT_FILE")
 
@@ -283,11 +285,11 @@ EOF
     local ech_link; ech_link=$(sb_ech_link_params)
     local link
     if [[ "${TLS_TYPE:-tls}" == "reality" ]]; then
-        link="anytls://$password@$server_ip:$listen_port?sni=$CERT_DOMAIN&insecure=0&pbk=$T_RE_PUB&sid=$T_RE_SID"$ech_link"#$tag"
+        link="anytls://$password@$server_ip:$listen_port?sni=$CERT_DOMAIN&insecure=0&pbk=$T_RE_PUB&sid=$T_RE_SID"$ech_link"#$(sb_tag_display "$tag")"
     elif [[ "$CERT_TRUSTED" == "true" ]]; then
-        link="anytls://$password@$server_ip:$listen_port?sni=$CERT_DOMAIN&insecure=0"$ech_link"#$tag"
+        link="anytls://$password@$server_ip:$listen_port?sni=$CERT_DOMAIN&insecure=0"$ech_link"#$(sb_tag_display "$tag")"
     else
-        link="anytls://$password@$server_ip:$listen_port?sni=$CERT_DOMAIN&insecure=1${pin:+&pinSHA256=$pin}"$ech_link"#$tag"
+        link="anytls://$password@$server_ip:$listen_port?sni=$CERT_DOMAIN&insecure=1${pin:+&pinSHA256=$pin}"$ech_link"#$(sb_tag_display "$tag")"
     fi
 
     local utls_fp; utls_fp=$(ask_utls_fingerprint)
