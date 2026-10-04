@@ -911,6 +911,20 @@ sub_start_ephemeral() {
     return 1
 }
 
+# 临时进程模式下用的 pid 文件。不用 pgrep -f: pgrep -f 会把运行面板的
+# 这个 shell 自己也匹配上 —— 脚本正文里就写着 sub_server.py 这个路径 ——
+# 于是永远判定"已在运行", 启动逻辑形同虚设。
+SUB_PID_FILE="${SUB_STATE_DIR}/sub.pid"
+
+sub_server_pid() { # 0=运行中(输出 PID) ; 1=未运行
+    [[ -s "$SUB_PID_FILE" ]] || return 1
+    local p
+    p=$(cat "$SUB_PID_FILE" 2>/dev/null)
+    [[ -n "$p" ]] || return 1
+    kill -0 "$p" 2>/dev/null || { rm -f "$SUB_PID_FILE"; return 1; }
+    printf '%s' "$p"
+}
+
 sub_stop() {
     if sub_unit_installed; then
         systemctl stop "$SUB_UNIT" 2>/dev/null
@@ -957,7 +971,6 @@ sub_status() {
     if [[ "$ST" == "运行中" ]]; then
         printf "  ${CYAN}订阅地址${RESET}  ${DIM}(把这个填进别的设备的「添加订阅」)${RESET}\n"
         printf "    %s\n" "$(sub_url)"
-        printf "    http://%s:%s/sub/%s\n" "$(sub_host_ip)" "$port" "$(sub_token)"
         echo
         printf "  ${DIM}这个地址带 token, 局域网里没有它的人拉不到配置。${RESET}\n"
         printf "  ${DIM}泄露了就在下面「重置 token」换一个新的。${RESET}\n"
