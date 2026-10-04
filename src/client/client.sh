@@ -98,7 +98,6 @@ sb_proxy_apply() { # $1 = 代理地址; 空 = 直连
     fi
 }
 
-
 sb_proxy_show() {
     local f="$SB_PROXY_MODE_FILE" cur="auto"
     [[ -s "$f" ]] && cur=$(head -1 "$f" 2>/dev/null)
@@ -444,7 +443,15 @@ collect_status() {
 node_count() {
     local f="$CLIENT_CONF/90-outbounds.json" n=0
     if [[ -s "$f" ]]; then
-        n=$(jq '[.outbounds[]?|select(.type!="selector" and .type!="urltest" and .type!="direct")]|length' "$f" 2>/dev/null) || n=0
+        # 必须排除被别的 outbound 用 detour 引用的辅助层 (如 shadowtls 的
+        # "<tag>-out"): 那不是独立节点, 用户在界面里也选不到它。
+        # 以前只排除了 selector/urltest/direct, 辅助层被算进去了 ——
+        # 实测 43 个节点的文件, 面板报 44 个可用节点, 一直差这一个。
+        n=$(jq '(.outbounds | map(select(.detour != null) | .detour)) as $dep
+               | [.outbounds[]?
+                  | select(.type!="selector" and .type!="urltest" and .type!="direct")
+                  | select((.tag as $t | $dep | index($t)) == null)] | length'\
+             "$f" 2>/dev/null) || n=0
     fi
     [[ "$n" =~ ^[0-9]+$ ]] || n=0
     echo "$n"
@@ -913,56 +920,52 @@ subs_menu() {
             i=$((i+1))
         done < <(jq -r '.subs[]?|[.id,.name,.prefix,(.nodes|tostring),.url]|@tsv' "$SUBS_FILE" 2>/dev/null)
         echo
-        printf "  ${CYAN}%d)${RESET} 补登记未登记的节点组 (把已有节点按前缀建成订阅)${RESET}\n" "$i"
-        i=$((i+1)); printf "  ${CYAN}%d)${RESET} 更新全部订阅\n" "$i"
-        printf "  ${CYAN}%d)${RESET} 只删某订阅的节点 (${DIM}保留订阅, 之后可再更新拉回)${RESET}\n" "$((i+1))"
-        printf "  ${YELLOW}%d)${RESET} ${YELLOW}删除某订阅${RESET} (连订阅记录和 URL 一起删)${RESET}\n" "$((i+2))"
-        printf "  ${RED}0)${RESET} 返回\n"
-        # 菜单上显示成连续编号: 1..N 是订阅, N+1 更新选中, N+2 删除选中,
-        # N+3 更新全部, 0 返回。
-        # 之前这里显示的是 "2]U) 2]D) 2]A)" —— $i 是循环结束后的值, 三行
-        # 全打成同一个数字, 看着像坏掉的索引; 而派发却只认字母, 输 2 反而
-        # 报"无法识别的操作"。显示和实际接受的东西对不上。
-        # 菜单编号:
-        #   1..N        更新这一条 (最常用, 做成最顺手)
-        #   N+1         更新全部
-        #   N+2         只删这一条的**节点**, 保留订阅记录
-        #   N+3         删这一条的**订阅**(连记录和 URL 一起没)
-        #   0           返回
-        # N+2 和 N+3 必须分开: 服务器重置 / 订阅过期, 想先把节点清掉但留着
-        # URL, 之后点"更新"就能重拉; 连记录一起删的话 URL 就没了, 得重新填。
-        local nsub="$n" c sel sid
-        local a_reg=$((nsub+1)) a_all=$((nsub+2)) a_deln=$((nsub+3)) a_dels=$((nsub+4))
-        local top=$a_dels
-        read -r -p "  请输入操作 [0-$top]: " c || { echo; return 0; }
-        c="${c// /}"
-        [[ -z "$c" || "$c" == "0" ]] && return 0
-        if ! [[ "$c" =~ ^[0-9]+$ ]] || (( c > top )); then
-            print_err "请输入编号 (0-$top)"; continue
+        echo
+        # 两段式, **两套互不影响的数字编号**:
+        #
+        #   第一步  订阅编号 1..N  —— 选哪一条订阅
+        #   第二步  操作编号 1..5  —— 对它做什么 (编号固定)
+        #
+        # 以前是把操作项接在订阅数后面 (N+1/N+2/...), 删掉一个订阅就整体
+        # 往前挪一位: 记熟的"6 = 只删节点"变成 5, 按记忆操作会删错东西。
+        # 用户报的原话是"上面的列表和下面的菜单共用一个序列"。
+        # 拆成两段后, 订阅增减完全不影响操作编号。
+        #
+        # 第二步支持直接回车 = 1 (更新), 这是最常用的操作, 不用多按一次。
+        local nsub="$n" sel sid act nm
+        read -r -p "  请输入订阅编号 [1-$nsub], 0 返回: " sel || { echo; return 0; }
+        sel="${sel// /}"
+        [[ -z "$sel" || "$sel" == "0" ]] && return 0
+        if ! [[ "$sel" =~ ^[0-9]+$ ]] || (( sel < 1 || sel > nsub )); then
+            print_err "请输入 1-$nsub 之间的编号"; continue
         fi
-        if [[ "$c" == "$a_reg" ]]; then sub_backfill; continue; fi
-        if [[ "$c" == "$a_all" ]]; then sub_update_all; continue; fi
-        # 带参数的两个动作要先问是哪一条
-        if [[ "$c" == "$a_deln" || "$c" == "$a_dels" ]]; then
-            read -r -p "  哪一条订阅? 编号 [1-$nsub]: " sel || { echo; continue; }
-            sel="${sel// /}"
-            [[ "$sel" =~ ^[0-9]+$ ]] || { print_err "请输入 1-$nsub"; continue; }
-            sid=$(jq -r --argjson i "$sel" '(.subs//[])[$i-1].id // empty' "$SUBS_FILE" 2>/dev/null)
-            [[ -n "$sid" ]] || { print_err "没有编号 $sel"; continue; }
-            # 删节点/删订阅都会改写 90-outbounds.json (分组要重算),
-            # 必须 apply_change 重启, 否则运行中的内核还拿着旧配置,
-            # 界面上的分组看着没变。
-            if [[ "$c" == "$a_deln" ]]; then
-                sub_delete_nodes "$sid" && apply_change "节点已删除"
-            else
-                sub_delete_one "$sid" && apply_change "订阅已删除"
-            fi
-            continue
-        fi
-        # 1..N: 更新这一条
-        sid=$(jq -r --argjson i "$c" '(.subs//[])[$i-1].id // empty' "$SUBS_FILE" 2>/dev/null)
-        [[ -n "$sid" ]] || { print_err "没有编号 $c"; continue; }
-        sub_update_one "$sid" && regen_selector && apply_change "订阅已更新"
+        sid=$(jq -r --argjson i "$sel" '(.subs//[])[$i-1].id // empty' "$SUBS_FILE" 2>/dev/null)
+        [[ -n "$sid" ]] || { print_err "没有编号 $sel"; continue; }
+        nm=$(jq -r --argjson i "$sel" '(.subs//[])[$i-1].name // empty' "$SUBS_FILE" 2>/dev/null)
+
+        echo
+        printf "  ${CYAN}已选订阅 %d: %s${RESET}\n" "$sel" "$nm"
+        printf "   ${CYAN}1)${RESET} 更新这条订阅\n"
+        printf "   ${CYAN}2)${RESET} ${CYAN}只删这条的节点${RESET} ${DIM}(保留订阅, 之后可更新拉回)${RESET}\n"
+        printf "   ${YELLOW}3)${RESET} ${YELLOW}删除这条订阅${RESET} ${DIM}(连记录和 URL 一起删)${RESET}\n"
+        printf "   ${CYAN}4)${RESET} 更新全部订阅\n"
+        printf "   ${CYAN}5)${RESET} 补登记未登记的节点组\n"
+        printf "   ${RED}0)${RESET} 返回\n"
+        local act; read -r -p "  请选择 [1-5, 直接回车=更新, 0 返回]: " act || { echo; continue; }
+        act="${act// /}"
+        [[ -z "$act" ]] && act=1
+        [[ "$act" == "0" ]] && continue
+        case "$act" in
+            1) sub_update_one "$sid" && regen_selector && apply_change "订阅已更新" ;;
+            2)
+                # 只删节点, 订阅记录留着 —— 服务器重置 / 订阅过期时用,
+                # 之后还能"更新"重新拉回来。
+                sub_delete_nodes "$sid" && apply_change "节点已删除" ;;
+            3) sub_delete_one "$sid" && apply_change "订阅已删除" ;;
+            4) sub_update_all ;;
+            5) sub_backfill ;;
+            *) print_err "请输入 0-5" ;;
+        esac
     done
 }
 
@@ -1263,9 +1266,25 @@ list_nodes() {
     local f tag typ srv
     for f in "$CLIENT_NODE_DIR"/node-*.json; do
         [[ -f "$f" ]] || continue
-        tag=$(basename "$f" .json | sed 's/^node-//')
-        typ=$(jq -r '.outbounds[0].type // "?"' "$f" 2>/dev/null)
-        srv=$(jq -r '.outbounds[0]|((.server//"-")+":"+((.server_port//"-")|tostring))' "$f" 2>/dev/null)
+        # 一个节点文件里可能有多个 outbound, 比如 shadowtls 的外层 vless
+        # 和被它 detour 引用的内层 "<tag>-out"。内层不是独立节点, 界面上
+        # 也选不到, 以前这里取 .outbounds[0] 恰好会读到内层 —— 表现为
+        # 文件叫 rn-shadowtls01-TLS.json, 列表里却显示 rn-shadowtls01-TLS-out,
+        # 而且"共 N 个可用节点"凭空多一个。改成: 有 detour 依赖的取剩下的那个。
+        local -a tgs
+        mapfile -t tgs < <(jq -r '
+            (.outbounds // []) as $o
+            | ($o | map(select(.detour != null) | .detour)) as $dep
+            | ($o | map(select((.tag as $t | $dep | index($t)) != null) | .tag)) as $inner
+            | $o[0].tag as $first
+            | if (($o | length) > 1 and ($inner | index($first)) != null)
+              then ($o | map(select((.tag as $t | $dep | index($t)) == null))[0].tag)
+              else $first end' "$f" 2>/dev/null)
+        tag="${tgs[0]:-}"
+        [[ -n "$tag" ]] || continue
+        typ=$(jq -r --arg t "$tag" '.outbounds[]?|select(.tag==$t)|.type // "?"' "$f" 2>/dev/null | head -1)
+        srv=$(jq -r --arg t "$tag" '.outbounds[]?|select(.tag==$t)
+                |((.server//"-")+":"+((.server_port//"-")|tostring))' "$f" 2>/dev/null | head -1)
         NODE_LIST+="$tag"$'\t'"$typ"$'\t'"$srv"$'\n'
     done
     [[ -n "$NODE_LIST" ]]
@@ -1281,6 +1300,7 @@ print_nodes() {
     printf "  ${CYAN}%4s  %-44s %-13s %s${RESET}\n" "序号" "节点名" "类型" "地址"
     printf "  %s\n" "────────────────────────────────────────────────────────"
     while IFS=$'\t' read -r tag typ srv; do
+        [[ -n "$tag" ]] || continue
         printf "  %4d  %-44s %-13s %s\n" "$i" "$tag" "$typ" "$srv"
         i=$((i+1))
     done <<< "$NODE_LIST"
