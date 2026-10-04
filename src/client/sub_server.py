@@ -95,8 +95,34 @@ def load_config(confdir, with_tun=False):
 
     if with_tun:
         merged["inbounds"] = [dict(TUN_INBOUND)]
-        rules = merged.setdefault("route", {}).setdefault("rules", [])
-        _fix_rules_for_tun(rules)
+        route = merged.setdefault("route", {})
+        _fix_rules_for_tun(route.setdefault("rules", []))
+
+        # 防路由回环 —— Android 上必须同时开这两个。
+        #
+        # auto_detect_interface 的官方说明是
+        #   "Only supported on Linux, Windows and macOS."
+        # 也就是说**它在 Android 上是空转的**, 而它恰恰是 Linux 上防回环
+        # 的唯一手段。结果就是 sing-box 连代理节点的出站被 Android 的
+        # VpnService 抓回 VPN -> 回到 TUN -> route.final=PROXY -> 再连代理
+        # -> 再回 TUN, 无限循环。
+        #
+        # 症状很有辨识度: VPN 图标正常出来, 但一个网页都打不开, 连接列表
+        # 里反复出现同一个失败连接然后消失。App 内的"测速"不走 TUN 路由,
+        # 所以节点延迟一切正常 —— 正是"测速能过但实际不通"的成因。
+        #
+        # override_android_vpn 的官方说明是
+        #   "Only supported on Android.
+        #    Accept Android VPN as upstream NIC when auto_detect_interface enabled."
+        # 作用是让 sing-box 把 Android 的 VPN 接口当作上游真实网卡来绑定
+        # 出站, 出站因此走物理网络而不是回灌 TUN。
+        #
+        # 注意: 这两个字段是配对的。override_android_vpn 只在
+        # auto_detect_interface 启用时才有意义, 所以两个一起设, 且
+        # auto_detect_interface 必须保持 true (它的作用是在 Android 上
+        # 作为 override_android_vpn 的前置开关)。
+        route["auto_detect_interface"] = True
+        route["override_android_vpn"] = True
 
     return json.dumps(merged, ensure_ascii=False, indent=2).encode("utf-8")
 
