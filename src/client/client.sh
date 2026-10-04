@@ -662,9 +662,9 @@ for sb in subs:
     if not pre: continue
     gt=[t for t in tags if t.startswith(pre+"-")]
     if not gt: continue
-    groups.append([sb.get("name") or pre, gt]); matched.update(gt)
+    groups.append([sb.get("name") or pre, gt, False]); matched.update(gt)
 rest=[t for t in tags if t not in matched]
-if rest: groups.append(["其它", rest])
+if rest: groups.append(["其它", rest, True])  # 末尾 True = 不是订阅组, 只是收容
 
 def gtag(name):
     # 组 tag 必须是唯一且不与节点 tag 撞; 去掉非 ASCII 字符 (国旗等)
@@ -672,12 +672,19 @@ def gtag(name):
     if t in seen or t in tags: t="G-"+t
     seen.add(t); return t
 
-# 只有一组时不再套一层 —— 那样 PROXY 里只剩一项, 纯属多绕一层。
-# 没有订阅记录的老用户也走这条路, 行为和改动前完全一致。
-use_groups = len(groups)>1
+# 只要**有**订阅记录就建组, 跟订阅是一条还是多条无关。
+# 之前写的是 len(groups)>1 才分组, 理由是"只有一组时 PROXY 里就剩一项, 纯属
+# 多绕一层"。这个判断是错的: 用户删光订阅再重加一条, 就掉进平铺分支, 界面上
+# 看不到任何组 —— 报的原话是"我没有看见我这个新订阅的组"。
+# 多绕一层的代价是点一下才能进组; 少一层的代价是整条需求消失。取舍很清楚。
+#
+# 真正该平铺的只有一种情况: **一条订阅都没登记** —— 此时所有节点都是手动加的
+# (简易 HTTP/SOCKS 之类), 本来就没有"订阅"这个概念可分组。
+# 有**真正的订阅**才建组。「其它」是收容组, 不算订阅。
+use_groups = any(not g[2] for g in groups)
 if use_groups:
     gsel=[]
-    for name,gt in groups:
+    for name,gt,_isother in groups:
         g=gtag(name)
         gsel.append({"type":"selector","tag":g,"outbounds":gt,"default":gt[0]})
     proxy_items=[g["tag"] for g in gsel]
@@ -1801,7 +1808,10 @@ show_panel() {
         5) subs_menu ;;
         6) del_node_menu && apply_change "节点已删除" ;;
         7) del_all_nodes && apply_change "节点已全部删除" ;;
-        8) regen_selector; print_nodes ;;
+        # 纯查看, 不要在这里 regen_selector: 它只重写 90-outbounds.json 而不重启,
+        # 会造出"配置文件里已有分组、运行实例里还是旧的"这种状态 ——
+        # 用户看界面没组, 打开配置文件却有。列出节点不该有副作用。
+        8) print_nodes ;;
         9) update_node && apply_change "节点更新" ;;
         10) do_start && sleep 1 ;;
         11) do_stop ;;
