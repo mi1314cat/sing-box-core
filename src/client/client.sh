@@ -949,7 +949,14 @@ subs_menu() {
             [[ "$sel" =~ ^[0-9]+$ ]] || { print_err "请输入 1-$nsub"; continue; }
             sid=$(jq -r --argjson i "$sel" '(.subs//[])[$i-1].id // empty' "$SUBS_FILE" 2>/dev/null)
             [[ -n "$sid" ]] || { print_err "没有编号 $sel"; continue; }
-            if [[ "$c" == "$a_deln" ]]; then sub_delete_nodes "$sid"; else sub_delete_one "$sid"; fi
+            # 删节点/删订阅都会改写 90-outbounds.json (分组要重算),
+            # 必须 apply_change 重启, 否则运行中的内核还拿着旧配置,
+            # 界面上的分组看着没变。
+            if [[ "$c" == "$a_deln" ]]; then
+                sub_delete_nodes "$sid" && apply_change "节点已删除"
+            else
+                sub_delete_one "$sid" && apply_change "订阅已删除"
+            fi
             continue
         fi
         # 1..N: 更新这一条
@@ -1055,8 +1062,12 @@ print("\n".join(out))
         added=$((added+1))
     done
     (( added > 0 )) || { print_msg "没有需要补登记的 (都已有订阅记录)"; return 0; }
-    regen_selector
-    print_ok "补登记 $added 个分组, 已重建 PROXY"
+    # 必须 apply_change (重启), 不能只 regen_selector。
+    # regen_selector 只重写 90-outbounds.json, 运行中的内核还拿着旧配置 ——
+    # 配置文件里 PROXY 已经是 3 个组了, 但 Clash API (Web UI 读的就是它)
+    # 仍然返回旧的 ["mysub","其它"], 自家那 29 个节点在界面里全落在「其它」。
+    # 这个坑踩过: 提示写着"已重建 PROXY", 实际界面没变。
+    regen_selector && apply_change "分组已重建"
 }
 
 # 只删节点, **保留订阅记录**。
