@@ -124,6 +124,42 @@ def load_config(confdir, with_tun=False):
         route["auto_detect_interface"] = True
         route["override_android_vpn"] = True
 
+        # DoH 必须显式声明走物理网络, 否则在 Android 上必然死锁。
+        #
+        # 日志证据(用户手机 debug 级别, 关键特征):
+        #   inbound/tun[tun-in]: inbound DNS packet from 172.19.0.1:5663
+        #   dns: exchange incoming.telemetry.mozilla.org. IN A
+        #   <--- 之后什么都没有, 全程没有一条 outbound/ 日志
+        #
+        # 链条: TUN 接管全部流量 -> hijack-dns 接管 DNS -> 要解析域名就得连
+        # 1.1.1.1:443(DoH) -> **这个 DoH 连接本身也是 sing-box 的出站**
+        # -> 同样被 Android VpnService 抓回 VPN -> 回到 TUN -> 又要解析域名
+        # -> 死锁。日志停在 exchange 再无进展, 正是因为连出站那一步都没走到。
+        #
+        # 这和普通流量回环是两码事: override_android_vpn 管的是 route.rules
+        # 选出来的 outbound; 而 DoH 走 DNS 模块自己的 dialer, 默认等价于
+        # 一个**空的 direct** —— 那个 direct 在 Android 上一样被 VPN 抓走。
+        # 官方原话:
+        #   "The new one uses dialer just like outbound, which is equivalent
+        #    to using an empty direct outbound by default."
+        #
+        # 修法是给 DNS 上游加 network_strategy:
+        #   network_strategy
+        #     Only supported in graphical clients on Android and Apple
+        #     platforms with auto_detect_interface enabled.
+        #     default / hybrid / fallback
+        #   network_type: wifi / cellular / ethernet / other
+        # 明确是给 Android 图形客户端设计的 —— 让出站**按物理网络类型**走
+        # 而不是按路由表, 因为路由表已经被 auto_route 改成全指向 TUN。
+        # hybrid = 所有可用网络并发连接谁先通用谁, 走动时 wifi 切蜂窝不会卡住。
+        dns = merged.get("dns")
+        if isinstance(dns, dict):
+            for srv in dns.get("servers", []):
+                # 只给真正要出网的上游加; local/hosts 没有 dial 阶段
+                if srv.get("type") in ("https", "quic", "tls", "h3",
+                                       "http", "tcp", "udp"):
+                    srv["network_strategy"] = "hybrid"
+
     return json.dumps(merged, ensure_ascii=False, indent=2).encode("utf-8")
 
 
