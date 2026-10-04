@@ -746,6 +746,9 @@ apply_change() { # $1=说明 ; 0=成功
 add_node() {
     local src="$1"
     [[ -n "$src" ]] || { print_err "用法: client.sh add <share-url|本地配置文件>"; return 1; }
+    # 本次导入的节点 tag, 供后面反推订阅前缀。必须在每次 add_node 开头清空 ——
+    # 否则上一批的 tag 会混进来, 前缀取错。
+    IMPORTED_TAGS=""
     local tmp; tmp=$(mktemp "$CLIENT_ROOT/share-state/.import.XXXXXX.json")
     if [[ "$src" =~ ^https?:// ]]; then
         # 拉分享链接同样会卡: 服务端在境外/被墙时直连就是干等 30 秒超时。
@@ -851,6 +854,7 @@ add_node() {
         local n=0 t tags
           tags=$(jq -r "$HELPER_JQ | .tag" "$tmp" 2>/dev/null)
         for t in $tags; do
+            IMPORTED_TAGS="$IMPORTED_TAGS $t"
             [[ -n "$t" ]] || continue
               # 必须连 detour 依赖一起切出来。
               # shadowtls 是两层结构: shadowsocks(tag=X) detour→ shadowtls(tag=X-out, 带
@@ -877,19 +881,37 @@ add_node() {
         print_ok "已导入 $n 个节点 (单个链接全量分享); 现 $(node_count) 个可用节点"
     fi
 
-    # 自家 share 的登记补在这里 (外部订阅在转换分支里已经登记过了)。
-    # 前缀从**刚落盘的节点名**里取 —— 单节点/多节点两条路径落盘后
-    # 第一个 tag 都带同一个服务端前缀, 这里用它反过来建订阅记录。
+    # 自家 share 的登记 (外部订阅在转换分支里已经登记过了)。
+    #
+    # 顺序是关键: **先登记, 再重建配置**。
+    # 以前这段在 regen_selector **之后**, 于是 regen_selector 跑的时候
+    # subscriptions.json 里还没有这条订阅, 那批新节点匹配不到任何 prefix,
+    # 全掉进「其它」组。菜单层随后 apply_change 重启, 用的是那份"还没有
+    # 订阅记录"的配置 —— 表现就是"新加的订阅跑到其它组里去了", 而注册表里
+    # 明明清清楚楚写着这条订阅的 prefix。用户的原话是"它为什么会变到其他
+    # 组里面? 很奇怪"。
     if [[ -n "${PENDING_SUB_URL:-}" ]]; then
         local _sid _pre
-        _pre=$(list_nodes 2>/dev/null | awk -F'\t' '{print $1}' | sort | head -1)
-        _pre="${_pre%%-[^-]*}"
+        # 前缀必须和节点名里的完全一致。不能用"砍掉最后一段"来猜:
+        # der-anytls01-TLS -> der-anytls01, 和 der-vless01-TLS-CDN ->
+        # der-vless01-TLS 对不上, 同一个订阅会散成好几堆 (补登记那边已经踩过)。
+        # 取所有 tag 里出现次数最多的第一段 —— 服务端生成的节点名都以
+        # "<服务器标识>-<协议>-<模式>" 开头, 第一段就是订阅前缀。
+        # 前缀只能从**本次导入**的节点名里取, 不能扫全部节点。
+        # 扫全量在"老节点已经存在"时会取错: rn 和 der 各出现一次时按字母序
+        # 挑到 rn, 于是新加的 der 被登记成前缀 rn, 配置里 der-* 匹配不上,
+        # 还是掉进「其它」。
+        _pre=$(printf '%s' "${IMPORTED_TAGS:-}" | tr ' ' '\n' | grep -E '^[^-]+-' \
+               | cut -d- -f1 | sort | uniq -c | sort -rn | head -1 | awk '{print $2}')
         if [[ -n "$_pre" ]]; then
             _sid=$(subs_id "$PENDING_SUB_URL")
+            # 已经登记过就别重复写 (更新订阅时会再走一遍这里)。
             [[ -n "$(subs_get "$_sid")" ]] || \
                 subs_register "$PENDING_SUB_URL" self "$_pre"
         fi
         unset PENDING_SUB_URL
+        # 登记完必须重建: 上面 regen_selector 生成配置时这条订阅还不存在。
+        regen_selector
     fi
 }
 
@@ -897,6 +919,7 @@ import_one_outbound() {
     local tmp="$1" tag
     tag=$(jq -r '.outbounds[0].tag // empty' "$tmp" 2>/dev/null)
     [[ -n "$tag" ]] || { rm -f "$tmp"; print_err "配置无 outbound"; return 1; }
+    IMPORTED_TAGS="$IMPORTED_TAGS $tag"
     jq '{outbounds}' "$tmp" > "$CLIENT_NODE_DIR/node-$tag.json"
     echo "$IF_SOURCE" > "$CLIENT_NODE_DIR/node-$tag.txt"
     echo "{\"tag\":\"$tag\",\"source\":\"share\",\"imported_at\":\"$(date -Is)\"}" > "$CLIENT_NODE_DIR/node-$tag.meta"
@@ -977,22 +1000,54 @@ subs_menu() {
 }
 
 sub_update_one() {
-    local sid="$1" url pre nm
+    local sid="$1" url pre nm rc
     url=$(subs_get "$sid" | jq -r '.url // empty')
     [[ -n "$url" ]] || { print_err "订阅记录异常 (无 URL)"; return 1; }
     pre=$(subs_get "$sid" | jq -r '.prefix // empty')
     nm=$(subs_get "$sid" | jq -r '.name // empty')
     print_msg "更新订阅「$nm」..."
-    # 该订阅带的节点先删掉, 否则改名后的节点会变成孤儿。
+
+    # 先备份旧节点, **拉取成功才替换**。
+    #
+    # 以前是"先删该前缀的节点 -> 再拉", 看起来干净 (避免改名后的孤儿节点),
+    # 但链接失效时拉不回来, 旧节点已经被删了 —— 订阅记录还在, 节点却归零,
+    # 而且没法从面板恢复 (只能重新导入 URL, 而它是 max_uses=1 的分享链接,
+    # 用过一次就废了)。实测就把自己 13 个 rn 节点弄没了。
+    # 分享链接本来就用一次就失效, 这个顺序等于把用户的节点押在"下次还能拉到"
+    # 这个假设上, 而那个假设不成立。
+    local bdir; bdir=$(mktemp -d "$CLIENT_ROOT/share-state/.upd.XXXXXX")
+    local -a old=()
     local t
-    for t in $(grep -lF "${pre}-" "$CLIENT_NODE_DIR"/node-*.json 2>/dev/null); do
-        rm -f "${t%.json}".*
+    for t in "$CLIENT_NODE_DIR"/node-"$pre"-*; do
+        [[ -f "$t" ]] || continue
+        old+=("$t")
     done
+    if (( ${#old[@]} > 0 )); then
+        for t in "${old[@]}"; do cp -f "$t" "$bdir/"; done
+    fi
+
     # 必须用 export 而不是 `VAR=x func` 前置赋值: bash 里那种写法只在函数
     # 执行期间让该变量临时可见, 但 add_node 内部再调的其它函数看不到它,
     # 会退回"询问前缀"分支 —— 更新订阅时又弹一次前缀输入, 前缀就丢了。
     export SB_SUBS_PREFIX="$pre"
-    add_node "$url"
+    if add_node "$url"; then
+        # 拉取成功, 旧节点清理掉残留的 (服务端改名过的那些)
+        for t in "${old[@]}"; do [[ -f "$t" ]] && rm -f "$t"; done
+        rc=0
+    else
+        # 失败: 恢复旧节点, 一个都不能少
+        if (( ${#old[@]} > 0 )); then
+            for t in "$bdir"/*; do
+                [[ -f "$t" ]] || continue
+                cp -f "$t" "$CLIENT_NODE_DIR/"
+            done
+            print_warn "拉取失败, 已还原该订阅原有的 ${#old[@]} 个节点"
+        fi
+        rc=1
+    fi
+    unset SB_SUBS_PREFIX
+    rm -rf "$bdir"
+    return $rc
 }
 
 sub_update_all() {
