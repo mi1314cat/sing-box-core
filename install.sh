@@ -356,6 +356,11 @@ do_client() {
     mkdir -p "$CLI_ROOT"/{conf,core,nodes,share-state,ui} /usr/local/bin || die "目录创建失败"
     cp -f "$SRC_DIR/src/client/client.sh" /usr/local/bin/sb-client || die "复制失败"
     chmod +x /usr/local/bin/sb-client
+    # 订阅格式转换器 (base64 / vless:// / mihomo YAML -> sing-box JSON)。
+    # 与 client.sh 分开存: 它是给用户机器上的 python3 跑的, 塞进 sb-client
+    # 会让那个文件凭空多几百行, 而且没法单独更新。
+    mkdir -p "$CLI_ROOT/share-state"
+    cp -f "$SRC_DIR/src/client/to_sb.py" "$CLI_ROOT/share-state/to_sb.py" 2>/dev/null || true
     ok "项目文件"
     if [[ ! -x "$CLI_ROOT/core/sing-box" ]]; then
         info "正在安装 Sing-box 内核..."

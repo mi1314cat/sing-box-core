@@ -798,6 +798,56 @@ bash src/client/client.sh service          # 只安装/更新 systemd unit
 bash src/client/client.sh install-ui       # metacubexd (Clash API UI)
 ```
 
+### 节点的三种来源
+
+面板的「添加节点」不只认自家 share 服务给的 sing-box JSON，它会**先识别格式再转换**，
+以下都能直接喂进去：
+
+| 格式 | 例子 | 处理方式 |
+|------|------|----------|
+| sing-box JSON | 自家 `share/<token>` | 内核直接认，原样导入 |
+| base64 订阅 | 整份 base64，解开是一堆 URI | 解码后逐条转 |
+| 明文 share URI | 一行一个 `vmess://` `vless://` `trojan://` `ss://` | 逐条转 |
+| mihomo YAML 片段 | `- name: Browser-Dialer` + `type: socks5` … | 取 proxies 转 |
+| mihomo 整份 YAML | 含 `proxies:` 段 | 只取 proxies，忽略 rules |
+
+转换器是 `src/client/to_sb.py`，安装时复制到客户端的 `share-state/to_sb.py`。
+只用标准库，PyYAML 有就用、没有就降级到内置的平铺 YAML 解析器（用户手贴的
+片段本来就是平铺的，够用）。识别不了的条目**跳过并计数，不猜**。
+
+支持的协议：vless / vmess / trojan / shadowsocks / socks5 / http / hysteria2 /
+tuic / anytls / snell / wireguard。
+
+**外部订阅一律加前缀。** 订阅里的节点名多半是裸的（`anytls01-TLS`），不加前缀
+就会和自己的节点重名 —— 重名的后果是静默覆盖旧的、面板还报 `[OK]`。面板会先问
+前缀，默认从域名猜（`sub.example.com` → `sub`），回车即用，也可以自己输入。
+
+### 订阅管理
+
+外部订阅会登记进 `subscriptions.json`，「订阅管理」页可以**列出 / 更新 / 删除**：
+
+- 更新 = 重拉该订阅并**重建它名下的节点**（先删旧节点，否则改名后会留下孤儿）
+- 删除订阅 = 连同它的节点一起删
+
+### 简易 HTTP / SOCKS 节点
+
+客户端机器上常还跑着别的内核（mihomo / sing-box / v2ray），想让本客户端把它们
+当成**出站**用 —— 在 `PROXY` 选择器里多一个选项，选它就走那个端口出去。
+
+```bash
+# 菜单 4, 或者
+{"type":"socks","tag":"...","server":"127.0.0.1","server_port":1080}
+{"type":"socks","tag":"...","server":"...","server_port":1080,"username":"u","password":"p"}
+{"type":"http","tag":"...","server":"...","server_port":8080}
+```
+
+- **目标地址默认 `127.0.0.1`** —— 链本机上另一个内核是最常见用法；接别的机器直接输入 IP/域名
+- **用户名 / 密码留空 = 不认证**（就不写进配置）；填了就两个一起写入
+- 端口做 1–65535 校验：`sing-box check` 放行 `server_port: 0`（语法合法、运行时才炸），这种错提前拦
+
+> 这是**出站**（客户端主动连出去），不是在本机开一个 socks 入站端口给别人连 ——
+> 后者是 mixed-port `:2080` 的事，两者方向相反。
+
 - 端点：HTTP + SOCKS5 同口 **`:2080`**，LAN 设备直接填这个地址
 - Clash API `:19090`（secret 保护）；metacubexd UI `http://<client-ip>:19090/ui/`
 - 多节点 = selector `PROXY` + urltest `AUTO`（`final=PROXY`）

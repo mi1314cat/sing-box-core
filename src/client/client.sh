@@ -136,6 +136,13 @@ PORT_CLASH="${PORT_CLASH:-19090}"                        # 避碰: mihomo/clash 
 BIND_LAN="${BIND_LAN:-0.0.0.0}"                          # LAN 支持; 127.0.0.1=仅本机
 CLASH_LISTEN="${CLASH_LISTEN:-0.0.0.0}"                  # LAN Web UI(ui 由 secret 保护)
 CLASH_SECRET_FILE="${CLASH_SECRET_FILE:-$CLIENT_ROOT/.clash-secret}"
+# 订阅注册表: 记录每个订阅的 来源URL / 前缀 / 节点数, 供"订阅管理"页用。
+# 以前只有节点级的 node-<tag>.txt 记着来源 URL, 没有"这是一条订阅"的概念,
+# 所以既列不出订阅、也没法只更新某一条 —— update_node 只能把所有来源挨个
+# 重拉一遍, 用户根本不知道自己在更新什么。
+SUBS_FILE="${SUBS_FILE:-$CLIENT_ROOT/subscriptions.json}"
+# 订阅格式转换器 (install.sh 随 client.sh 一起复制过来)
+SB_TO_SB="${SB_TO_SB:-$CLIENT_ROOT/share-state/to_sb.py}"
 
 # ---------- DNS (防泄露) ----------
 # 目标: 客户端所有域名解析都走代理, 不给"明文 53 走直连"留口子。
@@ -160,7 +167,12 @@ SB_UNIT_ADHOC="sb-client-adhoc" # 临时 unit (仅当未安装常驻 unit 时)
 # 这里统一用 printf %b 归一化成真正的 ESC 字节, 否则作为 printf 参数传入时会原样打印
 _c(){ printf '%b' "$1"; }
 RED="$(_c "${RED:-\e[31m}")"; GREEN="$(_c "${GREEN:-\e[32m}")"; YELLOW="$(_c "${YELLOW:-\e[33m}")"
-CYAN="$(_c "${CYAN:-\e[96m}")"; RESET="$(_c "${RESET:-\e[0m}")"
+CYAN="$(_c "${CYAN:-\e[96m}")"; RESET="$(_c "${RESET:-\e[0m]}")"
+# 暗色 (分组小标题用)。服务端 lib.sh 有 DIM, 客户端此前没有, 菜单分组一加
+# 分组一加就撞上 DIM: unbound variable —— set -u 下菜单直接不显示。
+# 用单引号把转义序列原样交给 _c 去 printf %b 还原; 写成双引号时 ${...:-...}
+# 的默认值会在参数展开阶段被当成 glob, 把这一行截断。
+DIM="$(_c "${DIM:-\e[2m}")"; BOLD="$(_c "${BOLD:-\e[1m]}")"
 print_msg(){ printf "${CYAN}[SB-Client] %s${RESET}\n" "$1" >&2; }
 print_ok(){ printf "${GREEN}[OK]   %s${RESET}\n" "$1" >&2; }
 print_warn(){ printf "${YELLOW}[WARN] %s${RESET}\n" "$1" >&2; }
@@ -626,8 +638,64 @@ add_node() {
         cp "$src" "$tmp" || { rm -f "$tmp"; print_err "无法读取 $src"; return 1; }
         export IF_SOURCE="$src"
     fi
+    # ---- 格式识别 ----
+    # 自家 share 返回的就是 sing-box JSON, 内核直接认; 别人的订阅五花八门
+    # (base64 包着的 vless://、mihomo YAML ...), 得先转一道。
+    # 不转直接喂内核必然失败, 而报的是 "decode config" —— 用户完全看不出
+    # 自己拉到的其实是另一种格式。
     if ! "$CLIENT_BIN" check -c "$tmp" >/dev/null 2>&1 && ! "$CLIENT_BIN" check "$tmp" >/dev/null 2>&1; then
-        rm -f "$tmp"; print_err "sing-box check 失败, 旧配置未变"; return 1
+        if [[ ! -s "$SB_TO_SB" ]]; then
+            rm -f "$tmp"
+            print_err "缺少格式转换器 $SB_TO_SB (重新执行安装脚本即可补上)"
+            return 1
+        fi
+        command -v python3 >/dev/null 2>&1 || {
+            rm -f "$tmp"; print_err "导入外部订阅需要 python3"; return 1; }
+
+        # 外部订阅一律加前缀。它内部的节点名多半是裸的 (anytls01-TLS 这种),
+        # 不加前缀就会和我们自己的节点重名 —— 而重名的后果是静默覆盖旧的、
+        # 面板还报 [OK] 已导入。用户可以自己指定, 回车用猜出来的。
+        local prefix="" sp
+        if [[ "$src" =~ ^https?:// ]]; then
+            local guess; guess=$(subs_guess_prefix "$src")
+            if [[ -n "${SB_SUBS_PREFIX:-}" ]]; then
+                sp="$SB_SUBS_PREFIX"
+            else
+                read -r -p "  这条订阅的节点名前缀 (默认 $guess): " sp || { echo; rm -f "$tmp"; return 1; }
+                sp="${sp// /}"
+                [[ -z "$sp" ]] && sp="$guess"
+            fi
+            sp=$(printf '%s' "$sp" | tr -c 'A-Za-z0-9._-' '-' | sed 's/^-*//;s/-*$//' | cut -c1-24)
+            [[ -n "$sp" ]] || sp="$guess"
+            prefix="$sp"
+        fi
+
+        local conv="$CLIENT_ROOT/share-state/.conv.json" cerr="$CLIENT_ROOT/share-state/.conv.err"
+        # 用数组传参, 别用 ${prefix:+--prefix "$prefix"} —— 那种写法不加引号,
+        # 会被分词成多个参数, 前缀里有空格就彻底错位。
+        local cargs=("$tmp")
+        [[ -n "$prefix" ]] && cargs+=(--prefix "$prefix")
+        python3 "$SB_TO_SB" "${cargs[@]}" > "$conv" 2>"$cerr"
+        local rep; rep=$(cat "$cerr" 2>/dev/null)
+        if [[ ! -s "$conv" ]] || [[ "$(jq '.outbounds|length' "$conv" 2>/dev/null || echo 0)" == "0" ]]; then
+            rm -f "$tmp"; print_err "无法识别的订阅格式"
+            [[ -n "$rep" ]] && print_msg "${rep}"
+            return 1
+        fi
+        local fmt cnt
+        fmt=$(printf '%s' "$rep" | sed -n 's/.*格式=\([^ ]*\).*/\1/p')
+        cnt=$(jq '.outbounds|length' "$conv" 2>/dev/null || echo 0)
+        print_ok "识别为 ${fmt:-未知} 格式, 转换出 $cnt 个节点"
+        mv -f "$conv" "$tmp"
+
+        # 登记订阅, 供「订阅管理」页列出/更新
+        if [[ -n "$prefix" && "$src" =~ ^https?:// ]]; then
+            local sid; sid=$(subs_id "$src")
+            subs_put "$(jq -n --arg id "$sid" --arg url "$src" --arg pre "$prefix" \
+                --arg nm "$prefix" --argjson n "$cnt" --arg ts "$(date -Is)" \
+                '{id:$id,name:$nm,prefix:$pre,url:$url,kind:"external",nodes:$n,added_at:$ts}')"
+            print_msg "已登记订阅「$prefix」($cnt 个节点), 可在「订阅管理」里更新"
+        fi
     fi
     local n_count
       # 被别的 outbound 当作 detour 依赖的 tag (如 shadowtls 的 "<tag>-out" 包装层)
@@ -685,6 +753,99 @@ import_one_outbound() {
     print_ok "节点 $tag 已导入; 共 $(node_count) 个可用节点"
 }
 
+# ---------- 订阅管理 ----------
+# 列出所有登记过的订阅, 支持 更新 / 删除。
+# 节点是"订阅"的产物: 更新订阅 = 重拉 + 重建该订阅名下的节点;
+# 删除订阅 = 同样删掉它带的节点 (否则会留下指向已删订阅的孤儿节点)。
+subs_menu() {
+    while true; do
+        local n; n=$(subs_count)
+        if [[ "$n" == "0" ]]; then
+            print_warn "还没有登记任何订阅"
+            print_msg "用菜单「添加节点」导入一个订阅 URL 就会出现在这里"
+            return 0
+        fi
+        echo
+        printf "  ${CYAN}%4s  %-22s %-10s %-8s %s${RESET}\n" "序号" "名称(前缀)" "节点数" "状态" "来源"
+        printf "  %s\n" "──────────────────────────────────────────────────────────────────"
+        local i=1 id nm pre cnt url
+        while IFS=$'\t' read -r id nm pre cnt url; do
+            printf "  %4d  %-22s %-10s %-8s %s\n" "$i" "$nm" "$cnt" "已登记" \
+                "$(printf '%s' "$url" | cut -c1-30)"
+            i=$((i+1))
+        done < <(jq -r '.subs[]?|[.id,.name,.prefix,(.nodes|tostring),.url]|@tsv' "$SUBS_FILE" 2>/dev/null)
+        echo
+        printf "  ${CYAN}%s${RESET}U) 更新选中的订阅 (重拉并重建它的节点)\n" "$i"
+        printf "  ${CYAN}%s${RESET}D) 删除选中的订阅 (连同它的节点)\n" "$i"
+        printf "  ${CYAN}%s${RESET}A) 更新全部订阅\n" "$i"
+        printf "  ${RED}0)${RESET} 返回\n"
+        local c sel sid
+        read -r -p "  请输入操作: " c || { echo; return 0; }
+        c="${c// /}"
+        [[ -z "$c" || "$c" == "0" ]] && return 0
+        case "${c^^}" in
+            A) sub_update_all; continue ;;
+            U|D)
+                [[ "$c" =~ ^[0-9]+$ ]] || { print_err "请输入编号或 U/D/A"; continue; }
+                sel="$c"
+                sid=$(jq -r --argjson i "$sel" '(.subs//[])[$i-1].id // empty' "$SUBS_FILE" 2>/dev/null)
+                [[ -n "$sid" ]] || { print_err "没有编号 $sel"; continue; }
+                if [[ "${c^^}" == "U" ]]; then
+                    sub_update_one "$sid" && regen_selector && apply_change "订阅已更新"
+                else
+                    sub_delete_one "$sid"
+                fi
+                ;;
+            *) print_err "无法识别的操作" ;;
+        esac
+    done
+}
+
+sub_update_one() {
+    local sid="$1" url pre nm
+    url=$(subs_get "$sid" | jq -r '.url // empty')
+    [[ -n "$url" ]] || { print_err "订阅记录异常 (无 URL)"; return 1; }
+    pre=$(subs_get "$sid" | jq -r '.prefix // empty')
+    nm=$(subs_get "$sid" | jq -r '.name // empty')
+    print_msg "更新订阅「$nm」..."
+    # 该订阅带的节点先删掉, 否则改名后的节点会变成孤儿。
+    local t
+    for t in $(grep -lF "${pre}-" "$CLIENT_NODE_DIR"/node-*.json 2>/dev/null); do
+        rm -f "${t%.json}".*
+    done
+    # 必须用 export 而不是 `VAR=x func` 前置赋值: bash 里那种写法只在函数
+    # 执行期间让该变量临时可见, 但 add_node 内部再调的其它函数看不到它,
+    # 会退回"询问前缀"分支 —— 更新订阅时又弹一次前缀输入, 前缀就丢了。
+    export SB_SUBS_PREFIX="$pre"
+    add_node "$url"
+}
+
+sub_update_all() {
+    local id n=0 bad=0
+    while read -r id; do
+        [[ -n "$id" ]] || continue
+        sub_update_one "$id" && n=$((n+1)) || bad=$((bad+1))
+    done < <(jq -r '.subs[]?.id' "$SUBS_FILE" 2>/dev/null)
+    if (( n > 0 )); then print_ok "已更新 $n 条订阅"; fi
+    if (( bad > 0 )); then print_warn "$bad 条订阅更新失败 (链接可能已过期/用尽)"; fi
+    (( n > 0 )) && { regen_selector; apply_change "订阅已更新"; }
+}
+
+sub_delete_one() {
+    local sid="$1" pre t
+    pre=$(subs_get "$sid" | jq -r '.prefix // empty')
+    print_warn "删除订阅「$pre」并同时删除它带的节点"
+    local w
+    read -r -p "  确认? 输入 yes, 其它任何输入=取消: " w
+    [[ "$w" == "yes" ]] || { print_msg "已取消"; return 0; }
+    for t in "$CLIENT_NODE_DIR"/node-"$pre"-*; do
+        [[ -f "$t" ]] && rm -f "${t%.json}".*
+    done
+    subs_del "$sid"
+    regen_selector
+    print_ok "已删除订阅「$pre」, 现 $(node_count) 个可用节点"
+}
+
 update_node() {
     # 同一个 share URL 会被多个节点共用, 必须去重, 否则重复下载会消耗服务端 max_uses
     local f src done_src=" " n=0 bad=0
@@ -705,6 +866,177 @@ update_node() {
     fi
     (( n > 0 )) && print_ok "已更新 $n 个分享来源, 现 $(node_count) 个可用节点"
     return 0
+}
+
+# ---------- 简易 HTTP / SOCKS 节点 ----------
+# 用途: 这台客户端机器上可能还跑着别的内核 (mihomo / sing-box / v2ray ...),
+# 想让本客户端把它们当成**出站**用 —— 在 PROXY 选择器里多一个选项, 选它就走
+# 那个 socks/http 端口出去。
+# 注意这是 outbound (客户端主动连出去), 不是在本机开一个 socks 端口给别人连
+# (那是 mixed-port 的事, 见 write_mixed_conf)。两者方向相反, 别混。
+add_local_proxy() {
+    local t addr port user pass tag defport
+    echo
+    printf "  ${CYAN}1)${RESET} socks5   ${DIM}(另一个内核的本地 SOCKS 端口)${RESET}\n"
+    printf "  ${CYAN}2)${RESET} http     ${DIM}(另一个内核的本地 HTTP 端口)${RESET}\n"
+    printf "  ${CYAN}0)${RESET} 取消\n"
+    local c
+    read -r -p "  节点类型 [1-2, 回车=1]: " c || { echo; return 0; }
+    c="${c// /}"
+    case "$c" in
+        2) t="http";     defport=7890 ;;
+        0) return 0 ;;
+        *) t="socks";    defport=1080 ;;
+    esac
+
+    # 默认 127.0.0.1: 这个面板跑在客户端机器上, 最常见的用法就是链本机上另一个
+    # 内核, 回环地址省一次输入; 要接别的机器直接输入 IP/域名即可。
+    read -r -p "  目标地址 (默认 127.0.0.1): " addr || { echo; return 0; }
+    addr="${addr// /}"
+    [[ -z "$addr" ]] && addr="127.0.0.1"
+
+    read -r -p "  目标端口 (默认 $defport): " port || { echo; return 0; }
+    port="${port// /}"
+    [[ -z "$port" ]] && port="$defport"
+    # 实测 sing-box check 放行 server_port:0 —— 语法合法但运行时才炸,
+    # 这种错留到内核才报最难查, 这里直接拦。
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+        print_err "端口必须是 1-65535 的整数"; return 1
+    fi
+
+    # 用户名/密码: 很多本地代理开着认证, 这两项必须能填。
+    # 留空 = 不认证, 就不写进配置 (username/password 是 sing-box 的可选字段)。
+    read -r -p "  用户名 (留空=不认证): " user || { echo; return 0; }
+    user="${user// /}"
+    read -r -p "  密码 (留空=不认证): " pass || { echo; return 0; }
+    pass="${pass// /}"
+    if [[ -n "$pass" && -z "$user" ]]; then
+        print_warn "只填了密码没填用户名, 按不认证处理"
+        pass=""
+    fi
+
+    local defname="SOCKS5"; [[ "$t" == "http" ]] && defname="HTTP"
+    read -r -p "  节点名 (默认 ${defname}-${addr}-${port}): " tag || { echo; return 0; }
+    tag="${tag// /}"
+    [[ -z "$tag" ]] && tag="${defname}-${addr}-${port}"
+    # tag 会进文件名 node-<tag>.json, 去掉路径分隔符等不安全字符
+    tag=$(printf '%s' "$tag" | tr -c 'A-Za-z0-9._-' '-' | sed 's/^-*//;s/-*$//' | cut -c1-48)
+    [[ -n "$tag" ]] || { print_err "节点名无效"; return 1; }
+    [[ -f "$CLIENT_NODE_DIR/node-$tag.json" ]] && { print_err "同名节点已存在: $tag"; return 1; }
+
+    if [[ -n "$user" ]]; then
+        jq -n --arg tag "$tag" --arg t "$t" --arg addr "$addr" --argjson port "$port" \
+           --arg user "$user" --arg pass "$pass" '
+          {outbounds:[{type:$t, tag:$tag, server:$addr, server_port:$port,
+                       username:$user, password:$pass}]}'
+    else
+        jq -n --arg tag "$tag" --arg t "$t" --arg addr "$addr" --argjson port "$port" '
+          {outbounds:[{type:$t, tag:$tag, server:$addr, server_port:$port}]}'
+    fi > "$CLIENT_NODE_DIR/node-$tag.json" || { print_err "生成节点文件失败"; return 1; }
+
+    echo "$t://$addr:$port" > "$CLIENT_NODE_DIR/node-$tag.txt"
+    printf '{"tag":"%s","source":"local","imported_at":"%s"}\n' "$tag" "$(date -Is)" \
+        > "$CLIENT_NODE_DIR/node-$tag.meta.json"
+    regen_selector
+    print_ok "已添加 $tag  ($t://$addr:$port${user:+ 用户 $user}); 现 $(node_count) 个可用节点"
+}
+
+# ---------- 订阅注册表 ----------
+# subscriptions.json:
+#   {"subs":[{"id","name","prefix","url","kind","nodes","added_at","last_ok"}]}
+# kind: external=外部订阅  self=自家 share  local=本地文件
+subs_file_init() { [[ -s "$SUBS_FILE" ]] || echo '{"subs":[]}' > "$SUBS_FILE" 2>/dev/null || true; }
+subs_count() { subs_file_init; jq '.subs|length' "$SUBS_FILE" 2>/dev/null || echo 0; }
+subs_id() { printf '%s' "$1" | md5sum | cut -c1-12; }
+subs_get() { subs_file_init; jq -c --arg i "$1" '.subs[]?|select(.id==$i)' "$SUBS_FILE" 2>/dev/null; }
+subs_put() { # $1=json 对象; 同 id 覆盖, 否则追加
+    subs_file_init
+    local id; id=$(printf '%s' "$1" | jq -r '.id')
+    jq --argjson o "$1" --arg i "$id" \
+        '.subs = (((.subs // []) | map(select(.id != $i))) + [$o])' \
+        "$SUBS_FILE" > "$SUBS_FILE.tmp" 2>/dev/null && mv -f "$SUBS_FILE.tmp" "$SUBS_FILE"
+}
+subs_del() {
+    subs_file_init
+    jq --arg i "$1" '.subs = ((.subs // []) | map(select(.id != $i)))' \
+        "$SUBS_FILE" > "$SUBS_FILE.tmp" 2>/dev/null && mv -f "$SUBS_FILE.tmp" "$SUBS_FILE"
+}
+# 从 URL 猜默认前缀: sub.example.com -> sub。猜不出用 sub,
+# 用户回车就有合理默认, 想改再手打。
+subs_guess_prefix() {
+    local h p
+    h=$(printf '%s' "$1" | sed -E 's#^[a-zA-Z]+://##; s#[/?].*$##')
+    case "$h" in
+        *.*.*) p=$(printf '%s' "$h" | cut -d. -f2) ;;
+        *.*)   p=$(printf '%s' "$h" | cut -d. -f1) ;;
+        *)     p="sub" ;;
+    esac
+    p=$(printf '%s' "$p" | tr -cd 'A-Za-z0-9_-' | cut -c1-24)
+    [[ -n "$p" ]] || p="sub"
+    printf '%s' "$p"
+}
+
+# ---------- 节点列表 (带编号) ----------
+# 菜单 4 以前直接 read 一个节点名, 要手打 `🇺🇸 myserver-anytls01-TLS`
+# 这种长串, 打错一个字就"无此节点"。列出来给编号, 敲个数字就行。
+NODE_LIST=""
+list_nodes() {
+    NODE_LIST=""
+    local f tag typ srv
+    for f in "$CLIENT_NODE_DIR"/node-*.json; do
+        [[ -f "$f" ]] || continue
+        tag=$(basename "$f" .json | sed 's/^node-//')
+        typ=$(jq -r '.outbounds[0].type // "?"' "$f" 2>/dev/null)
+        srv=$(jq -r '.outbounds[0]|((.server//"-")+":"+((.server_port//"-")|tostring))' "$f" 2>/dev/null)
+        NODE_LIST+="$tag"$'\t'"$typ"$'\t'"$srv"$'\n'
+    done
+    [[ -n "$NODE_LIST" ]]
+}
+print_nodes() {
+    list_nodes || { print_warn "还没有任何节点"; return 1; }
+    local i=1 tag typ srv
+    echo
+    printf "  ${CYAN}%4s  %-44s %-13s %s${RESET}\n" "序号" "节点名" "类型" "地址"
+    printf "  %s\n" "────────────────────────────────────────────────────────"
+    while IFS=$'\t' read -r tag typ srv; do
+        printf "  %4d  %-44s %-13s %s\n" "$i" "$tag" "$typ" "$srv"
+        i=$((i+1))
+    done <<< "$NODE_LIST"
+    echo
+    print_msg "共 $((i-1)) 个可用节点"
+}
+node_by_index() { # <序号> -> stdout: tag
+    local n="$1" i=1 tag rest
+    list_nodes || return 1
+    while IFS=$'\t' read -r tag rest; do
+        if [[ "$i" == "$n" ]]; then printf '%s' "$tag"; return 0; fi
+        i=$((i+1))
+    done <<< "$NODE_LIST"
+    return 1
+}
+# 交互式删除: 列出来选编号
+del_node_menu() {
+    print_nodes || return 1
+    local n t
+    read -r -p "  要删除的编号 (回车取消): " n || { echo; return 0; }
+    n="${n// /}"
+    [[ -z "$n" ]] && return 0
+    t=$(node_by_index "$n") || { print_err "没有编号 $n"; return 1; }
+    del_node "$t"
+}
+# 全部删除 (节点 + 订阅记录)。以前只能一个个删, 清空要十几轮交互。
+# 删了只能重新订阅拉回来, 所以默认 no。
+del_all_nodes() {
+    local n; n=$(node_file_count)
+    (( n == 0 )) && { print_warn "没有可删除的节点"; return 0; }
+    print_warn "即将删除全部 $n 个节点 (含订阅记录), 不可撤销"
+    local w
+    read -r -p "  确认删除全部? 输入 yes, 其它任何输入=取消: " w
+    [[ "$w" == "yes" ]] || { print_msg "已取消"; return 0; }
+    rm -f "$CLIENT_NODE_DIR"/node-* 2>/dev/null
+    printf '{"subs":[]}' > "$SUBS_FILE" 2>/dev/null || true
+    regen_selector
+    print_ok "已删除全部节点, 现 $(node_count) 个可用节点"
 }
 
 del_node() {
@@ -1124,49 +1456,58 @@ show_panel() {
     ui_kv_ascii "Clash API" "$EF_CLASH_PORT   $(port_state_mark "$EF_CLASH_PORT")"
     if [[ "$ST_SERVICE" != "运行中" && -n "$ST_REASON" ]]; then
         echo; printf "  ${YELLOW}提示${RESET}: %s\n" "$ST_REASON"
-        [[ "$ST_SERVICE" == "未运行" ]] && printf "         可选择 “7. 启动服务” 开始使用。\n"
-        [[ "$ST_SERVICE" == "启动失败" ]] && printf "         建议先执行 “12. 配置检查”。\n"
+        [[ "$ST_SERVICE" == "未运行" ]] && printf "         可选择 “10. 启动服务” 开始使用。\n"
+        [[ "$ST_SERVICE" == "启动失败" ]] && printf "         建议先执行 “15. 配置检查”。\n"
         [[ "$ST_SERVICE" == "未初始化" ]] && printf "         请先执行 “2. 初始化基础配置”。\n"
     fi
     echo
     ui_rule
+    echo
+    printf "  %s节点%s\n" "$DIM" "$RESET"
     ui_menu  1 "安装内核"
     ui_menu  2 "初始化基础配置"
-    ui_menu  3 "添加节点 (share-url)"
-    ui_menu  4 "删除节点"
-    ui_menu  5 "列出节点"
-    ui_menu  6 "更新节点 (重拉 share)"
-    ui_menu  7 "启动服务"
-    ui_menu  8 "停止服务"
-    ui_menu  9 "重启服务"
-    ui_menu 10 "查看运行状态"
-    ui_menu 11 "Web UI / Clash API"
-    ui_menu 12 "配置检查"
-    ui_menu 13 "客户端设置 (端口 / Web UI / 占用检测)"
-    ui_menu 14 "应用配置 (重启, sing-box 无热重载)"
-    ui_menu 15 "卸载客户端 (停服务/删目录/删入口)"
+    ui_menu  3 "添加节点 (分享链接 / 订阅 URL / YAML 片段)"
+    ui_menu  4 "添加简易 HTTP/SOCKS 节点 (接本机或局域网的其它内核)"
+    ui_menu  5 "订阅管理 (列出 / 更新 / 删除)"
+    ui_menu  6 "删除节点 (列表选编号)"
+    ui_menu  7 "全部删除节点"
+    ui_menu  8 "列出节点"
+    ui_menu  9 "更新节点 (重拉全部订阅)"
+    echo
+    printf "  %s服务%s\n" "$DIM" "$RESET"
+    ui_menu 10 "启动服务"
+    ui_menu 11 "停止服务"
+    ui_menu 12 "重启服务"
+    ui_menu 13 "查看运行状态"
+    echo
+    printf "  %s配置%s\n" "$DIM" "$RESET"
+    ui_menu 14 "Web UI / Clash API"
+    ui_menu 15 "配置检查"
+    ui_menu 16 "客户端设置 (端口 / Web UI / 占用检测)"
+    ui_menu 17 "应用配置 (重启, sing-box 无热重载)"
+    ui_menu 18 "卸载客户端 (停服务/删目录/删入口)"
     ui_menu  0 "退出"
     ui_rule
     read -r -p "请输入选项: " c || { ui_clear; exit 0; }
     case "$c" in
         1) do_install ;;
         2) do_init; do_status ;;
-        3) read -r -p "  分享链接/URL: " u; add_node "$u" && apply_change "节点导入" ;;
-        4) read -r -p "  要删除的节点名: " t; del_node "$t" && apply_change "节点删除" ;;
-        5) regen_selector; local f; for f in "$CLIENT_NODE_DIR"/node-*.json; do
-                [[ -f "$f" ]] || continue
-                printf "  %-22s %s\n" "$(basename "$f" .json | sed 's/^node-//')" "$(jq -r '.outbounds[0].type // "?"' "$f" 2>/dev/null)"
-           done; echo; print_msg "共 $(node_count) 个可用节点" ;;
-        6) update_node && apply_change "节点更新" ;;
-        7) do_start && sleep 1 ;;
-        8) do_stop ;;
-        9) do_restart && sleep 1 ;;
-        10) do_status ;;
-        11) do_info ;;
-        12) check_menu ;;
-        13) settings_menu ;;
-        14) do_reload ;;
-        15) do_uninstall ;;
+        3) read -r -p "  分享链接/订阅 URL/本地文件: " u; add_node "$u" && apply_change "节点导入" ;;
+        4) add_local_proxy && apply_change "简易节点已添加" ;;
+        5) subs_menu ;;
+        6) del_node_menu && apply_change "节点已删除" ;;
+        7) del_all_nodes && apply_change "节点已全部删除" ;;
+        8) regen_selector; print_nodes ;;
+        9) update_node && apply_change "节点更新" ;;
+        10) do_start && sleep 1 ;;
+        11) do_stop ;;
+        12) do_restart && sleep 1 ;;
+        13) do_status ;;
+        14) do_info ;;
+        15) check_menu ;;
+        16) settings_menu ;;
+        17) do_reload ;;
+        18) do_uninstall ;;
         0) ui_clear; exit 0 ;;
         *) print_err "无效选项 $c" ;;
     esac
