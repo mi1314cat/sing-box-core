@@ -556,8 +556,16 @@ pick_trusted_cert_verbose() {
         echo -e "  ${MAGENTA}(检测到 ${#SB_NGINX_SITES[@]} 个 nginx 站点域名)${RESET}" >&2
     fi
     local c
-    read -r -p "  选哪张 (数字, 回车=1): " c
-    c=$(clean_input "$c"); [[ -z "$c" ]] && c=1
+    # 快速生成 / 无人值守: 直接取第一张, 不列表也不问。
+    # 之前只在 batch_main 里给"选证书方案"那问加了守卫, 但选**哪一张**是
+    # 这个函数里另一次 read, 照样会问 —— 于是快速生成仍然卡在列表上,
+    # 输入喂到一半就被判成"无效选择"而中止。
+    if [[ -n "${SB_BATCH_QUICK:-}${SB_NONINTERACTIVE:-}" ]]; then
+        c=1
+    else
+        read -r -p "  选哪张 (数字, 回车=1): " c
+        c=$(clean_input "$c"); [[ -z "$c" ]] && c=1
+    fi
     [[ "$c" =~ ^[0-9]+$ ]] && (( c >= 1 && c <= ${#uniq[@]} )) || { print_error "无效选择"; return 1; }
     e="${uniq[$((c-1))]}"
     crt="${e%%|*}"; key="${e#*|}"; key="${key%%|*}"

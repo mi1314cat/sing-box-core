@@ -198,9 +198,15 @@ batch_main() {
     mkdir -p "$SB_CONFIG_DIR" "$SB_OUT_DIR"
     init_base >/dev/null 2>&1 || true
 
+    # 快速生成 (菜单 2 / 3): 除**端口范围**外一律走默认, 不逐项问。
+    # 注意这里刻意不去设 SB_BATCH_AUTO —— AUTO 的语义是"连端口都不问",
+    # 只给脚本/CI 用。早期版本让快速模式去设 AUTO, 结果端口那问也被跳掉,
+    # 整个流程一次交互都没有, 菜单上写的"只问端口范围"就成了假的。
+    # 各提问点的守卫读的是 SB_BATCH_AUTO, 端口那问读的是 SB_NONINTERACTIVE。
+
     echo >&2
     print_title "全协议一键生成"
-    echo -e "${CYAN}交互项: 对外地址 → 证书方案 → CDN → 服务器标识. 端口区间自动分配. 其余沿用各协议默认值.${RESET}" >&2
+    echo -e "${CYAN}交互项: 对外地址 → 证书方案 → 端口范围 → CDN → 服务器标识. 其余沿用各协议默认值.${RESET}" >&2
     echo -e "${CYAN}如端口被占用或配置失败, 会自动清理; 收尾统一 check + reload.${RESET}" >&2
 
     # --- 服务端监听: 不问, 统一双栈 ---
@@ -228,7 +234,10 @@ batch_main() {
     echo -e "   ${MAGENTA}选 IPv6 前请确认客户端网络真能出 IPv6 —— 写进去连不上更麻烦${RESET}" >&2
     cur_fam=$(sb_addr_family_get); [[ "$cur_fam" == "v6" ]] && cur_fam=2 || cur_fam=1
     local sch=""
-    read -r -p "   请选择 [1-2, 回车=$([[ "$cur_fam" == 2 ]] && echo IPv6 || echo IPv4)]: " sch
+    # 快速生成时跳过这一步, 直接用当前/默认地址族。
+    if [[ -z "${SB_BATCH_QUICK:-}" ]]; then
+        read -r -p "   请选择 [1-2, 回车=$([[ "$cur_fam" == 2 ]] && echo IPv6 || echo IPv4)]: " sch
+    fi
     case "$(clean_input "${sch:-}")" in
       2) [[ -n "$a6" ]] || print_warn "本机无 IPv6"
          SB_SERVER_ADDR="$a6"; sb_addr_family_set v6
@@ -258,7 +267,10 @@ batch_main() {
     echo -e "   ${GREEN}2)${RESET} ${YELLOW}自签证书${RESET} (伪装成随机大站域名, 客户端用 SPKI pin 锁定)" >&2
     echo -e "   ${MAGENTA}真实证书=任何客户端都能连; 自签=仅支持 pin 的客户端能连${RESET}" >&2
     local cch=""
-    read -r -p "   请选择 [1-2, 回车=$([[ $ncert -gt 0 ]] && echo 1 || echo 2)]: " cch
+    # 快速生成: 跳过这一步 (默认走真证书, 没有则自签)。
+    if [[ -z "${SB_BATCH_QUICK:-}" ]]; then
+        read -r -p "   请选择 [1-2, 回车=$([[ $ncert -gt 0 ]] && echo 1 || echo 2)]: " cch
+    fi
     case "$(clean_input "${cch:-}")" in
       2) SB_BATCH_CERT=self; print_ok "证书: 自签 (各节点用 domains.sh 随机域名)" ;;
       *) if (( ncert > 0 )); then
@@ -272,18 +284,37 @@ batch_main() {
          fi ;;
     esac
     export SB_BATCH_CERT SB_BATCH_CERT_CRT SB_BATCH_CERT_KEY SB_BATCH_CERT_DOMAIN
-
-    # --- 端口区间: 不再问, 直接随机 ---
-    # 以前这里是一次交互 ("端口范围 如 20000-25000, 回车=自动")。批量生成要占
-    # 十几个端口, 让用户先想好一整段没什么意义 —— 回车的人占绝大多数, 真正
-    # 填的人又常和已有节点撞上。要指定就用环境变量:
-    #   SB_BATCH_PORT_START=30000 SB_BATCH_PORT_END=31000 bash conf/batch.sh
+    # --- 端口区间 (单独一问, 有随机默认值) ---
+    # 三个来源, 优先级从高到低:
+    #   1) 环境变量 (脚本化调用)
+    #   2) 交互输入; 直接回车 = 随机
+    #   3) 什么都不给 = 随机 (SB_BATCH_AUTO / 无人值守)
     if [[ -n "${SB_BATCH_PORT_START:-}" && -n "${SB_BATCH_PORT_END:-}" ]]; then
         print_ok "批量端口区间 (预设): $SB_BATCH_PORT_START-$SB_BATCH_PORT_END"
-    else
+    elif [[ -n "${SB_NONINTERACTIVE:-}" ]]; then
+        # 真正的无人值守 (CI / 一键脚本)。菜单上的选项2 不走这里 ——
+        # 快速生成仍然问端口, 只是除了端口以外不问别的。
         SB_BATCH_PORT_START=$(( 20000 + RANDOM % 10000 ))
         SB_BATCH_PORT_END=$(( SB_BATCH_PORT_START + 5000 ))
         print_ok "批量自动端口区间: $SB_BATCH_PORT_START-$SB_BATCH_PORT_END"
+    else
+        echo >&2
+        read -r -p "    端口范围 (如 20000-25000, 回车=随机): " r
+        r=$(clean_input "$r")
+        if [[ -z "$r" ]]; then
+            SB_BATCH_PORT_START=$(( 20000 + RANDOM % 10000 ))
+            SB_BATCH_PORT_END=$(( SB_BATCH_PORT_START + 5000 ))
+            print_ok "批量随机端口区间: $SB_BATCH_PORT_START-$SB_BATCH_PORT_END"
+        elif [[ "$r" =~ ^[0-9]+-[0-9]+$ ]] \
+             && (( 10#${r%%-*} < 10#${r##*-} )) && (( 10#${r##*-} <= 65535 )); then
+            SB_BATCH_PORT_START="${r%%-*}"; SB_BATCH_PORT_END="${r##*-}"
+            print_ok "批量端口区间: $SB_BATCH_PORT_START-$SB_BATCH_PORT_END"
+        else
+            print_error "端口范围格式不对 (要 起始-结束, 且起始<结束≤65535), 改用随机"
+            SB_BATCH_PORT_START=$(( 20000 + RANDOM % 10000 ))
+            SB_BATCH_PORT_END=$(( SB_BATCH_PORT_START + 5000 ))
+            print_ok "批量随机端口区间: $SB_BATCH_PORT_START-$SB_BATCH_PORT_END"
+        fi
     fi
     export SB_BATCH_PORT_START SB_BATCH_PORT_END
 
@@ -300,7 +331,9 @@ batch_main() {
           echo >&2
           print_info "检测到 ${#sb_FOUND_CERTS[@]} 张真证书 (可用于 CDN 回源)"
           printf "  CDN 模式: 1) vless/vmess 自动走 CDN (推荐)  2) 全部直连 [默认 1]: " >&2
-          read -r -p "  " rc 2>/dev/null
+          if [[ -z "${SB_BATCH_QUICK:-}" ]]; then
+              read -r -p "  " rc 2>/dev/null
+          fi
           rc=$(clean_input "${rc:-}")
           [[ "$rc" == "2" ]] || { SB_BATCH_CDN=1; SB_BATCH_CDN_DOMAIN="$cdn_dom"; }
           if (( SB_BATCH_CDN )); then
@@ -355,7 +388,9 @@ batch_main() {
         _mi=$((_mi + 1))
     done
     local _mc=""
-    read -r -p "   请选择 [1-$((_mi - 1)), 回车=1]: " _mc
+    if [[ -z "${SB_BATCH_QUICK:-}" ]]; then
+        read -r -p "   请选择 [1-$((_mi - 1)), 回车=1]: " _mc
+    fi
     _mc=$(clean_input "${_mc:-}")
     # 只接受纯数字: 用户乱输入字母时不能进算术展开, 否则下面 _pick 变空
     # 又会触发 local 的 "not a valid identifier" 把函数打断
@@ -395,7 +430,9 @@ batch_main() {
     echo -e "   ${CYAN}2)${RESET} obfs 混淆 ${MAGENTA}(salamander, 再加一层加密)${RESET}" >&2
     echo -e "   ${GREEN}3)${RESET} 两个都开   ${MAGENTA}4) 都不开 (默认)${RESET}" >&2
     local _h=""
-    read -r -p "   请选择 [1-4, 回车=4]: " _h
+    if [[ -z "${SB_BATCH_QUICK:-}" ]]; then
+        read -r -p "   请选择 [1-4, 回车=4]: " _h
+    fi
     _h=$(clean_input "${_h:-}")
     # 回车 (未选) 时保留外部预设, 不要无条件清空 —— 否则 SB_BATCH_HOP
     # 传进来也被 case 的 *) 分支丢掉。
@@ -440,7 +477,9 @@ batch_main() {
         echo -e "   ${GREEN}2)${RESET} ${CYAN}gRPC${RESET}          ${MAGENTA}(Cloudflare 面板需开启 gRPC)${RESET}" >&2
         echo -e "   ${GREEN}3)${RESET} ${CYAN}ws + gRPC${RESET}      ${MAGENTA}(两种都建, 共 6 个 CDN 节点)${RESET}" >&2
         local _ct=""
-        read -r -p "   请选择 [1-3, 回车=1]: " _ct
+        if [[ -z "${SB_BATCH_QUICK:-}" ]]; then
+            read -r -p "   请选择 [1-3, 回车=1]: " _ct
+        fi
         _ct=$(clean_input "${_ct:-}")
         case "${_ct:-1}" in
             2) SB_BATCH_CDN_TRANSPORTS=(grpc)
@@ -476,7 +515,9 @@ batch_main() {
             SB_OVERWRITE=1
         else
             echo >&2
-            read -r -p "如何处理? 1) 跳过已有 (幂等)  2) 覆盖全部 [默认 1]: " oc
+            if [[ -z "${SB_BATCH_QUICK:-}" ]]; then
+                read -r -p "如何处理? 1) 跳过已有 (幂等)  2) 覆盖全部 [默认 1]: " oc
+            fi
             oc=$(clean_input "$oc"); [[ -z "$oc" ]] && oc=1
             [[ "$oc" == "2" ]] && SB_OVERWRITE=1
         fi
@@ -702,16 +743,21 @@ show_service() {
 main() {
     while true; do
         print_title "全协议一键生成 (Batch Generator)"
-        echo -e "${CYAN}1)${RESET} 全协议生成 (默认形态)"
-        echo -e "${CYAN}2)${RESET} 全协议脚本 (一条命令跑完, 直接给脚本用)"
-        echo -e "${CYAN}3)${RESET} 全协议生成 (强制覆盖已有协议, 重新生成全部)"
+          echo -e "${CYAN}1)${RESET} 全协议生成     ${DIM:-}逐项都问, 已存在的节点跳过${RESET}"
+          echo -e "${CYAN}2)${RESET} 全协议快速生成 ${DIM:-}只问端口范围, 其余全用默认${RESET}"
+          echo -e "${CYAN}3)${RESET} 全协议重建     ${YELLOW:-}强制覆盖已存在的节点${RESET}"
         echo -e "${RED}4)${RESET} 清空全部节点 (批量删除 + 吊销所有分享链接)"
         echo -e "${CYAN}0)${RESET} 返回"
         read -r -p "请输入选项 [0-4]: " c || { echo; exit 0; }
         case "$(clean_input "$c")" in
             1) batch_main ;;
-            2) SB_BATCH_AUTO=1 batch_main ;;
-            3) SB_BATCH_OVERWRITE=1 SB_BATCH_AUTO=1 batch_main ;;
+
+              # 选项2 = 除**端口范围**外全用默认 (菜单上写的就是"只问端口范围")。
+              # 必须用 export 而不是 `VAR=x batch_main` 那种前置赋值: bash 里
+              # 那种写法只在函数执行期间临时可见, 函数内部再调用的第二层
+              # (pick_trusted_cert_verbose 等) 完全看不到, 守卫会静默失效。
+            2) export SB_BATCH_QUICK=1; batch_main ;;
+            3) export SB_BATCH_OVERWRITE=1 SB_BATCH_QUICK=1; batch_main ;;
             4) wipe_all_nodes ;;
             0) return ;;
             *) print_error "无效选项" ;;
