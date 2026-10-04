@@ -20,13 +20,20 @@ SB_REPO_API="https://api.github.com/repos/SagerNet/sing-box"
 export SB_ROOT SB_CONFIG_DIR SB_OUT_DIR SB_BACKUP_DIR SB_BIN SB_SERVICE
 
 # ---- 颜色 ----
-RED="\e[31m"
-GREEN="\e[32m"
-YELLOW="\e[33m"
-MAGENTA="\e[95m"
-CYAN="\e[96m"
-BOLD="\e[1m"
-RESET="\e[0m"
+# 一律存**真正的 ESC 字节**, 不存字面量 "\e[96m"。
+# 区别很要紧: `echo "  ${CYAN}1)"` (无 -e) 与 `printf '%s' "$CYAN"`
+# 都不会解释转义, 终端上会原样显示 \e[96m1)\e[0m —— 颜色全废, 而且
+# 那些反斜杠留在屏幕上, 复制粘贴必带垃圾。
+# 归一化成真字节后, 这两种写法都能正常上色。
+# client.sh 从一开始就是这么做的 (_c 函数), 服务端这边此前漏了。
+_sb_esc() { printf '%b' "$1"; }
+RED="$(_sb_esc '\e[31m')"
+GREEN="$(_sb_esc '\e[32m')"
+YELLOW="$(_sb_esc '\e[33m')"
+MAGENTA="$(_sb_esc '\e[95m')"
+CYAN="$(_sb_esc '\e[96m')"
+BOLD="$(_sb_esc '\e[1m')"
+RESET="$(_sb_esc '\e[0m')"
 
 print_info()  { printf "${CYAN}[Info]${RESET} %s\n" "$1" >&2; }
 print_ok()    { printf "${GREEN}[OK]${RESET} %s\n" "$1" >&2; }
@@ -619,11 +626,11 @@ sb_ask_transport() {
         t="${SB_BATCH_TRANSPORT:-ws}"
     else
         echo "  传输方式:" >&2
-        echo "    ${CYAN}1)${RESET} ws             ${DIM:-}(默认, 兼容性最好, Cloudflare 全功能)${RESET}" >&2
-        echo "    ${CYAN}2)${RESET} grpc           ${DIM:-}(Cloudflare 面板需开 gRPC 开关)${RESET}" >&2
-        echo "    ${CYAN}3)${RESET} http (HTTP/2)   ${DIM:-}(低优先级: Xray 已移除此传输)${RESET}" >&2
-        echo "    ${CYAN}4)${RESET} httpupgrade    ${DIM:-}(主动探测最难识别, CPU 开销最低)${RESET}" >&2
-        echo "    ${CYAN}5)${RESET} 裸 TCP          ${DIM:-}(不写 transport 字段)${RESET}" >&2
+        printf '%b\n' "    ${CYAN}1)${RESET} ws             ${DIM:-}(默认, 兼容性最好, Cloudflare 全功能)${RESET}" >&2
+        printf '%b\n' "    ${CYAN}2)${RESET} grpc           ${DIM:-}(Cloudflare 面板需开 gRPC 开关)${RESET}" >&2
+        printf '%b\n' "    ${CYAN}3)${RESET} http (HTTP/2)   ${DIM:-}(低优先级: Xray 已移除此传输)${RESET}" >&2
+        printf '%b\n' "    ${CYAN}4)${RESET} httpupgrade    ${DIM:-}(主动探测最难识别, CPU 开销最低)${RESET}" >&2
+        printf '%b\n' "    ${CYAN}5)${RESET} 裸 TCP          ${DIM:-}(不写 transport 字段)${RESET}" >&2
         # 预置方案指定的传输: 菜单照常打出来 (用户仍能改), 但回车直接落在
         # 它身上。用独立变量而不是复用 SB_BATCH_TRANSPORT —— 后者会把整个
         # sb_ask_transport 切到不提问的批量分支, 等于剥夺用户改动的机会。
@@ -1323,8 +1330,8 @@ sb_ask_flow() { # <CERT_MODE> <TR_TYPE>  -> stdout: flow 取值 (空=不用)
         return 0
     fi
     print_title "XTLS Vision 流控 (Reality 专用)"
-    echo "    ${CYAN}1)${RESET} 开启 vision  ${DIM:-}(Reality 的正解, 少而长的大流量)${RESET}" >&2
-    echo "    ${CYAN}2)${RESET} 不开         ${DIM:-}(留给 multiplex 用, 多而短的小请求)${RESET}" >&2
+    printf '%b\n' "    ${CYAN}1)${RESET} 开启 vision  ${DIM:-}(Reality 的正解, 少而长的大流量)${RESET}" >&2
+    printf '%b\n' "    ${CYAN}2)${RESET} 不开         ${DIM:-}(留给 multiplex 用, 多而短的小请求)${RESET}" >&2
     local c; c=$(safe_read "选择" "1")
     [[ "$c" == "2" ]] && return 0
     FLOW="$SB_FLOW_DEFAULT"
@@ -1475,11 +1482,15 @@ sb_ask_preset() { # <协议> [菜单标题]
     local i=1 row
     for row in "${SB_PRESETS[@]}"; do
         [[ "${row%%|*}" == "$proto" ]] || continue
-        printf '    %s%s)%s %-26s %s\n' "$CYAN" "$i" "$RESET" \
+        # 颜色必须走 %b: printf 只在**格式串**里解释转义, 传给 %s 的
+        # "\e[96m" 会原样打印成字面量 "\e[96m" —— 菜单会显示成
+        #   \e[96m1)\e[0m ① 隐匿优先 ...
+        # 整份预置菜单的高亮全废, 且那些反斜杠会留在终端上, 复制粘贴就出错。
+        printf '    %b%s)%b %-26s %s\n' "$CYAN" "$i" "$RESET" \
             "$(echo "$row" | cut -d'|' -f3)" "$(echo "$row" | cut -d'|' -f8)" >&2
         ((i++))
     done
-    printf '    %s%s)%s 不用预设, 我自己逐项配%s\n' "$CYAN" "$((i))" "$RESET" \
+    printf '    %b%s)%b 不用预设, 我自己逐项配%b\n' "$CYAN" "$((i))" "$RESET" "${RESET}" \
         "${DIM:-}(回答每一个问题)${RESET}" >&2
     local c; c=$(safe_read "选择" "1")
     if [[ "$c" =~ ^[0-9]+$ ]] && (( c >= 1 && c <= n )); then
