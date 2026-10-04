@@ -342,7 +342,7 @@ ask_server_addr() {
 # 全部 10 个协议模块都会走 ask_server_addr, 挂在这里等于一次接入全覆盖。
 # 批量模式下不打扰 (用默认的 旗帜+hostname), 用户要改就设 SB_SERVER_NAME。
 # ---- 服务器标识 (节点名前缀) ----
-# 为什么需要: 用户常在多台服务器 (RN / DS / ...) 上各跑一份全协议, 再把它们的
+# 为什么需要: 用户常在多台服务器 ( DS / ...) 上各跑一份全协议, 再把它们的
 # 订阅全拉进**同一个**客户端。两台的节点 tag 完全一样 (都是 anytls01-TLS),
 # 而客户端的节点文件名就是 node-<tag>.json, 导入第二条时直接 `>` 覆盖第一条 ——
 # 静默丢节点, 面板还报 "[OK] 已导入 13 个节点"。加上前缀后
@@ -375,7 +375,7 @@ sb_flag_emoji() { # 拿不到就输出空 (不影响功能, 只是没有旗帜)
     if [[ -s "$cache" ]]; then printf '%s' "$(cat "$cache")"; return 0; fi
     local iso=""
     # 多源回退。fscarmen 用的是 ip.cloudflare.now, 那域名现在已经解析不了
-    # (RN 上实测 curl: (6) Could not resolve host), 所以换掉并保留多个源。
+    # (实测 curl: (6) Could not resolve host), 所以换掉并保留多个源。
     for u in "http://ip-api.com/json/?fields=countryCode" \
              "https://ifconfig.co/json" \
              "http://ip-api.com/json/"; do
@@ -1570,11 +1570,11 @@ SB_PRESETS=(
     # anytls 的预置表 (2026-10 更正两次)。
     #
     # 第一次误判: 写着"anytls 只有 REALITY 一种可用形态", 撤掉了全部 TLS 预置。
-    #   错因是当时���测试环境有问题: 临时起的端口没在防火墙放行, CC 连过去是
+    #   错因是当时那台测试环境有问题: 临时起的端口没在防火墙放行, 连过去是
     #   i/o timeout, 我把这个现象当成了"服务端在 ClientHello 阶段 reset"。
     #   (中途还误以为是 ALPN 的问题, 同样被推翻 —— 见下。)
     #
-    # 复核结论 (RN 起服务端, CC 上 sing-box 与 mihomo 双内核实测):
+    # 复核结论 (一台机器起服务端, 另一台跑 sing-box 与 mihomo 双内核实测):
     #   anytls 原生 TLS + 自签/真证书          -> 两端都正常, 稳定 8/8
     #   anytls + REALITY                       -> 两端正常 (仅 sing-box 客户端)
     #   alpn 有无、服务端有无 alpn             -> 四种组合**全部 8/8**, 与 ALPN 无关
@@ -3067,7 +3067,7 @@ cleanup_node_shares() { # cleanup_node_shares <tag>
 
 # ---- 批量模式: 覆盖 bash 内置 read ----
 # add_config 内编号/选择 read 返回空串 → 各协议自身的 [[ -z ]]&&默认 逻辑接管
-# 防空转 (事故复盘 2026-09-21 RN): 连续 N 次(默认 32)注入"空答案"仍未正常推进 → 认定是菜单循环误入, 强制 exit.
+# 防空转 (事故复盘 2026-09-21): 连续 N 次(默认 32)注入"空答案"仍未正常推进 → 认定是菜单循环误入, 强制 exit.
 if [[ "${SB_BATCH:-}" == "1" ]]; then
     _SB_BARE_READ_SEQ=0
     read() {

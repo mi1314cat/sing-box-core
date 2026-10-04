@@ -131,7 +131,7 @@ cdn_render_location() {
             local loc="${svc:-$path}"
             [[ "$loc" != /* ]] && loc="/$loc"
             #
-            # 实测定位 (RN, sing-box 1.14.2, nginx 1.26.3):
+            # 实测定位 (sing-box 1.14.2, nginx 1.26.3):
             #   proxy_pass https:// + proxy_http_version 2  -> 请求发不出去,
             #     而且 proxy_http_version 2 在 nginx < 1.29.4 直接
             #     [emerg] invalid value "2", 整份配置起不来。
