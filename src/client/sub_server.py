@@ -22,6 +22,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 # 允许导入的客户端
 ADDR = "0.0.0.0"
 SUB_PATH = "/sub/"
+# /sub/<token>       -> 出站 + DNS + 路由 (不含入站)
+# /sub/<token>/tun   -> 同上 + tun 入站 (手机 / Windows 命令行用这个)
+# 为什么要 tun 变体: SagerNet 的 openTun() 里直接写着
+#   error("android: tun inbound requires VPN service")
+# 也就是配置里没有 tun 入站, 它根本不会去启动 Android 的 VpnService。
+# 表现是节点和延迟全都正常, 也能点启动不报错, 但状态栏永远没有 VPN 图标,
+# 手机流量压根没进代理。所以给手机用必须带 tun。
 
 
 def load_token(path):
@@ -32,7 +39,20 @@ def load_token(path):
         return ""
 
 
-def load_config(confdir):
+# TUN 入站模板。stack 用 mixed: gvisor 纯用户态兼容性最好但慢, system
+# 最快但个别安卓 ROM 有内核 bug, mixed 是目前最稳的折中。
+TUN_INBOUND = {
+    "type": "tun",
+    "tag": "tun-in",
+    "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
+    "mtu": 9000,
+    "auto_route": True,
+    "strict_route": True,
+    "stack": "mixed",
+}
+
+
+def load_config(confdir, with_tun=False):
     """实时合并 conf/ 下的所有片段。
 
     早先的��现是读一份预生成的快照 (sub.json), 靠 apply_change 钩子刷新。
@@ -63,6 +83,14 @@ def load_config(confdir):
     merged.pop("experimental", None)
     if not merged.get("outbounds"):
         raise ValueError("no outbounds")
+
+    if with_tun:
+        merged["inbounds"] = [dict(TUN_INBOUND)]
+        rules = merged.setdefault("route", {}).setdefault("rules", [])
+        # sniff 必须在最前面: 否则 TUN 进来的流量只有 IP 没有域名, 分流失准
+        if not any(r.get("action") == "sniff" for r in rules):
+            rules.insert(0, {"action": "sniff"})
+
     return json.dumps(merged, ensure_ascii=False, indent=2).encode("utf-8")
 
 
@@ -100,9 +128,12 @@ class Handler(BaseHTTPRequestHandler):
         return SUB_PATH + load_token(self.token_path)
 
     def _authorized(self, path):
-        exp = self._expected()
-        # token 为空 (还没生成) 时一律拒绝, 不能让 /sub/ 裸奔
-        return bool(load_token(self.token_path)) and path == exp
+        """只认 /sub/<token> 和 /sub/<token>/tun 两种路径。"""
+        tok = load_token(self.token_path)
+        if not tok:
+            return False          # token 还没生成, 不能让 /sub/ 裸奔
+        exp = SUB_PATH + tok
+        return path in (exp, exp + "/tun")
 
     def do_GET(self):
         path = self.path.split("?", 1)[0]
@@ -110,7 +141,8 @@ class Handler(BaseHTTPRequestHandler):
             self._deny()
             return
         try:
-            body = load_config(self.conf_dir)
+            body = load_config(self.conf_dir,
+                               path.endswith("/tun"))
         except (OSError, ValueError) as e:
             body = ('{"error":"配置尚未生成, 请先在面板里启动该服务"}'
                     .encode("utf-8"))
@@ -129,7 +161,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(load_config(self.conf_dir))))
+        self.send_header("Content-Length", str(
+                len(load_config(self.conf_dir, path.endswith("/tun")))))
         self.end_headers()
 
 

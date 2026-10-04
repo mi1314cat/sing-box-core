@@ -969,11 +969,19 @@ sub_status() {
     fi
     echo
     if [[ "$ST" == "运行中" ]]; then
-        printf "  ${CYAN}订阅地址${RESET}  ${DIM}(把这个填进别的设备的「添加订阅」)${RESET}\n"
+        printf "  ${CYAN}手机 / Windows 用这个${RESET}  ${DIM}(自带 TUN, 接管全局流量)${RESET}\n"
+        printf "    %s/tun\n" "$(sub_url)"
+        echo
+        printf "  ${CYAN}其它客户端用这个${RESET}  ${DIM}(只有节点和 DNS, 入站由客户端自己管)${RESET}\n"
         printf "    %s\n" "$(sub_url)"
         echo
-        printf "  ${DIM}这个地址带 token, 局域网里没有它的人拉不到配置。${RESET}\n"
-        printf "  ${DIM}泄露了就在下面「重置 token」换一个新的。${RESET}\n"
+        printf "  ${DIM}区别: 带 /tun 的那份里有 tun 入站, 手机上会弹出 VPN 权限、\n"
+        printf "  ${DIM}状态栏出现钥匙图标, 流量真正被接管。不带的那个只有节点和\n"
+        printf "  ${DIM}DNS —— 适合已经自带 TUN 开关的 GUI 客户端, 或者你想把节点\n"
+        printf "  ${DIM}并进自己已有的配置里。${RESET}\n"
+        echo
+        printf "  ${DIM}地址带 token, 局域网里没有它的人拉不到。泄露了就用下面\n"
+        printf "  ${DIM}「重置 token」换一个新的。${RESET}\n"
     fi
 }
 
