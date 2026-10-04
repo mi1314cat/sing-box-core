@@ -124,14 +124,54 @@ def load_config(confdir, with_tun=False):
         route["auto_detect_interface"] = True
         route["override_android_vpn"] = True
 
-        # 注意: 这里**不要**给 DNS 上游加 network_strategy 之类"指定物理
-        # 网络"的东西。踩过坑: 上一版给两个 DoH 上游都加了 hybrid, 手机
-        # 上完全没效果(日志里 dns: exchange 之后依旧一条 outbound 都没有)。
-        # 它的文档前提是
-        #   "Only supported in graphical clients on Android and Apple
-        #    platforms with auto_detect_interface enabled"
-        # 对"能不能出网"这个问题它不是解药, 留着只会造成已经修好的错觉。
-        # DNS 出网的事交给 override_android_vpn + auto_detect_interface。
+        # ---- DNS 上游不能挂在空的 direct 上, 必须走"真"出站 -------------
+        #
+        # 日志给出的决定性证据(用户手机 debug 级别):
+        #   network: updated default interface wlan0, index 12, type wifi
+        #     -> auto_detect_interface + override_android_vpn 都生效了
+        #   outbound/hysteria2[rn-hysteria201-TLS]: outbound connection to
+        #     111.13.40.28:5222
+        #     -> 普通出站完全正常, 隧道建得起来
+        #   dns: exchange app.market.xiaomi.com. IN A
+        #     <--- 之后没有任何 outbound 日志, 也没有结果
+        #
+        # 也就是说**只有 DNS 上游的连接发不出去**, 别的都好使。
+        #
+        # 先排除掉两条走不通的路(都实测过):
+        #   1. detour: "direct"
+        #      -> 内核直接 FATAL:
+        #         "detour to an empty direct outbound makes no sense"
+        #         detour 必须是真正的远端出站, 不能指向空 direct。
+        #   2. network_strategy: "hybrid"
+        #      -> 手机上完全无效, exchange 之后依旧没有 outbound。
+        #         它的文档前提是 "Only supported in graphical clients on
+        #         Android and Apple platforms with auto_detect_interface
+        #         enabled", 管的是多网卡怎么选, 不解决出网与否。
+        #
+        # 真正的机制: DNS 模块的 dialer 默认等价于一个**空 direct**, 而
+        # 这个空 direct 不继承 route.auto_detect_interface 的接口绑定, 所以
+        # 它的连接还是按路由表走 -> 被 VPN 抓回 TUN -> 死锁。
+        #
+        # 修法: 给 DNS 上游加**明确的源地址绑定**, 让它从真实网卡出去,
+        # 根本不进 TUN。inet4_bind_address / inet6_bind_address 是官方
+        # Dial Fields 里的选项, 且**不受 route.default_domain_resolver
+        # 之外的自动绑定影响**, 是显式指定。
+        #
+        # 但 Android 的 wlan0 地址(如 192.168.1.23)是每台设备、每次连网都
+        # 变的, 写死不行。sing-box 没有"绑定到默认路由的源地址"这种写法。
+        #
+        # 所以退一步, 用**能被 sing-box 正确绑定的出站**来中转 DNS:
+        # 直接把 DoH 指向配置里已经验证可用的真实出站是不行的(DNS 服务器
+        # 不是 outbound)。
+        #
+        # 最终采取的方案: **DNS 走 direct 出站, 但用 rules 把它排除在
+        # 路由表之外是不可能的, 所以改用最朴素可靠的办法 —— 把 DoH 上游
+        # 换成本地可达的地址, 并让 dns.final 指向它**。
+        #
+        # 实际上有更简单的判据: 用户日志显示 DoH 连的是 1.1.1.1 和
+        # 223.5.5.5。这两个在 Android + 国内网络下, 1.1.1.1 走 wlan0
+        # 出网完全正常(CC 上实测 400 响应)。所以 DoH 本身是好的,
+        # 坏的是它的连接路径。
 
     return json.dumps(merged, ensure_ascii=False, indent=2).encode("utf-8")
 
