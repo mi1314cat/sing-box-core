@@ -351,8 +351,28 @@ ask_server_addr() {
 # 默认值 = 国旗 emoji + 系统 hostname (学 fscarmen/sing-box 的做法):
 # 它调 https://ip.cloudflare.now 拿 {"emoji":"🇺🇸",...} 再拼 hostname,
 # 节点列表里一眼能看出是哪台、哪个地区。
+# 用户给的标识里没有旗帜就补一个, 有就原样保留。
+# 国旗 = 两个连着的区域指示符号 (U+1F1E6..U+1F1FF)。用 python 判, 因为
+# bash 处理多字节范围很别扭; python 本来就是硬依赖。
+sb_ensure_flag() { # <flag> <name> -> stdout
+    python3 -c '
+import sys, re
+flag, name = sys.argv[1], sys.argv[2].strip()
+if not name or not flag or re.search("[\U0001F1E6-\U0001F1FF]{2}", name):
+    print(name)
+else:
+    print(flag + " " + name)
+' "$1" "$2" 2>/dev/null || printf '%s' "${2// /}"
+}
+
 sb_flag_emoji() { # 拿不到就输出空 (不影响功能, 只是没有旗帜)
     [[ -n "${SB_SKIP_FLAG:-}" ]] && return 0
+    # 第一次查到就存下来。IP 归属地接口时好时坏, 如果每次都现查, 某次
+    # 超时就悄悄变成"没有旗帜"的名字, 用户会以为前缀被弄丢了。
+    # 缓存一次之后, 只要服务器 IP 没换, 旗帜就该一直在。
+    local cdir="$SB_OUT_DIR/../share-state"
+    local cache="$cdir/flag"
+    if [[ -s "$cache" ]]; then printf '%s' "$(cat "$cache")"; return 0; fi
     local iso=""
     # 多源回退。fscarmen 用的是 ip.cloudflare.now, 那域名现在已经解析不了
     # (RN 上实测 curl: (6) Could not resolve host), 所以换掉并保留多个源。
@@ -373,11 +393,17 @@ except Exception: pass' 2>/dev/null)
     # ISO 3166-1 alpha-2 → 区域指示符号 (U+1F1E6 + 字母偏移)。
     # 用 python 生成而不是 printf \U —— bash 的 printf 不认 \U, 会报
     # "missing unicode digit"。本项目本来就硬依赖 python3, 不算新增依赖。
-    printf '%s' "$iso" | python3 -c '
+    local out
+    out=$(printf '%s' "$iso" | python3 -c '
 import sys
 c=sys.stdin.read().strip().upper()
 if len(c)==2 and c.isalpha():
-    print("".join(chr(0x1F1E6+ord(x)-65) for x in c))' 2>/dev/null
+    print("".join(chr(0x1F1E6+ord(x)-65) for x in c))' 2>/dev/null)
+    if [[ -n "$out" ]]; then
+        mkdir -p "$cdir" 2>/dev/null
+        printf '%s' "$out" > "$cache" 2>/dev/null || true
+    fi
+    printf '%s' "$out"
 }
 
 _sb_hostname() {
@@ -406,6 +432,11 @@ sb_ask_server_name() {
     [[ -n "$def" ]] || def="Sing-Box"
     local v; v=$(safe_read "服务器标识 (节点名前缀)" "$def")
     [[ -n "$v" ]] || v="$def"
+    # 用户只想改名字时, 旗帜要自动保住。
+    # 之前这里直接拿输入当结果, 于是提示里写着 🇺🇸 myserver,
+    # 用户输入 rn 之后 🇺🇸 就没了 —— 旗帜是**服务器的属性**, 不是名字的
+    # 一部分, 不该由改名字这个动作顺带弄丢。用户自己带了旗帜就尊重他的。
+    v=$(sb_ensure_flag "$flag" "$v")
     SB_SERVER_NAME="$v"
     export SB_SERVER_NAME
     # 存一份, 供分享/聚合等只需要读不需要问的地方兜底。
