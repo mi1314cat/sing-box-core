@@ -98,8 +98,81 @@ sb_proxy_apply() { # $1 = 代理地址; 空 = 直连
     fi
 }
 
+
+sb_proxy_show() {
+    local f="$SB_PROXY_MODE_FILE" cur="auto"
+    [[ -s "$f" ]] && cur=$(head -1 "$f" 2>/dev/null)
+    printf '%s' "$cur"
+}
+sb_proxy_set_mode() { # $1 = auto|off|<url>
+    mkdir -p "$(dirname "$SB_PROXY_MODE_FILE")" 2>/dev/null
+    printf '%s' "$1" > "$SB_PROXY_MODE_FILE" 2>/dev/null || true
+}
+
+proxy_settings_menu() {
+    while true; do
+        local cur; cur=$(sb_proxy_show)
+        local desc
+        case "$cur" in
+            off) desc="强制直连 (不使用任何代理)" ;;
+            auto) desc="自动 (有环境变量就用, 否则探测本机端口)" ;;
+            http*|socks5*) desc="固定使用 $cur" ;;
+            *) desc="未知 ($cur)" ;;
+        esac
+        ui_title "下载通道"
+        ui_kv_ascii "当前" "$desc"
+        echo
+        ui_menu 1 "自动 (环境变量 / 探测本机代理)"
+        ui_menu 2 "强制直连 (不走任何代理)"
+        ui_menu 3 "固定使用某个代理地址"
+        ui_menu 4 "扫描本机可用代理端口"
+        ui_menu 0 "返回"
+        ui_rule
+        read -r -p "请输入选项 [0-4]: " c || return 0
+        case "$c" in
+            1) sb_proxy_set_mode auto;   print_ok "已设为: 自动" ;;
+            2) sb_proxy_set_mode off;    print_ok "已设为: 强制直连" ;;
+            3)
+                read -r -p "  代理地址 (如 http://127.0.0.1:7890, 留空=取消): " a || return 0
+                a="${a// /}"
+                if [[ -z "$a" ]]; then print_msg "已取消"; continue; fi
+                if [[ "$a" != http://* && "$a" != https://* && "$a" != socks5://* && "$a" != socks5h://* ]]; then
+                    print_err "需要以 http:// / https:// / socks5:// 开头"; continue
+                fi
+                sb_proxy_set_mode "$a"; print_ok "已设为: $a" ;;
+            4)
+                sb_proxy_scan
+                if (( ${#SB_PROXY_CANDS[@]} == 0 )); then
+                    print_warn "本机未发现可用代理端口"
+                else
+                    print_msg "发现 ${#SB_PROXY_CANDS[@]} 个:"
+                    local i
+                    for i in "${!SB_PROXY_CANDS[@]}"; do
+                        printf "  %d) %s\n" "$((i+1))" "${SB_PROXY_CANDS[$i]}" >&2
+                    done
+                fi ;;
+            0) return ;;
+            *) print_err "无效选项 $c" ;;
+        esac
+    done
+}
+
 sb_pick_proxy() { # 让用户选下载通道; 默认直连。$1 = 用途说明(给提示文案用)
     # 已显式配置: 不打扰
+    # 用户在「客户端设置 → 下载通道」里选过的模式优先于一切。
+    # 之前只看环境变量, 结果机器上一个历史遗留的 http_proxy 就把整个面板
+    # 的下载都带上了代理, 用户既不知道也没地方关 —— 现在有地方改了。
+    local pmode; pmode=$(sb_proxy_show)
+    case "$pmode" in
+        off)
+            unset http_proxy https_proxy all_proxy 2>/dev/null || true
+            print_msg "下载通道: 强制直连 (按设置)"
+            return 0 ;;
+        http://*|https://*|socks5://*|socks5h://*)
+            sb_proxy_apply "$pmode"
+            print_msg "下载通道: $pmode (按设置)"
+            return 0 ;;
+    esac
     if [[ -n "${https_proxy:-}${http_proxy:-}" ]]; then
         print_msg "下载通道: 环境变量 ${https_proxy:-$http_proxy}"
         return 0
@@ -143,6 +216,11 @@ CLASH_SECRET_FILE="${CLASH_SECRET_FILE:-$CLIENT_ROOT/.clash-secret}"
 SUBS_FILE="${SUBS_FILE:-$CLIENT_ROOT/subscriptions.json}"
 # 订阅格式转换器 (install.sh 随 client.sh 一起复制过来)
 SB_TO_SB="${SB_TO_SB:-$CLIENT_ROOT/share-state/to_sb.py}"
+
+# 下载通道选择 (auto / off / 代理地址)。
+# 必须放在 CLIENT_ROOT 之后 —— 之前它写在前面, set -u 下引用未定义的
+# CLIENT_ROOT 直接让整个面板起不来 (line 121: unbound variable)。
+SB_PROXY_MODE_FILE="${SB_PROXY_MODE_FILE:-$CLIENT_ROOT/share-state/proxy-mode}"
 
 # ---------- DNS (防泄露) ----------
 # 目标: 客户端所有域名解析都走代理, 不给"明文 53 走直连"留口子。
@@ -775,29 +853,42 @@ subs_menu() {
             i=$((i+1))
         done < <(jq -r '.subs[]?|[.id,.name,.prefix,(.nodes|tostring),.url]|@tsv' "$SUBS_FILE" 2>/dev/null)
         echo
-        printf "  ${CYAN}%s${RESET}U) 更新选中的订阅 (重拉并重建它的节点)\n" "$i"
-        printf "  ${CYAN}%s${RESET}D) 删除选中的订阅 (连同它的节点)\n" "$i"
-        printf "  ${CYAN}%s${RESET}A) 更新全部订阅\n" "$i"
+        printf "  ${CYAN}%d)${RESET} 更新选中的订阅 (输入它的编号, 重拉并重建节点)\n" "$i"
+        i=$((i+1)); printf "  ${CYAN}%d)${RESET} 删除选中的订阅 (输入它的编号, 连同节点一起删)\n" "$i"
+        i=$((i+1)); printf "  ${CYAN}%d)${RESET} 更新全部订阅\n" "$i"
         printf "  ${RED}0)${RESET} 返回\n"
-        local c sel sid
-        read -r -p "  请输入操作: " c || { echo; return 0; }
+        # 菜单上显示成连续编号: 1..N 是订阅, N+1 更新选中, N+2 删除选中,
+        # N+3 更新全部, 0 返回。
+        # 之前这里显示的是 "2]U) 2]D) 2]A)" —— $i 是循环结束后的值, 三行
+        # 全打成同一个数字, 看着像坏掉的索引; 而派发却只认字母, 输 2 反而
+        # 报"无法识别的操作"。显示和实际接受的东西对不上。
+        local nsub="$n" c sel sid act_total act_del act_all
+        act_total=$((nsub+1)); act_del=$((nsub+2)); act_all=$((nsub+3))
+        read -r -p "  请输入操作 [0-$act_all]: " c || { echo; return 0; }
         c="${c// /}"
         [[ -z "$c" || "$c" == "0" ]] && return 0
-        case "${c^^}" in
-            A) sub_update_all; continue ;;
-            U|D)
-                [[ "$c" =~ ^[0-9]+$ ]] || { print_err "请输入编号或 U/D/A"; continue; }
-                sel="$c"
-                sid=$(jq -r --argjson i "$sel" '(.subs//[])[$i-1].id // empty' "$SUBS_FILE" 2>/dev/null)
-                [[ -n "$sid" ]] || { print_err "没有编号 $sel"; continue; }
-                if [[ "${c^^}" == "U" ]]; then
-                    sub_update_one "$sid" && regen_selector && apply_change "订阅已更新"
-                else
-                    sub_delete_one "$sid"
-                fi
-                ;;
-            *) print_err "无法识别的操作" ;;
-        esac
+        [[ "$c" =~ ^[0-9]+$ ]] || { print_err "请输入编号 (1-$act_all) 或 0 返回"; continue; }
+        if [[ "$c" == "$act_all" ]]; then
+            sub_update_all; continue
+        fi
+        if [[ "$c" == "$act_total" || "$c" == "$act_del" ]]; then
+            # 这两个还要再问一次"哪一条", 因为它们带参数
+            read -r -p "  哪一条订阅? 编号 [1-$nsub]: " sel || { echo; continue; }
+            sel="${sel// /}"
+            [[ "$sel" =~ ^[0-9]+$ ]] || { print_err "请输入 1-$nsub"; continue; }
+            sid=$(jq -r --argjson i "$sel" '(.subs//[])[$i-1].id // empty' "$SUBS_FILE" 2>/dev/null)
+            [[ -n "$sid" ]] || { print_err "没有编号 $sel"; continue; }
+            if [[ "$c" == "$act_total" ]]; then
+                sub_update_one "$sid" && regen_selector && apply_change "订阅已更新"
+            else
+                sub_delete_one "$sid"
+            fi
+            continue
+        fi
+        # 其余都当"更新这一条"处理 (最常用的操作, 让它最顺手)
+        sid=$(jq -r --argjson i "$c" '(.subs//[])[$i-1].id // empty' "$SUBS_FILE" 2>/dev/null)
+        [[ -n "$sid" ]] || { print_err "没有编号 $c"; continue; }
+        sub_update_one "$sid" && regen_selector && apply_change "订阅已更新"
     done
 }
 
@@ -1238,9 +1329,10 @@ settings_menu(){
         ui_menu 5 "查看当前配置文件"
         ui_menu 6 "端口占用检测"
         ui_menu 7 "查看/显示 Clash 密钥"
+        ui_menu 8 "下载通道 (拉订阅/内核/UI 走不走代理)"
         ui_menu 0 "返回主菜单"
         ui_rule
-        read -r -p "请输入选项 [0-7]: " c || return 0
+        read -r -p "请输入选项 [0-8]: " c || return 0
         case "$c" in
             1) set_mixed_port ;;
             2) set_clash_port ;;
@@ -1249,6 +1341,7 @@ settings_menu(){
             5) show_conf ;;
             6) port_check_menu ;;
             7) show_secret ;;
+            8) proxy_settings_menu ;;
             0) return ;;
             *) print_err "无效选项 $c" ;;
         esac
