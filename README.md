@@ -901,6 +901,27 @@ http://<本机地址>:9293/sub/<32位随机token>/tun     # 额外带 TUN 入站
 | `route.rules[0] = sniff` | ✅ 自动插入 | ❌ | 见下 |
 | `experimental` | ❌ | ❌ | 见下 |
 
+**为什么 `/tun` 版不写 `stack` 字段**：省略即默认 `system`，覆盖面最广。
+曾经写成 `mixed`，结果手机直接起不来：
+
+```
+start inbound/tun[tun-in]: gVisor is not included in this build,
+rebuild with -tags with_gvisor
+```
+
+`mixed` 的语义是「system 的 TCP + **gVisor 的 UDP**」—— 也就是说 TCP 走内核态，
+**UDP 那一半仍然要 gVisor**。官方 App 和多数第三方内核没有 `with_gvisor`
+构建标签，必然踩这个坑。
+
+三个容易踩的点：
+
+1. `sing-box check` **不验证 gVisor 是否真编进内核**，要到 `start inbound`
+   时才报错。所以本地测永远是绿的，只有真实用户设备才暴露 —— 这个 bug
+   靠测试发现不了，只能靠「不发可能不兼容的值」来躲。
+2. `stack` 字段在 sing-box 1.15.0 已废弃，1.17.0 移除。不写它，新版本也
+   不会报 deprecated，语义还正好是想要的 `system`。
+3. 想要 gVisor 只能让对方换一个带 `with_gvisor` 标签的内核，改配置解决不了。
+
 **为什么默认不带 `inbounds`**：别的设备要用 TUN 还是 SOCKS、监听哪个端口，
 是它自己的事。把本机的 `2080` 硬塞过去，既可能端口冲突，也可能把它的本机
 代理暴露出去（`listen: 0.0.0.0`）。需要 TUN 时用 `/tun` 那个地址，那份里

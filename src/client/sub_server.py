@@ -39,8 +39,18 @@ def load_token(path):
         return ""
 
 
-# TUN 入站模板。stack 用 mixed: gvisor 纯用户态兼容性最好但慢, system
-# 最快但个别安卓 ROM 有内核 bug, mixed 是目前最稳的折中。
+# TUN 入站模板。
+#
+# 不写 stack —— 省略即默认 system, 这是覆盖面最广的选择:
+#   1. mixed 的语义是 "system 的 TCP + gVisor 的 UDP"。也就是说即使 TCP
+#      走内核态, **UDP 那一半仍然要 gVisor**。官方 App 和多数第三方内核
+#      没有 with_gvisor 构建标签, 发 mixed 过去手机直接起不来, 报
+#      "gVisor is not included in this build, rebuild with -tags with_gvisor"。
+#   2. stack 这个字段本身在 1.15.0 已废弃, 1.17.0 移除。不写它就不会
+#      在新版本上报 deprecated, 语义还正好是想要的 system。
+#   3. sing-box check **不验证 gVisor 是否真编进内核**, 要到 start inbound
+#      才炸。所以本机(带 gVisor)测永远是绿的, 只有用户手机才暴露。
+#      这个坑只能靠"不发可能不兼容的值"来躲, 没法靠测试发现。
 TUN_INBOUND = {
     "type": "tun",
     "tag": "tun-in",
@@ -48,7 +58,6 @@ TUN_INBOUND = {
     "mtu": 9000,
     "auto_route": True,
     "strict_route": True,
-    "stack": "mixed",
 }
 
 
