@@ -62,43 +62,24 @@ TUN_INBOUND = {
 
 
 
-def _doh_reachable(server, port, sni, timeout=4.0):
-    """直连探测一个 DoH 上游是否可用。不走代理, 模拟 DNS 模块的真实行为。"""
-    import socket
-    import ssl
-    try:
-        raw = socket.create_connection((server, port), timeout=timeout)
-    except OSError:
-        return False
-    try:
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        s = ctx.wrap_socket(raw, server_hostname=sni or None)
-        s.close()
+def _is_foreign_resolver(srv):
+    """判断一个 DNS 上游是不是境外解析器。
+
+    走隧道时, 境外解析器返回的地址与代理出口匹配(谷歌等境外站点正常),
+    国内解析器返回的是国内线路地址, 与境外出口不匹配。所以境外优先。
+
+    只认明确的境外 DoH 公共解析器, 认不出来就当国内的(保守)。
+    """
+    host = str(srv.get("server", "")).lower()
+    if host in ("1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4",
+                "9.9.9.9", "149.112.112.112", "208.67.222.222"):
         return True
-    except OSError:
-        return False
-    finally:
-        try:
-            raw.close()
-        except OSError:
-            pass
-
-
-def _first_reachable(servers):
-    """返回第一个直连可达的 DoH 服务器的 tag; 都不行则返回 None。"""
-    for srv in servers:
-        if srv.get("type") not in ("https", "quic"):
-            continue
-        addr = srv.get("server")
-        if not addr:
-            continue
-        port = srv.get("server_port") or 443
-        sni = srv.get("tls", {}).get("server_name") or addr
-        if _doh_reachable(addr, port, sni):
-            return srv.get("tag")
-    return None
+    name = str(srv.get("tls", {}).get("server_name", "")).lower()
+    for dom in ("cloudflare-dns.com", "dns.google", "dns.quad9.net",
+                "dns.nextdns.io"):
+        if name.endswith(dom):
+            return True
+    return False
 
 
 def load_config(confdir, with_tun=False):
@@ -195,14 +176,53 @@ def load_config(confdir, with_tun=False):
         #
         # 修法(最小): TUN 模式下把 dns.final 指向**实测直连可达**的上游。
         # 不改节点、不改协议、不改标签、不改订阅结构。
+        # ---- DNS 必须走隧道, 否则既泄露又解析到国内 IP -------------------
+        #
+        # 用户反馈: 手机上"有些网页能打开, 但 DNS 泄露了, 谷歌搜索不流畅"。
+        # 三者是同一个根因。
+        #
+        # 上一版只把 dns.final 指向了**直连可达**的 223.5.5.5, 那只是让
+        # DNS 能出网, 但它是阿里 DNS —— 解析结果按**国内**线路下发, 而且
+        # 这个查询本身是**明文可见地发给国内运营商的**(就算加密也仍是国内
+        # 解析器)。于是:
+        #   * DNS 泄露检测会报出 223.5.5.5
+        #   * google.com 解析到国内优化的地址, 但流量又从海外出口出去,
+        #     两者不匹配 -> 搜索慢、不稳定
+        #
+        # 正确做法: 让 DNS 查询本身也走代理隧道, 这样
+        #   * 解析器看到的是代理出口 IP, 不会泄露
+        #   * 返回的地址按境外线路下发, 和出口匹配 -> 谷歌等恢复正常
+        #
+        # 实测 detour 是否真的生效(两组对照, 上游都指到直连不通的 9.9.9.9):
+        #   无 detour:     dns: lookup failed: dial tcp 9.9.9.9:44...
+        #                  (直连, 失败)
+        #   detour=PROXY: outbound/anytls[...]: outbound connection to
+        #                  9.9.9.9:443
+        #                  (DNS 确实进了隧道)
+        # 结论: detour 指向 selector 时, DNS 会复用该出站的连接。
+        #
+        # 注意 detour 不能指向 direct —— 内核会 FATAL:
+        #   "detour to an empty direct outbound makes no sense"
+        #
+        # 上游选谁: 走隧道后不再受"本地能否直连"限制, 所以优先用境外
+        # 解析器(1.1.1.1), 它的结果与境外出口匹配; 境外那个不可用时
+        # 再退到国内的那个。
         dns = merged.get("dns")
         if isinstance(dns, dict):
             servers = dns.get("servers", [])
-            # 逐个直连探测, 取可达的第一个当 final。
-            # 探测失败不阻塞: 拿不到结果就退回第一个服务器, 行为与改之前一致。
-            reachable = _first_reachable(servers)
-            if reachable:
-                dns["final"] = reachable
+            # 走隧道后, 优先级不再由"本地直连可达性"决定, 而是由
+            # "解析结果是否与代理出口匹配"决定 —— 境外解析器优先。
+            foreign = [x for x in servers
+                       if _is_foreign_resolver(x)]
+            domestic = [x for x in servers if x not in foreign]
+            ordered = foreign + domestic
+            for srv in ordered:
+                # detour 只对需要出网的上游有意义; local/hosts 没有 dial 阶段
+                if srv.get("type") in ("https", "quic", "tls", "h3",
+                                       "http", "tcp", "udp"):
+                    srv["detour"] = "PROXY"
+            if ordered:
+                dns["final"] = ordered[0]["tag"]
 
     return json.dumps(merged, ensure_ascii=False, indent=2).encode("utf-8")
 
