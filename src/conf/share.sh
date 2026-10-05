@@ -90,6 +90,10 @@ for f in sorted(glob.glob(os.path.join(odir,"sb_client-*.json"))):
     base=os.path.basename(f)
     if base=="sb_client-all.json": continue
     for o in json.load(open(f)).get("outbounds",[]):
+        # 排除控制型与特殊出站, 它们不该出现在客户端订阅里。
+        # "block"/"dns" 是 sing-box 1.11.0 起的废弃特殊出站; 虽然面板已经
+        # 不再生成它们, 过滤列表仍保留 —— 这样万一配置里存着历史遗留的
+        # block 出站, 也不会被带进客户端(客户端同样会带着废弃字段)。
         if o.get("type") in ("selector","urltest","direct","block","dns"): continue
         if o.get("tag") in seen: continue
         seen.add(o.get("tag")); obs.append(o)

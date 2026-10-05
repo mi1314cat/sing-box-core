@@ -381,7 +381,13 @@ ob_form_naive() {
 }
 
 ob_form_direct() { echo '{"type": "direct"}'; }
-ob_form_block()  { echo '{"type": "block"}'; }
+# 注意: 不要再提供 "block" 特殊出站。
+# 它属于 sing-box 1.11.0 起的废弃特殊出站(与 "dns" 一起), 官方已改用
+# rule action 表达 —— 阻断用 {"action":"reject"}, 劫持 DNS 用
+# {"action":"hijack-dns"}。迁移文档:
+#   https://sing-box.sagernet.org/migration/#1150 (Legacy special outbounds)
+# 历史原因: 过去这个菜单项会生成 {"type":"block"} 并写进配置, 导致配置
+# 带着废弃字段。现在改成提示 + 引导用规则, 不再生成。
 
 ob_pick_tags_multi() { # 控制型出站: 从现有 tag 中多选
     local tags=() i=1 t sel
@@ -431,7 +437,7 @@ manual_add() {
   控制型 (聚合已有出站, 不需要服务器)
   11) selector    12) urltest
   特殊用途
-  13) direct     14) block
+  13) direct
 MENU
     if ! ob_type_ok naive; then
         echo -e "  ${YELLOW}注: 本内核不含 naive(NaiveProxy) 出站所需的 cronet 库, 已隐藏该选项${RESET}" >&2
@@ -456,7 +462,10 @@ MENU
         11) form=$(ob_form_selector) ;;
         12) form=$(ob_form_urltest) ;;
         13) form=$(ob_form_direct) ;;
-        14) form=$(ob_form_block) ;;
+        14) print_error "block 出站已移除 (sing-box 1.11.0 起废弃)"
+            print_info "需要阻断某些流量, 请改用路由规则: {\"action\":\"reject\", ...}"
+            print_info "需要把 DNS 交给 sing-box, 用 {\"action\":\"hijack-dns\"}"
+            return 1 ;;
         15) ob_type_ok naive || { print_error "本内核不支持 naive 出站"; return 1; }
             form=$(ob_form_naive) ;;
         0|"") return 0 ;;
