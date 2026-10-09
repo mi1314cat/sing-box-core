@@ -4,7 +4,7 @@
 outbound_remote.py — 服务端出站: 从「远程配置(分享链接)」拉取节点
 
 复用的是项目已有的分享机制本身, 不另造一套订阅系统:
-  分享端 (share.sh/share_server.py) 下发的就是一份 sing-box 配置 JSON,
+  分享端 (share.sh → 公共分享服务) 下发的就是一份 sing-box 配置 JSON,
   其中 .outbounds[] 的每一项本身就是完整可用的 outbound 对象。
   所以这里不需要"协议解析/字段转换", 只需:
     1. 按 client.sh add_node 的同一套 HTTP 语义取回 (200/404/410/503)

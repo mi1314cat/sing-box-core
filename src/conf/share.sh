@@ -3,10 +3,10 @@
 # share.sh — 分享链接管理（Server 端）
 # CLI:
 #   bash share.sh create <tag> [max_uses=1] [ttl_hours=24]
-#   bash share.sh list | del <token|tag> | toggle <token|tag> | regen <token|tag>
-# URL: http://<server_ip>:9292/share/<token>
-# 目录: $SB_ROOT/share/shares/<token>.json (元数据); client_file 指向 out/sb_client-<tag>.json
-# 并发/原子语义由 share_server.py 的 flock 保证
+#   bash share.sh list | del <编号|token|tag> | toggle ... | regen ...
+# URL: http://<server_ip>:<公共服务端口>/share/<token>   (端口由 sb_share_port 读, 不写死)
+# 存储: **公共分享服务** proxy-share-service (provider=sing-box), 不再是本地 JSON 文件
+# 并发/原子语义由公共分享服务保证 (先扣后发 + 双层互斥)
 # ==============================================================
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
@@ -15,15 +15,74 @@ SHARED="$SHARE_BASE/shares"
 mkdir -p "$SHARED"
 touch "$SHARE_BASE/.share.lock"
 
-meta_file() {
-    # 参数: token 或 tag; 输出元数据文件路径
-    [[ -f "$SHARED/$1.json" ]] && { echo "$SHARED/$1.json"; return; }
-    local f
-    for f in "$SHARED"/*.json; do
-        [[ -f "$f" ]] || continue
-        if [[ "$(jq -r .tag "$f" 2>/dev/null)" == "$1" ]]; then echo "$f"; return; fi
-    done
+# ==============================================================
+# 公共分享服务适配层
+#
+# ★ 分享的存储与生命周期 (Token / TTL / max_uses / 次数 / 过期) 归**公共服务**
+#   proxy-share-service —— 它是服务器上的公共基础服务, M / SB / X 共用,
+#   不是 SB 的子服务。
+#
+#   SB 只负责: 生成客户端配置内容、决定什么时候创建与刷新、面板怎么展示。
+#
+#   provider 固定为 sing-box —— 公共服务的列表/删除接口**强制**要求带
+#   provider 参数, 所以 SB 在结构上不可能看到、也不可能误删 M 的记录。
+# ==============================================================
+SHARE_CLIENT="${SHARE_CLIENT:-$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/share_client.py}"
+
+# 公共服务的实际端口 —— 它可能因端口回避而不是 9443, 绝不能写死
+sb_share_port() {
+    local p=""
+    [[ -f "$SHARE_CLIENT" ]] && p=$(python3 "$SHARE_CLIENT" port 2>/dev/null)
+    printf '%s' "${p:-9443}"
 }
+
+# 确保公共服务在位 (不存在则从独立项目安装)。装有检验、幂等, 多内核共用。
+# 返回值约定: 成功时 **stdout 输出端口**, 同时退出码 0; 失败退出码非 0。
+# (曾经只返回退出码, 调用方却写 port=$(sb_share_ensure) 再判空 ——
+#  于是服务明明活着也永远判成"不可用"。端口只在这一处吐, 不再各处自己拼。)
+sb_share_ensure() {
+    [[ -f "$SHARE_CLIENT" ]] || return 1
+    local p
+    p=$(python3 "$SHARE_CLIENT" ensure 2>/dev/null) || return 1
+    printf '%s' "${p:-$(sb_share_port)}"
+}
+
+_sb_share_api() { python3 "$SHARE_CLIENT" "$@"; }
+
+# 列出 SB 自己的分享 (JSON 数组, 创建时间倒序)。可选按 type 过滤。
+_sb_share_list() {
+    if [[ -n "${1:-}" ]]; then _sb_share_api list --type "$1" 2>/dev/null
+    else _sb_share_api list 2>/dev/null; fi
+}
+
+# 挑一条分享: 支持 编号 / token / token 前缀 / tag。
+# 输出 **token**(不再返回文件路径 —— 存储已经不在本地了)。
+_sb_share_find() {
+    local c="${1:-}" js
+    js=$(_sb_share_list)
+    [[ -z "$js" || "$js" == "[]" ]] && return 1
+    printf '%s' "$js" | python3 -c '
+import sys, json
+c = sys.argv[1]
+try: recs = json.load(sys.stdin)
+except Exception: recs = []
+if c.isdigit():
+    i = int(c)
+    if 1 <= i <= len(recs):
+        print(recs[i-1]["token"]); raise SystemExit
+for r in recs:
+    t = r.get("token",""); tg = str((r.get("meta") or {}).get("tag",""))
+    if t == c or t.startswith(c) or tg == c:
+        print(t); raise SystemExit
+raise SystemExit(1)
+' "$c"
+}
+
+meta_file() {
+    # 参数: 编号 / token / token 前缀 / tag; 输出 **token**
+    _sb_share_find "$1" 2>/dev/null
+}
+
 
 # IPv6 必须包方括号, 否则 "http://2001:db8::1:9292/..." 里的端口会被
 # 并进地址, 客户端解析成非法 host 而失败。
@@ -53,11 +112,14 @@ ask_addr_family_now() {
     esac
 }
 
-share_url_for() {
-    local host; host=$(sb_addr_current)
+
+share_url_for() {   # 入参改成 token (存储已不在本地, 不再接受文件路径)
+    local tok="${1:-}" host
+    host=$(sb_addr_current)
     [[ -z "$host" ]] && host=$(default_server_ip)
-    echo "http://$(sb_url_host "$host"):9292/share/$(jq -r .share_token "$1")"
+    echo "http://$(sb_url_host "$host"):$(sb_share_port)/share/$tok"
 }
+
 
 # 聚合全部节点 outbound → 一份 client profile (selector PROXY + urltest AUTO + route.final)
 gen_full_profile() {
@@ -177,165 +239,193 @@ ttl_prompt() {
     esac
 }
 
-create_share() { 
+
+create_share() { # <tag> [max_uses=1] [ttl_hours=24]
     local tag="$1" max_uses="${2:-1}" ttl="${3:-24}"
     [[ -n "$tag" ]] || { print_error "用法: share.sh create <tag> [max_uses] [ttl_hours]"; return 1; }
     local client_file="$SB_OUT_DIR/sb_client-$tag.json"
     [[ -f "$client_file" ]] || { print_error "找不到 $tag 的客户端配置 ($client_file)"; return 1; }
-    # 参数校验 (在任何旧数据被改动之前)
     [[ "$max_uses" =~ ^[0-9]+$ ]] || { print_error "max_uses 必须是非负整数 (0=不限), 收到: $max_uses"; return 1; }
     [[ "$ttl" =~ ^[0-9]+$ ]] || { print_error "ttl_hours 必须是小时数 (0=永久), 收到: $ttl"; return 1; }
+
+    # 公共服务不在就装 (幂等; 已有则空操作)
+    local port; port=$(sb_share_ensure)
+    [[ -n "$port" ]] || { print_error "公共分享服务不可用 —— 分享链接暂时发不出去"; return 1; }
+
     # 同 tag 旧 token 全部下架 —— 设计如此(一个 tag 只保留一个有效链接),
-    # 但原先是静默删除, 用户手上的旧链接会毫无征兆地变成 404。
-    local old token now expires f
-    local revoked=0
-    for f in "$SHARED"/*.json; do
-        [[ -f "$f" ]] || continue
-        if [[ "$(jq -r .tag "$f" 2>/dev/null)" == "$tag" ]]; then
-            # 先留一份列表, 让用户知道哪些链接失效了
-            if (( revoked == 0 )); then
-                echo "  [注意] $tag 已存在旧链接, 重建会让它们立即失效 (404):" >&2
-            fi
-            echo "    - $(basename "$f" .json)" >&2
-            rm -f "$f"; revoked=$((revoked+1))
+    # 但要让用户知道哪些链接失效了(原来是静默删除)。
+    local old tok revoked=0
+    while IFS= read -r old; do
+        [[ -n "$old" ]] || continue
+        if (( revoked == 0 )); then
+            echo "  [注意] $tag 已存在旧链接, 重建会让它们立即失效:" >&2
         fi
-    done
+        echo "    - ${old:0:16}…" >&2
+        _sb_share_api delete --token "$old" >/dev/null 2>&1 && revoked=$((revoked+1))
+    done < <(_sb_share_list | python3 -c '
+import sys, json
+tag = sys.argv[1]
+try: recs = json.load(sys.stdin)
+except Exception: recs = []
+for r in recs:
+    if str((r.get("meta") or {}).get("tag","")) == tag: print(r.get("token",""))
+' "$tag" 2>/dev/null)
     (( revoked > 0 )) && print_warn "已作废 $revoked 个旧链接"
-    token=$(openssl rand -hex 16)      # 128-bit 密码学随机
-    now=$(date +%s)
-    # ttl=0 => 永久 (expires_at=0 表示永不过期; 服务端 0 跳过过期检查)
-    if [[ "$ttl" -gt 0 ]]; then expires=$((now + ttl*3600)); else expires=0; fi
-    python3 - "$SHARED" "$token" "$tag" "$client_file" "$max_uses" "$expires" <<'PY'
-import json,sys,os,time
-d,token,tag,cf,maxu,exp = sys.argv[1:7]
-meta={"share_token":token,"tag":tag,"client_file":cf,"created_at":int(time.time()),
-      "expires_at":int(exp),"max_uses":int(maxu),"used_count":0,
-      "enabled":True,"last_used_at":0}
-open(os.path.join(d,f"{token}.json"),"w").write(json.dumps(meta,indent=1))
-PY
-    local url; url="$(share_url_for "$SHARED/$token.json")"
+
+    local tmp rec token expires
+    tmp=$(mktemp)
+    if ! _sb_share_content_file "$tag" "$tmp"; then
+        rm -f "$tmp"; print_error "读取客户端配置失败: $client_file"; return 1
+    fi
+    local ttl_s=0; [[ "$ttl" -gt 0 ]] && ttl_s=$((ttl * 3600))
+    rec=$(_sb_share_api create --type node --content-file "$tmp" --ttl "$ttl_s" \
+            --max-uses "$max_uses" --meta "{\"tag\":\"$tag\"}" 2>/dev/null)
+    rm -f "$tmp"
+    token=$(printf '%s' "$rec" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("token",""))' 2>/dev/null)
+    [[ -n "$token" ]] || { print_error "公共服务创建分享失败"; return 1; }
+
+    local url; url="$(share_url_for "$token")"
     echo "$url" | tee "$SB_OUT_DIR/share_tag-$tag.txt"
-    if [[ "$ttl" -gt 0 ]]; then
+    expires=$(printf '%s' "$rec" | python3 -c 'import sys,json;print(int(json.load(sys.stdin).get("expires_at",0)))' 2>/dev/null)
+    if [[ "${expires:-0}" -gt 0 ]]; then
         print_ok "max_uses=$max_uses, 有效期 ${ttl} 小时 ($(date -d @$expires '+%F %T'))"
     else
         print_ok "max_uses=$max_uses, 有效期: 永久"
     fi
 }
 
+
   # 为聚合配置 (sb_client-all.json) 单独发一个 share token。
   # create_share 走单节点文件路径 (sb_client-<tag>.json), 聚合产物走不了那条路,
   # 于是菜单"全量聚合"承诺的 all-share URL 实际上从来没被生成过。
   # 这里直接对聚合文件发 token, 与单节点链接同一套元数据/消费语义。
-  make_aggregate_share() { # <max_uses> <ttl_hours>
-      local max_uses="${1:-1}" ttl="${2:-24}"
-      local client_file="$SB_OUT_DIR/sb_client-all.json"
-      [[ -f "$client_file" ]] || { print_error "找不到聚合配置: $client_file"; return 1; }
-      [[ "$max_uses" =~ ^[0-9]+$ ]] || { print_error "max_uses 必须是非负整数 (0=不限)"; return 1; }
-      [[ "$ttl" =~ ^[0-9]+$ ]] || { print_error "ttl_hours 必须是小时数 (0=永久)"; return 1; }
-      # 聚合链接与旧聚合 token 互斥: 一个 tag 只保留一个有效链接
-      local f
-      for f in "$SHARED"/*.json; do
-          [[ -f "$f" ]] || continue
-          [[ "$(jq -r .tag "$f" 2>/dev/null)" == "all" ]] && rm -f "$f"
-      done
-      local token now expires
-      token=$(openssl rand -hex 16)
-      now=$(date +%s)
-      if [[ "$ttl" -gt 0 ]]; then expires=$((now + ttl*3600)); else expires=0; fi
-      python3 - "$SHARED" "$token" "$max_uses" "$expires" "$client_file" <<'PY'
-import json,sys,os,time
-d,token,maxu,exp = sys.argv[1:5]
-# client_file 必须是绝对路径: 服务端用 os.path.isfile() 校验, 相对路径会按
-# share_server 的 CWD 解析而找不到文件, 返回 503 "config unavailable"。
-meta={"share_token":token,"tag":"all","client_file":sys.argv[5],
-      "created_at":int(time.time()),"expires_at":int(exp),
-      "max_uses":int(maxu),"used_count":0,"enabled":True,"last_used_at":0}
-open(os.path.join(d,f"{token}.json"),"w").write(json.dumps(meta,indent=1))
-PY
-      local url; url="$(share_url_for "$SHARED/$token.json")"
-      echo "$url" | tee "$SB_OUT_DIR/share_all.txt"
-      if [[ "$ttl" -gt 0 ]]; then
-          print_ok "聚合链接: max_uses=$max_uses, 有效期 ${ttl} 小时 ($(date -d @$expires '+%F %T'))"
-      else
-          print_ok "聚合链接: max_uses=$max_uses, 有效期: 永久"
-      fi
-  }
-share_files_sorted() { ls "$SHARED"/*.json 2>/dev/null | sort; }
+
+# 为聚合配置 (sb_client-all.json) 单独发一个 share token。
+# 与单节点链接同一套元数据/消费语义, 只是内容换成聚合产物。
+
+
+# 分享内容 = 客户端配置文件的**内容**(公共服务不解析它, 只存字节)。
+#
+# 旧实现存的是**文件路径**(client_file), 服务端访问时再去读那个文件 ——
+# 那要求内容一直留在本机、且路径不变。改成创建时读一次写入公共服务;
+# 内容变了由 share_refresh_all 主动 PUT 刷新(token/URL 不变)。
+_sb_share_content_file() { # <tag> <输出文件>  0=成功
+    local tag="$1" out="$2" src="$SB_OUT_DIR/sb_client-$tag.json"
+    [[ -f "$src" ]] || return 1
+    cp -f "$src" "$out" || return 1
+    grep -q '"outbounds"' "$out" 2>/dev/null
+}
+
+# ---------------------------------------------------------------- 内容保鲜
+#
+# SB 的客户端配置文件会被 regen-aggregate / 节点增删重新生成, 而已发出去的
+# 链接里存的是**创建时的快照**。这里在节点变化后主动刷新 —— token / URL /
+# TTL / 使用次数全部不变, 只换内容。内容没变就不写(比对 content_sha256)。
+share_refresh_all() {
+    local js; js=$(_sb_share_list)
+    [[ -z "$js" || "$js" == "[]" ]] && return 0
+    # 刷新是"尽力而为": 绝不为了刷新去装服务(节点生成路径不能被网络阻塞),
+    # 但服务不可达时必须**说出来** —— 否则已有链接会一直发旧内容而无人察觉。
+    if ! _sb_share_api health >/dev/null 2>&1; then
+        print_warn "公共分享服务不可达, 已有分享链接的内容未刷新" >&2
+        return 0
+    fi
+    local n=0 tok tag tmp newh curh
+    while IFS=$'\t' read -r tok tag; do
+        [[ -n "$tok" ]] || continue
+        tmp=$(mktemp)
+        if ! _sb_share_content_file "$tag" "$tmp"; then rm -f "$tmp"; continue; fi
+        newh=$(sha256sum "$tmp" | awk '{print $1}')
+        curh=$(_sb_share_api get --token "$tok" 2>/dev/null \
+               | python3 -c 'import sys,json;print(json.load(sys.stdin).get("content_sha256",""))' 2>/dev/null)
+        if [[ "$newh" != "$curh" ]]; then
+            _sb_share_api update --token "$tok" --content-file "$tmp" >/dev/null 2>&1 && n=$((n+1))
+        fi
+        rm -f "$tmp"
+    done < <(_sb_share_list | python3 -c '
+import sys, json
+try: recs = json.load(sys.stdin)
+except Exception: recs = []
+for r in recs:
+    print("%s\t%s" % (r.get("token",""), (r.get("meta") or {}).get("tag","")))
+' 2>/dev/null)
+    (( n > 0 )) && print_info "已刷新 ${n} 条分享链接的内容 (token 与地址未变)"
+    return 0
+}
+
+
 
 list_shares() {
     print_title "分享链接"
-    local now; now=$(date +%s)
-    local f i=0
-    local entries=()
-    while IFS= read -r f; do
-        [[ -f "$f" ]] || continue
-        local tg tok mu u ex en st=Active
-        tg=$(jq -r .tag "$f"); tok=$(jq -r .share_token "$f")
-        mu=$(jq -r .max_uses "$f"); u=$(jq -r .used_count "$f")
-        ex=$(jq -r .expires_at "$f"); en=$(jq -r .enabled "$f")
-        [[ "$en" == "false" ]] && st=Disabled
-        [[ "$ex" != "0" && "$now" -gt "$ex" ]] && st=Expired
-        [[ "$mu" != "0" && "$u" -ge "$mu" ]] && st=UsedUp
-        i=$((i+1)); entries+=("$f")
-        printf "%s) %s…  tag=%s  uses=%s/%s  有效期=%s  %s\n" "$i" "${tok:0:16}" "$tg" "$u" "$mu" "$([[ $ex == 0 ]] && echo 永久 || date -d @$ex '+%F %T')" "$st"
-    done < <(share_files_sorted)
-    [[ $i -eq 0 ]] && { print_warn "当前没有任何分享链接"; return 0; }
-    printf '%s\n' "${entries[@]}" > /tmp/.sb-share-entries
+    local js; js=$(_sb_share_list)
+    if [[ -z "$js" || "$js" == "[]" ]]; then
+        print_warn "当前没有任何分享链接"
+        return 0
+    fi
+    # 编号 -> token 的映射由 _sb_share_find 按同一份 JSON 顺序现算,
+    # 所以这里只要保证打印顺序 == JSON 顺序即可。
+    #
+    # 注意: 不要把字段用制表符吐出来再交给 bash read —— tag 为空时连续的
+    # 两个制表符会被 IFS(制表符属空白符)折叠, 整行左移一列,
+    # 表现为 "tag=0 uses=5/2026-10-09..." 这种错位。直接在这里排版。
+    printf '%s' "$js" | python3 -c '
+import sys, json, time
+try: recs = json.load(sys.stdin)
+except Exception: recs = []
+now = int(time.time())
+for i, r in enumerate(recs, 1):
+    ex = int(r.get("expires_at", 0)); mu = int(r.get("max_uses", 0)); u = int(r.get("used_count", 0))
+    st = "Active"
+    if not r.get("enabled", True): st = "Disabled"
+    elif ex and now > ex: st = "Expired"
+    elif mu and u >= mu: st = "UsedUp"
+    exp = "永久" if not ex else time.strftime("%F %T", time.localtime(ex))
+    tag = (r.get("meta") or {}).get("tag", "") or "-"
+    print("%s) %s…  tag=%s  uses=%s/%s  有效期=%s  %s" % (
+        i, str(r.get("token",""))[:16], tag, u, "∞" if not mu else mu, exp, st))
+' 2>/dev/null
 }
 
-meta_file_for() {
-    local out
-    out=$(meta_file "$@" 2>/dev/null || true)
-    if [[ -z "$out" ]]; then out=$(_ByNumber "$1" 2>/dev/null || true); fi
-    echo "$out"
-}
-_ByNumber() { # ByNumber <choice> -> token file (auto pick when multiple match)
-    local c="$1"
-    if [[ "$c" =~ ^[0-9]+$ ]]; then
-        local files=(); local f
-        for f in $(share_files_sorted); do files+=("$f"); done
-        local n=${#files[@]}
-        (( n > 0 && c >= 1 && c <= n )) || { echo ""; return 1; }
-        echo "${files[c-1]}"; return 0
-    fi
-    local hit
-    hit=$(for f in $(share_files_sorted); do
-        local tok tg; tok=$(jq -r .share_token "$f"); tg=$(jq -r .tag "$f")
-        [[ "$tok" == "*$c*" || "$tok" == "$c" || "$tg" == "$c" ]] && echo "$f"
-    done | head -1)
-    [[ -n "$hit" ]] && { echo "$hit"; return 0; }
-    return 1
-}
+meta_file_for() { meta_file "$1"; }
 
 del_share() {
-    local f; f=$(meta_file_for "$1")
-    [[ -z "$f" ]] && { print_error "token|tag 不存在: $1"; return 1; }
-    rm -f "$f"
+    local tok; tok=$(meta_file_for "$1")
+    [[ -z "$tok" ]] && { print_error "token|tag|编号 不存在: $1"; return 1; }
+    _sb_share_api delete --token "$tok" >/dev/null 2>&1 || { print_error "删除失败"; return 1; }
+    # 回读确认 (静默失败在旧实现里踩过)
+    _sb_share_api get --token "$tok" >/dev/null 2>&1 && { print_error "删除未生效"; return 1; }
     print_ok "已删除"
 }
 
 toggle_share() {
-    local f; f=$(meta_file_for "$1")
-    [[ -z "$f" ]] && { print_error "token|tag 不存在: $1"; return 1; }
-    local cur nv
-    cur=$(jq -r .enabled "$f")
-    [[ "$cur" == "false" ]] && nv=true || nv=false
-    if [[ "$cur" == "false" ]]; then
-        jq '.enabled = true' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
-    else
-        jq '.enabled = false' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
-    fi
-    print_ok "$1 -> enabled=$nv"
+    local tok; tok=$(meta_file_for "$1")
+    [[ -z "$tok" ]] && { print_error "token|tag|编号 不存在: $1"; return 1; }
+    local cur want now
+    cur=$(_sb_share_api get --token "$tok" 2>/dev/null \
+          | python3 -c 'import sys,json;print("true" if json.load(sys.stdin).get("enabled",True) else "false")' 2>/dev/null)
+    [[ "$cur" == "true" ]] && want=false || want=true
+    _sb_share_api update --token "$tok" --enabled "$want" >/dev/null 2>&1
+    now=$(_sb_share_api get --token "$tok" 2>/dev/null \
+          | python3 -c 'import sys,json;print("true" if json.load(sys.stdin).get("enabled",False) else "false")' 2>/dev/null)
+    [[ "$now" == "$want" ]] || { print_error "切换未生效"; return 1; }
+    print_ok "$1 -> enabled=$want"
 }
 
 regen_share() {
-    local f; f=$(meta_file_for "$1")
-    [[ -z "$f" ]] && { print_error "token|tag 不存在: $1"; return 1; }
-    local tag maxu
-    tag=$(jq -r .tag "$f"); maxu=$(jq -r .max_uses "$f")
-    rm -f "$f"
-    create_share "$tag" "${2:-$maxu}" "${3:-24}"
+    # 公共服务的 token 就是主键, 没有"改名"这种操作 ——
+    # 语义上用「建新的 + 删旧的」等价实现: 旧链接立刻失效, 新链接可用。
+    # 内容/范围/次数上限/有效期全部照搬。
+    local tok; tok=$(meta_file_for "$1")
+    [[ -z "$tok" ]] && { print_error "token|tag|编号 不存在: $1"; return 1; }
+    local rec tag maxu
+    rec=$(_sb_share_api get --token "$tok" 2>/dev/null)
+    tag=$(printf '%s' "$rec" | python3 -c 'import sys,json;print((json.load(sys.stdin).get("meta") or {}).get("tag",""))' 2>/dev/null)
+    maxu=$(printf '%s' "$rec" | python3 -c 'import sys,json;print(int(json.load(sys.stdin).get("max_uses",1)))' 2>/dev/null)
+    [[ -n "$tag" ]] || { print_error "读不到该分享的 tag"; return 1; }
+    _sb_share_api delete --token "$tok" >/dev/null 2>&1
+    create_share "$tag" "${2:-${maxu:-1}}" "${3:-24}"
 }
+
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     case "${1:-}" in
@@ -345,11 +435,23 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
             gen_full_profile >/dev/null 2>&1 || { print_error "聚合生成失败 (out/sb_client-*.json 为空?)"; exit 1; }
             shift; create_share "all" "$@"
             ;;
-        regen-aggregate) gen_full_profile >/dev/null 2>&1 || { print_error "聚合生成失败"; exit 1; } ;;
+        regen-aggregate)
+            # 这个动词是所有节点增删的**收口点**: 11 个协议脚本在 add/delete 之后
+            # 都会调 sb_regen_aggregate -> 这里 (共 22 处), 所以刷新分享内容挂在
+            # 这一处就覆盖了全部增删路径, 不用去每个协议里各插一遍。
+            #
+            # 两件事的顺序不能反: 必须先重建聚合产物, 再拿新产物去刷新 ——
+            # 反过来会把**旧内容**当成最新重新推一遍, 看起来"刷新成功"却没变化。
+            gen_full_profile >/dev/null 2>&1 || { print_error "聚合生成失败"; exit 1; }
+            # 刷新是尽力而为: 服务不可达只告警, 绝不让节点增删失败。
+            declare -F share_refresh_all >/dev/null 2>&1 && share_refresh_all >&2
+            ;;
         list) list_shares ;;
         del)
-            f=$(meta_file_for "$2" 2>/dev/null); [[ -z "$f" ]] && f=$( _ByNumber "$2" )
-            [[ -n "$f" ]] && { rm -f "$f" && print_ok "分享已删除"; } || { print_error "token|tag|编号 不存在: $2"; return 1; } ;;
+            # 走适配层 —— 原来这里是直接 rm 本地元数据文件, 存储搬到公共服务
+            # 之后那个文件根本不存在, rm 对不存在的路径返回 0, 于是**报"已删除"
+            # 而什么都没删**(静默假成功)。这类"看起来成功"的失败在本项目出现过。
+            del_share "${2:-}" || exit 1 ;;
         toggle) toggle_share "$2" ;;
         regen) regen_share "$2" ;;
         *) while true; do

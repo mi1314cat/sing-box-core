@@ -226,9 +226,9 @@ scripts_sane() {
         [[ -f "$f" ]] || continue
         bash -n "$f" 2>/dev/null || return 1
     done
-    if [[ -f "$SRV_ROOT/conf/share_server.py" ]]; then
+    if [[ -f "$SRV_ROOT/conf/share_client.py" ]]; then
         python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" \
-            "$SRV_ROOT/conf/share_server.py" 2>/dev/null || return 1
+            "$SRV_ROOT/conf/share_client.py" 2>/dev/null || return 1
     fi
     return 0
 }
@@ -290,20 +290,24 @@ RestartSec=3
 [Install]
 WantedBy=multi-user.target
 EOF
-        cat > /etc/systemd/system/sing-box-share.service <<EOF
-[Unit]
-Description=SB-Panel Share URL HTTP Service
-After=network-online.target sing-box.service
-[Service]
-Type=simple
-Environment=SHARE_DIR=$SRV_ROOT/share
-Environment=SHARE_PORT=9292
-ExecStart=/usr/bin/python3 $SRV_ROOT/conf/share_server.py
-Restart=on-failure
-RestartSec=3
-[Install]
-WantedBy=multi-user.target
-EOF
+        # ★ 不再创建 sing-box-share.service ——
+        #   分享的存储与生命周期归**公共基础服务** proxy-share-service
+        #   (独立项目), M / SB / X 共用; SB 自己不再跑一个分享端口。
+        #
+        #   这里只做"检查 → 不存在才装 → 启动"。安装器本身是幂等的:
+        #   第一个装的内核把它建好, 后装的探测到健康就直接复用 ——
+        #   不会重复安装、不会重新占端口、不会覆盖已有的分享数据。
+        #
+        #   失败**不能**让安装失败: 分享不是内核的核心功能。
+        if [[ -f "$SRV_ROOT/conf/share_client.py" ]]; then
+            printf '  %s 公共分享服务: ' "$ARROW"
+            _pss_port=$(SHARE_PROVIDER=sing-box python3 "$SRV_ROOT/conf/share_client.py" ensure 2>/dev/null)
+            if [[ -n "$_pss_port" ]]; then
+                ok "已就绪 (端口 $_pss_port)"
+            else
+                warn "未就绪 (不影响使用; 面板「分享链接管理」里可重试)"
+            fi
+        fi
         systemctl daemon-reload
         systemctl enable -q sing-box
         ok "systemd 服务"
@@ -327,16 +331,30 @@ EOF
         if systemctl start sing-box && sleep 1 && systemctl is-active sing-box >/dev/null; then
             ok "服务启动"
         else die "sing-box.service 启动失败"; fi
-        if systemctl enable -q --now sing-box-share 2>/dev/null && (sleep 1; curl -fsS localhost:9292/status >/dev/null 2>&1); then
-            # 防火墙必须放行 9292, 否则服务只在 localhost 自检通过, 外部客户端连不上
-            if open_port 9292 >/dev/null 2>&1; then
-                ok "分享服务 (9292, 防火墙已放行)"
+        # ---- 分享服务: 已迁到公共基础服务, 不再有 SB 自己的端口 ----
+        #
+        # 旧单元 sing-box-share.service (9292) 已废弃: 它的分享服务端把内容
+        # 存在本地并自己下发, 现在存储与生命周期归 proxy-share-service。
+        # 顺手停用并删掉旧单元, 免得留一个没人用还在跑的端口。
+        if [[ -f /etc/systemd/system/sing-box-share.service ]]; then
+            systemctl disable -q --now sing-box-share >/dev/null 2>&1
+            rm -f /etc/systemd/system/sing-box-share.service
+            systemctl daemon-reload >/dev/null 2>&1
+            close_port 9292 >/dev/null 2>&1
+            ok "已停用旧的 sing-box-share.service (分享已迁到公共服务)"
+        fi
+        if _pss_port=$(SHARE_PROVIDER=sing-box python3 "$SRV_ROOT/conf/share_client.py" ensure 2>/dev/null) \
+           && [[ -n "$_pss_port" ]]; then
+            # 公共服务的端口由它自己决定(可能因端口回避不是 9443), 防火墙要放行的是它
+            if open_port "$_pss_port" >/dev/null 2>&1; then
+                ok "公共分享服务 (端口 $_pss_port, 防火墙已放行)"
             else
-                warn "分享服务 (9292) 已启动, 但防火墙放行失败"
-                warn "  分享链接仅本机可用; 请手动放行: ufw allow 9292/tcp"
+                warn "公共分享服务在 $_pss_port, 但防火墙放行失败"
+                warn "  分享链接仅本机可用; 请手动放行: ufw allow $_pss_port/tcp"
             fi
         else
-            warn "分享服务未启动, 分享链接功能暂不可用 (不影响主面板)。查看: journalctl -u sing-box-share"
+            warn "公共分享服务未就绪, 分享链接暂不可用 (不影响主面板)"
+            warn "  面板「分享链接管理」里可以重试"
         fi
     fi
     echo

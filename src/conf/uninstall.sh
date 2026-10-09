@@ -7,6 +7,11 @@
 set -u
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"     # $SB_ROOT
 SB_ROOT="${SB_ROOT:-$SELF_DIR}"
+# sing-box-share.service 是**历史遗留**单元 (分享服务端已并入公共基础服务
+# proxy-share-service)。这里仍然列出它, 是为了把老机器上残留的单元一并清掉;
+# 新装机器上它根本不存在, 停止/删除都是空操作。
+# 注意: 公共基础服务 proxy-share-service **不**在这里 —— 它是 M/SB/X 共用的,
+# 卸载 SB 绝不能把它带走。
 SERVICES=(sing-box.service sing-box-share.service)
 
 # 本文件由 run_module 以独立 bash 进程执行, **不会**继承主脚本 source 的

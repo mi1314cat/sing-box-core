@@ -200,7 +200,8 @@ do_uninstall() {
       print_info "  - $SB_ROOT/config  (全部节点配置)"
       print_info "  - $SB_ROOT/out     (客户端产物 / 分享链接)"
       print_info "  - $SB_ROOT/cert    (自签证书)"
-      print_info "  - sing-box-share 服务 (会继续运行, 但内核已删, 分享链接将失效)"
+      print_info "  - 公共分享服务 proxy-share-service (M/SB/X 共用, 本步骤不动它)"
+      print_info "    —— 但内核已删, 已有分享链接会失效, 需要另行在面板里吊销"
       echo "" >&2
       print_info "要彻底清空请回到本菜单选 7) 完整卸载面板"
     read -r -p "确认? [y/N]: " yn

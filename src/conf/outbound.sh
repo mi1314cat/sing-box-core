@@ -661,7 +661,7 @@ ob_commit_multi() { # ob_commit_multi <outbounds-json-array> <主tag> [条数]
 #
 # 复用的就是项目已有的分享服务本身, 不另造一套订阅系统:
 #   对方跑 sing-box-core -> share.sh 生成 http://<ip>:9292/share/<token>
-#   -> share_server.py 下发一份 sing-box 配置 JSON (其中的 .outbounds[]
+#   -> 公共分享服务下发一份 sing-box 配置 JSON (其中的 .outbounds[]
 #      每一项本身就是完整可用的 outbound, 因此不需要"协议解析/字段转换")
 # 客户端 client.sh add_node 拉的是同一种东西, 这里保持完全一致的
 # HTTP 语义与校验顺序。
