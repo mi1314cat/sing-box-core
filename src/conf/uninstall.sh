@@ -51,6 +51,9 @@ show_impact() {
     echo "  -. systemd 上有其服务 (xray/caddy/nginx/docker/moontv 等) 均不动" >&2
     echo "  - 证书文件 (/etc/letsencrypt, /root/catmi/cloudflare/cert 等) 不动" >&2
     echo "  - /usr/local/bin/sb-client 若与本机无关, 不删" >&2
+    echo "  - 公共基础服务 proxy-share-service (M/SB/X 共用) 及它的数据, 不删" >&2
+    echo "    要单独卸载它: git clone https://github.com/mi1314cat/Share-Service" >&2
+    echo "                  && bash Share-Service/install.sh uninstall" >&2
     echo "" >&2
 }
 
@@ -178,7 +181,15 @@ do_uninstall() {
     show_impact
     read -r -p "确认执行完整卸载? 输入 yes 继续: [不存在默认输入] " a
     [[ "$(echo "$a"|tr A-Z a-z)" == "yes" ]] || { print_warn "已取消"; return 1; }
+    # 兜底: 公共基础服务被 M/SB/X 共用, 删了会连带打断另外两个内核已经
+    # 发出去的链接。它**不该**出现在 SERVICES 里, 但万一被谁改进去,
+    # 这里直接跳过 —— 卸载是破坏性操作, 多一道闸门比少一道好。
+    local _shared="proxy-share-service"
     for s in "${SERVICES[@]}"; do
+        if [[ "${s%.service}" == "$_shared" ]]; then
+            print_warn "$_shared 是 M/SB/X 共用的公共基础服务, 跳过 (不停止/不删除)"
+            continue
+        fi
         systemctl stop "$s" 2>/dev/null || true
         systemctl disable "$s" 2>/dev/null
         rm -f "/etc/systemd/system/$s"
