@@ -258,7 +258,12 @@ if ttype=="http": ob["transport"]={"type":"http","path":tpath,"host":[dom2]}
 if ttype=="httpupgrade": ob["transport"]={"type":"httpupgrade","path":tpath,"host":dom2}
 if mode=="real":
     sn = os.popen(f'openssl x509 -in {crt} -noout -ext subjectAltName 2>/dev/null | grep -oE "DNS:[^,]+" | head -1 | cut -d: -f2').read().strip()
-    ob["tls"]={"enabled":True,"insecure":True,"server_name": sn or domain,"utls":{"enabled":True,"fingerprint":os.environ.get("SB_UTLS_FP","chrome")}}
+    # ★ 这里原来是写死的 "insecure":True —— **真证书**分支也照写。
+    #   后果: 拿着有效的 Let's Encrypt 证书, 客户端仍然不校验证书身份,
+    #   中间人可以用自己签的证书冒充服务端。其余 6 个协议 (anytls/trojan/
+    #   hysteria2/tuic/vless/naive) 都是条件化的, 只有 vmess 漏了。
+    #   真证书 => 正常校验 (insecure 不写, sing-box 默认 false)。
+    ob["tls"]={"enabled":True,"server_name": sn or domain,"utls":{"enabled":True,"fingerprint":os.environ.get("SB_UTLS_FP","chrome")}}
 elif mode=="selfsign":
     ob["tls"]={"enabled":True,"insecure":True,"server_name":dom2,
                "certificate_public_key_sha256":pin,

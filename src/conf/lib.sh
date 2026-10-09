@@ -2930,7 +2930,17 @@ sb_has_key_for() {
 }
 sb_scan_certs() {
     local dirs=() lbls=() src cid f
-    # 1) 统一 cert 目录 (catmi 主目录)
+    # 1) KPanel 维护的证书目录 —— **必须在最前面**。
+    #
+    # ★ 原来这里没有它。下面的注释 (sb_dedup_certs_by_domain 上方) 一直写着
+    #   "扫描顺序是 /home/web/certs -> /etc/letsencrypt", 但代码里从来没扫过
+    #   /home/web/certs —— 注释与实现不一致, 而且是不报错的那种。
+    #
+    #   后果: KPanel 的保活脚本 (/root/auto_cert_renewal.sh) 把新证书写到
+    #   /home/web/certs/, 而 SB 的挑选器看不见它, 于是只能挑到别处的副本
+    #   (实测生产上挑的是 /root/catmi/certs/ 下一个手工填的快照, 没人维护)。
+    [[ -d /home/web/certs ]] && { dirs+=("/home/web/certs"); lbls+=("web-certs"); }
+    # 2) 统一 cert 目录 (catmi 主目录)
     [[ -d "$SB_ROOT/cert" ]] && { dirs+=("$SB_ROOT/cert"); lbls+=("sb-cert-dir"); }
     # 2) certbot/ACME 正式目录 (真实域 CA 可信, 特别适合 naive/vmess)
     if [[ -d /etc/letsencrypt/live ]]; then
