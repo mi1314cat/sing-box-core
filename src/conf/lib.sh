@@ -3299,8 +3299,43 @@ gen_mihomo_yaml() { # 按 tag 生成/刷新单节点 YAML; mihomo 不支持的�
 # ---------- 切换产物里的地址族 ----------
 # 节点建好之后想把产物从 IPv4 换成 IPv6 (或反过来), 不必重建节点:
 # 把所有客户端产物里"连哪个地址"统一改掉即可。
-# 覆盖: sb_client-*.json (单节点) / .yaml (mihomo) / sb_client-all.json (聚合)
-#       / sb_share-*.txt 与 sb_links-all.txt (分享链接里的 @host)
+# 覆盖: sb_client-*.json (单节点 / 聚合 / CDN 版) / sb_client-*.yaml (mihomo)
+#       / sb_share-*.txt 与 sb_links-all.txt (URI 分享链接里的 @host)
+#       / share_tag-*.txt (订阅 URL 里的主机)
+#
+# ★ 只改**确实指向本机的 IP**, 其余一律原样保留 (见 addr_family.py 顶部说明)。
+#   旧实现用 jq/sed 无条件改写每一个 server 字段, 后果实测有三类:
+#     1) CDN 节点被改写 —— sb_cdn_finalize 故意把产物写成"证书域名:443"
+#        (走 Cloudflare, 源站通常只监听 127.0.0.1), 换成源站 IP:443 后
+#        CDN 被整个绕过: 源站 IP 暴露、IP 被封的客户端直接连不上,
+#        源站只监听 127.0.0.1 的接入方式下更是完全连不通;
+#     2) 他机/中转节点的 IP 被改成本机地址 —— 那些节点当场全部失联;
+#     3) 链接里的 IPv6 是 @[2001:db8::1]:port 带方括号的, 旧正则拿裸 IPv6 去匹配
+#        永远不中, 切 v6->v4 时一处都没改却报"已更新"; vmess 的地址在 base64 里,
+#        文本替换同样碰不到。
+#   域名 (CDN / 手工填写) 与他机 IP 保留后会在报告里逐条列出, 不做静默处理。
+
+# 本机"可对外"的地址 (指定族, 可能多个)。
+# 为什么不能只靠 sb_addr4/sb_addr6: 那俩只取第一个。多公网 IP 的机器上,
+# 产物里可能写着本机另一个地址 —— 它同样"指向本机", 应该跟着切;
+# 但他机 IP 绝不能碰, 所以白名单必须精确到"本机真实地址"。
+sb_local_addrs() { # <v4|v6>
+    local fam="$1" dev cidr
+    if [[ "$fam" == "v4" ]]; then
+        ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 |
+            grep -vE '^(127\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)' | sort -u
+    else
+        # 用 awk 取字段, 不用 `read -r dev _ _ cidr` ——
+        # `ip -o` 的第一列是**接口索引** ("6:"), 第二列才是接口名;
+        # read 会把索引塞进 dev, 于是隧道接口过滤永远不中 (sb_real_ipv6 就是这个坑)。
+        while read -r dev cidr; do
+            [[ -z "$dev" || -z "$cidr" ]] && continue
+            [[ "$dev" =~ $SB_TUNNEL_IFACE_RE ]] && continue
+            case "$cidr" in *:*/*) echo "${cidr%%/*}" ;; esac
+        done < <(ip -6 -o addr show scope global 2>/dev/null | awk '{print $2, $4}') | sort -u
+    fi
+}
+
 sb_switch_addr_family() {
     local want="$1"
     [[ "$want" == "v4" || "$want" == "v6" ]] || { print_error "用法: sb_switch_addr_family v4|v6"; return 1; }
@@ -3316,46 +3351,59 @@ sb_switch_addr_family() {
       fi
       [[ -z "$old" ]] && print_warn "旧地址不可用, 只更新能更新的部分"
 
-    local n=0 f base
-    shopt -s nullglob
-    # 1) 单节点 JSON 与聚合 JSON: 直接改 outbounds[].server
-    for f in "$SB_OUT_DIR"/sb_client-*.json; do
-        base=$(basename "$f")
-        [[ "$base" == "sb_client-all.json" ]] && continue
-        local t="${base#sb_client-}"; t="${t%.json}"
-        jq --arg s "$ip" '(.outbounds[] | select(.server != null) | .server) = $s' "$f" > "$f.tmp" 2>/dev/null \
-            && mv -f "$f.tmp" "$f" && n=$((n+1)) || { print_warn "跳过 $base (改写失败)"; rm -f "$f.tmp"; }
-    done
-    # 2) mihomo YAML: 改 server: 字段
-    for f in "$SB_OUT_DIR"/sb_client-*.yaml; do
-        local t; t=$(grep -m1 '^ *server:' "$f" 2>/dev/null)
-        if [[ -n "$t" ]]; then
-            sed -i -E "s|^( *server:).*|\\1 $ip|" "$f" && n=$((n+1))
-        fi
-    done
-    # 3) 分享链接: 主机在 URI 的 @host:port 里。IPv6 必须带方括号,
-    #    否则客户端会把最后一段当成端口 —— 这是 IPv6 最常见的踩坑。
-    local v4re v6re
-    if [[ -n "$old" ]]; then
-        v4re=${old//./\\.}
-        for f in "$SB_OUT_DIR"/sb_share-*.txt "$SB_OUT_DIR"/sb_links-all.txt; do
-            [[ -f "$f" ]] || continue
-            sed -i -E "s|@${v4re}(:[0-9]+)|@$(sb_url_host "$ip")\\1|g" "$f"
-        done
-        n=$((n+1))
+    # "本机地址"白名单: 探测到的旧地址 + 本机同族公网地址 (多 IP 机器)。
+    # 只有落在这个集合里的 IP 会被替换 —— 域名 / 他机 IP / 私网 / 隧道地址一律不动。
+    local -a ours=()
+    [[ -n "$old" ]] && ours+=("$old")
+    local fam_old a; [[ "$want" == "v6" ]] && fam_old=v4 || fam_old=v6
+    while IFS= read -r a; do
+        [[ -n "$a" ]] && ours+=("$a")
+    done < <(sb_local_addrs "$fam_old")
+
+    local here; here=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)
+    if [[ ! -f "$here/addr_family.py" ]]; then
+        # 宁可什么都不改也不要退回 sed 无条件替换 —— 那正是把 CDN 域名
+        # 换成源站 IP、把他机节点地址改成本机地址的原因。
+        print_error "缺少 $here/addr_family.py, 已放弃改写 (拒绝用无条件替换的方式改产物)"
+        return 1
     fi
-    shopt -u nullglob
-    # 4) 聚合文件重新生成, 让 sb_client-all.json 和单节点保持一致
-    if declare -F sb_regen_aggregate >/dev/null 2>&1; then
-        sb_regen_aggregate
-        n=$((n+1))
+    local -a args=(--out-dir "$SB_OUT_DIR" --from "${old:-$ip}" --to "$ip")
+    for a in "${ours[@]}"; do args+=(--ours "$a"); done
+    local rep; rep=$(python3 "$here/addr_family.py" "${args[@]}" 2>&1)
+    if (( $? != 0 )) || [[ -z "$rep" ]]; then
+        print_error "产物地址改写失败: ${rep:-无输出}"
+        return 1
     fi
-    if [[ -f "$SB_OUT_DIR/sb_client-all.yaml" ]] || [[ -d "$SB_OUT_DIR" ]]; then
-        declare -F gen_all_mihomo >/dev/null 2>&1 && gen_all_mihomo >/dev/null 2>&1 && n=$((n+1))
-    fi
+    local n_json n_yaml n_links n_subs n_total
+    n_json=$(printf '%s' "$rep"  | jq -r '.json.hosts  // 0' 2>/dev/null)
+    n_yaml=$(printf '%s' "$rep"  | jq -r '.yaml.hosts  // 0' 2>/dev/null)
+    n_links=$(printf '%s' "$rep" | jq -r '.links.hosts // 0' 2>/dev/null)
+    n_subs=$(printf '%s' "$rep"  | jq -r '.subs.hosts  // 0' 2>/dev/null)
+    n_total=$(( ${n_json:-0} + ${n_yaml:-0} + ${n_links:-0} + ${n_subs:-0} ))
+
+    # 聚合 JSON 由单节点重新生成 (顺带把新内容推给已发出的分享 token),
+    # 这样聚合里不会残留旧地址。合并 YAML 已由 addr_family.py 就地改好 ——
+    # 旧代码这里调的 gen_all_mihomo 在整个仓库里**从未定义过**,
+    # 所以 sb_client-all.yaml 一直被漏掉 (菜单 9->7 的产物停留在旧地址)。
+    declare -F sb_regen_aggregate >/dev/null 2>&1 && sb_regen_aggregate
+
     sb_addr_family_set "$want"
-    print_ok "产物地址已切换为 $([[ "$want" == "v6" ]] && echo IPv6 || echo IPv4): $ip  (共更新 $n 处)"
+    local want_label; [[ "$want" == "v6" ]] && want_label=IPv6 || want_label=IPv4
+    if (( n_total == 0 )); then
+        print_warn "产物里没有指向本机的 $([[ "$fam_old" == v4 ]] && echo IPv4 || echo IPv6) 地址可改 —— 地址族状态已记为 $want_label"
+    else
+        print_ok "产物地址已切换为 $want_label: $ip  (JSON $n_json / YAML $n_yaml / 链接 $n_links / 订阅URL $n_subs)"
+    fi
     [[ -n "$old" ]] && print_info "已替换的旧地址: $old"
+    # 没动的那些要**逐条说清**, 否则用户以为"切了但没生效":
+    # 域名 (CDN / 手工填写) 与地址族无关; 他机 IP 属于别的服务器, 更不该动。
+    local kd ki err
+    kd=$(printf '%s' "$rep" | jq -r '(.kept_domains // []) | join(", ")' 2>/dev/null)
+    ki=$(printf '%s' "$rep" | jq -r '(.kept_ips // [])     | join(", ")' 2>/dev/null)
+    err=$(printf '%s' "$rep" | jq -r '(.errors // [])      | join("; ")' 2>/dev/null)
+    [[ -n "$kd" ]] && print_info "保留域名 (CDN/手工填写, 地址族对它们无意义): $kd"
+    [[ -n "$ki" ]] && print_info "保留其他 IP (非本机地址, 可能是他机/中转/隧道): $ki"
+    [[ -n "$err" ]] && print_warn "有产物未能处理: $err"
     return 0
 }
 
@@ -3492,7 +3540,8 @@ sb_menu_addr_family() {
     echo -e "  ${GREEN}2)${RESET} IPv6   ${CYAN}${a6:-未检测到}${RESET}" >&2
     echo >&2
     print_info "只改客户端产物里的地址, 不动服务器监听, 也不动已生成的分享 token"
-    print_info "改完记得重新生成聚合/分享链接, 让它们用上新地址"
+    print_info "只替换指向本机的 IP; 域名 (CDN/手工填写) 与他机 IP 原样保留并列出"
+    print_info "聚合产物与分享 token 的内容会自动重建, 不需要再手工生成一次"
     echo >&2
     local c=""
     read -r -p "  请选择 [1-2, 回车不变]: " c || { echo; return 0; }
