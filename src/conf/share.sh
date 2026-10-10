@@ -277,6 +277,13 @@ for r in recs:
     if ! _sb_share_content_file "$tag" "$tmp"; then
         rm -f "$tmp"; print_error "读取客户端配置失败: $client_file"; return 1
     fi
+    # 发布前校验: 内容里的节点必须还在真实配置里、端口必须与真实监听一致。
+    # 不通过就**不发** —— 发出去的是死节点, 而且冻结在服务里不会自愈。
+    if ! sb_share_consistency_check "$tag"; then
+        rm -f "$tmp"
+        print_error "分享内容与服务端真实配置不一致, 已中止发布 ($tag)"
+        return 1
+    fi
     local ttl_s=0; [[ "$ttl" -gt 0 ]] && ttl_s=$((ttl * 3600))
     rec=$(_sb_share_api create --type node --content-file "$tmp" --ttl "$ttl_s" \
             --max-uses "$max_uses" --meta "{\"tag\":\"$tag\"}" 2>/dev/null)
@@ -316,6 +323,122 @@ _sb_share_content_file() { # <tag> <输出文件>  0=成功
     grep -q '"outbounds"' "$out" 2>/dev/null
 }
 
+# ==============================================================
+# 生成后一致性校验: 分享内容 ↔ 真实配置 / 真实监听
+#
+# 为什么需要: 分享内容 = out/sb_client-<tag>.json 的**字节副本**, 这比 M / X
+# 那种"再渲染一遍"干净 (不存在"分享层与产物不一致"的可能) —— 但副本在创建
+# 那一刻**冻结**, 于是引入另一类不一致: **产物 vs 真实配置**。
+# 实证过的后果: 节点删掉/端口改掉之后, 公共服务里的记录仍然活着, 继续下发
+# 指向已删节点的内容; 而 share_refresh_all 找不到产物只能 continue ⇒ 那条
+# 记录永远不会自愈, 用户手上的订阅是死的 (与 M 的 P-M2 同后果)。
+#
+# 校验收口 (权威是 config/*.json 的 inbounds, 不是产物文件):
+#   1) 分享内容里每个 outbound 的 tag 必须能在 inbounds[].tag 里找到
+#      (兼容聚合产物的 "<服务器前缀>-" 前缀, 与 shadowtls 的内层 "<tag>-out");
+#   2) 直连节点的 server_port 必须等于该 inbound 的 listen_port;
+#      CDN 节点跳过 —— 它只监听 127.0.0.1, 客户端走 域名:443, 两者本来不同;
+#   3) 端口当前是否真的在监听 (ss): 只告警不拦 —— 刚写完配置还没 reload 时
+#      会短暂为假, 但必须让人看见。
+# 失败一律"报告 + 拒绝发布", 绝不偷偷改产物。
+# ==============================================================
+
+# 真实 inbound 索引: 每行 "tag\tlisten\tlisten_port"
+_sb_live_index_file() {
+    local f c; f=$(mktemp)
+    for c in "$SB_CONFIG_DIR"/*.json; do
+        [[ -f "$c" ]] || continue
+        jq -r '.inbounds[]? | select(.tag != null) | [.tag, (.listen // ""), (.listen_port // "")] | @tsv' \
+            "$c" 2>/dev/null
+    done | sort -u > "$f"
+    printf '%s' "$f"
+}
+
+# 在索引里找 tag (允许 "<前缀>-<tag>" 与 "<tag>-out" 两种写法)
+_sb_live_lookup() { # <tag> <索引文件> -> "listen\tport" (找不到则空)
+    local t="$1" ix="$2" base="${1%-out}"
+    # 末尾的 length(...) > length($1) 守卫是必须的: awk 的 index() 找不到时
+    # 返回 0, 而"恰好等长"时 length(b)-length($1) 也是 0 —— 少了守卫就会把
+    # "base 正好等于索引里的 tag" 当成"后缀匹配"而误命中别的节点。
+    awk -F'\t' -v t="$t" -v b="$base" '
+        $1 == t { print; exit }
+        $1 == b { print; exit }
+        index(t, "-" $1) == length(t) - length($1) && length(t) > length($1) { print; exit }
+        index(b, "-" $1) == length(b) - length($1) && length(b) > length($1) { print; exit }
+    ' "$ix"
+}
+
+# 校验一份客户端产物 (单节点或聚合) -> 0=一致, 1=有不一致 (原因写 stderr)
+_sb_share_verify_file() { # <产物文件> <索引文件>
+    local f="$1" ix="$2" bad=0 tag lport aport
+    while IFS= read -r tag; do
+        [[ -n "$tag" ]] || continue
+        case "$tag" in PROXY|AUTO|direct|block|dns) continue ;; esac
+        local row; row=$(_sb_live_lookup "$tag" "$ix")
+        if [[ -z "$row" ]]; then
+            print_error "分享内容里的节点在服务端配置里不存在 (产物是旧的): $tag"
+            bad=1; continue
+        fi
+        local lip lport
+        lip=$(printf '%s' "$row" | cut -f2)
+        lport=$(printf '%s' "$row" | cut -f3)
+        # CDN 节点: 服务端只听 127.0.0.1, 客户端连 域名:443 —— 端口不参与比对
+        if [[ "$lip" == "127.0.0.1" || "$lip" == "::1" ]]; then continue; fi
+        aport=$(jq -r --arg t "$tag" '.outbounds[]? | select(.tag == $t) | .server_port // empty' "$f" 2>/dev/null | head -1)
+        if [[ -n "$aport" && -n "$lport" && "$aport" != "$lport" ]]; then
+            print_error "分享内容里的端口 ($aport) 与真实监听配置 ($lport) 不一致: $tag"
+            bad=1
+        elif [[ -n "$lport" ]] && command -v ss >/dev/null 2>&1; then
+            ss -tulnH 2>/dev/null | awk '{print $5}' | grep -qE "[:]]${lport}$" \
+                || print_warn "服务端当前没有监听 $lport (配置里有, 套接字不在 —— 这个节点现在连不上): $tag"
+        fi
+    done < <(jq -r '.outbounds[]?.tag // empty' "$f" 2>/dev/null)
+    return "$bad"
+}
+
+sb_share_consistency_check() { # <tag|all> -> 0=一致
+    local tag="${1:-}" f ix rc=0
+    [[ -n "$tag" ]] || { print_error "用法: sb_share_consistency_check <tag|all>"; return 1; }
+    f="$SB_OUT_DIR/sb_client-$tag.json"
+    [[ -f "$f" ]] || { print_error "找不到客户端产物: $f"; return 1; }
+    ix=$(_sb_live_index_file)
+    # 只有"这个部署根本还没建过节点"才跳过校验 (fail-open)。
+    # 配置目录里有 json 但索引为空 = 一个 inbound 都没有 ⇒ 产物全是幽灵,
+    # 这时候必须报错而不是跳过 —— 否则单节点部署删掉唯一节点后, 残留产物
+    # 照样能被发出去。
+    if [[ ! -s "$ix" ]] && ! compgen -G "$SB_CONFIG_DIR/*.json" >/dev/null 2>&1; then
+        rm -f "$ix"
+        print_warn "配置目录为空, 跳过一致性校验 ($SB_CONFIG_DIR)"
+        return 0
+    fi
+    _sb_share_verify_file "$f" "$ix" || rc=1
+    rm -f "$ix"
+    (( rc == 0 )) && print_ok "分享内容与真实配置一致: $tag ($(jq -r '.outbounds|length' "$f" 2>/dev/null) 个 outbound)"
+    return "$rc"
+}
+
+# 删除某个 tag 在公共服务上的全部分享记录。
+# 节点被删除时必须调用 —— 否则记录留着, 内容就是"已删节点的死配置",
+# 而且 share_refresh_all 再也刷不动它 (产物已经没了)。
+revoke_tag() { # <tag>
+    local tag="${1:-}" t n=0
+    [[ -n "$tag" ]] || return 0
+    _sb_share_list >/dev/null 2>&1 || return 0
+    while IFS= read -r t; do
+        [[ -n "$t" ]] || continue
+        _sb_share_api delete --token "$t" >/dev/null 2>&1 && n=$((n+1))
+    done < <(_sb_share_list | python3 -c '
+import sys, json
+tag = sys.argv[1]
+try: recs = json.load(sys.stdin)
+except Exception: recs = []
+for r in recs:
+    if str((r.get("meta") or {}).get("tag","")) == tag: print(r.get("token",""))
+' "$tag" 2>/dev/null)
+    (( n > 0 )) && print_info "已下架 $n 条指向 $tag 的分享链接 (节点已删除)" >&2
+    return 0
+}
+
 # ---------------------------------------------------------------- 内容保鲜
 #
 # SB 的客户端配置文件会被 regen-aggregate / 节点增删重新生成, 而已发出去的
@@ -330,11 +453,22 @@ share_refresh_all() {
         print_warn "公共分享服务不可达, 已有分享链接的内容未刷新" >&2
         return 0
     fi
-    local n=0 tok tag tmp newh curh
+    local n=0 tok tag tmp newh curh dead=0
     while IFS=$'\t' read -r tok tag; do
         [[ -n "$tok" ]] || continue
         tmp=$(mktemp)
-        if ! _sb_share_content_file "$tag" "$tmp"; then rm -f "$tmp"; continue; fi
+        if ! _sb_share_content_file "$tag" "$tmp"; then
+            # 产物已经不在了 ⇒ 这条记录指向一个**已删除的节点**, 而且再也
+            # 刷不动 (没有内容可刷)。留着它等于长期给用户发死节点 —— 直接下架。
+            rm -f "$tmp"
+            if _sb_share_api delete --token "$tok" >/dev/null 2>&1; then
+                dead=$((dead+1))
+                print_warn "已下架指向已删节点 $tag 的分享链接 (内容无法再刷新)" >&2
+            else
+                print_warn "$tag 的客户端产物已不存在, 但下架失败, 请到菜单手动删除" >&2
+            fi
+            continue
+        fi
         newh=$(sha256sum "$tmp" | awk '{print $1}')
         curh=$(_sb_share_api get --token "$tok" 2>/dev/null \
                | python3 -c 'import sys,json;print(json.load(sys.stdin).get("content_sha256",""))' 2>/dev/null)
@@ -350,6 +484,7 @@ for r in recs:
     print("%s\t%s" % (r.get("token",""), (r.get("meta") or {}).get("tag","")))
 ' 2>/dev/null)
     (( n > 0 )) && print_info "已刷新 ${n} 条分享链接的内容 (token 与地址未变)"
+    (( dead > 0 )) && print_info "已下架 ${dead} 条指向已删节点的分享链接"
     return 0
 }
 
@@ -447,6 +582,14 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
             declare -F share_refresh_all >/dev/null 2>&1 && share_refresh_all >&2
             ;;
         list) list_shares ;;
+        check)
+            # 生成后一致性校验 (只读, 不改任何东西):
+            #   bash conf/share.sh check all
+            #   bash conf/share.sh check hysteria201-TLS
+            shift; sb_share_consistency_check "${1:-all}" || exit 1 ;;
+        revoke-tag)
+            # 节点删除路径调用: 把该 tag 在公共服务上的记录一并下架
+            revoke_tag "${2:-}" || exit 1 ;;
         del)
             # 走适配层 —— 原来这里是直接 rm 本地元数据文件, 存储搬到公共服务
             # 之后那个文件根本不存在, rm 对不存在的路径返回 0, 于是**报"已删除"

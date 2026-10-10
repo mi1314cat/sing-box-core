@@ -3071,22 +3071,34 @@ sb_selfgen_cert() {
 }
 
 # ---- QA: 节点删除后清理其分享 token, 并刷新 all 聚合 ----
+#
+# ★ 存储早就搬到公共分享服务 (proxy-share-service, provider=sing-box), 而这里
+#   原来只扫本地 share/shares/*.json —— 迁移之后那段等于空转, 于是 README 上
+#   "删除任何节点会自动清理其 share token" 这句承诺**实际已经失效**:
+#   记录留在服务里, 内容冻结成"已删节点的客户端配置", 而 share_refresh_all
+#   找不到产物只能 continue ⇒ 那条链接永远不会自愈, 一直给用户发死节点
+#   (与 mihomo 侧 P-M2 同后果)。所以这里补上公共服务侧的下架。
 cleanup_node_shares() { # cleanup_node_shares <tag>
-    local tag="$1" f
-    [[ -n "$tag" && -d "$SB_OUT_DIR/../share/shares" ]] || return 0
-    local SHARES_DIR="$SB_ROOT/share/shares"
-    for f in "$SHARES_DIR"/*.json; do
-        [[ -f "$f" ]] || continue
-        [[ "$(jq -r .tag "$f" 2>/dev/null)" == "$tag" ]] && rm -f "$f"
-    done
-    # 若存在 all 分享, 刷新聚合文件 (token 不变, 内容即时更新)
-    for f in "$SHARES_DIR"/*.json; do
-        [[ -f "$f" ]] || continue
-        if [[ "$(jq -r .tag "$f" 2>/dev/null)" == "all" ]]; then
-            bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/share.sh" regen-aggregate >/dev/null 2>&1
-            break
-        fi
-    done
+    local tag="$1" f here
+    [[ -n "$tag" ]] || return 0
+    # 1) 公共服务 (当前真正的存储) —— 失败只告警, 绝不让删节点失败
+    here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    if [[ -f "$here/share.sh" ]]; then
+        bash "$here/share.sh" revoke-tag "$tag" >/dev/null 2>&1 || true
+    fi
+    # 2) 旧本地存储 (还没迁完的部署) —— 保留原逻辑
+    if [[ -d "$SB_ROOT/share/shares" ]]; then
+        local SHARES_DIR="$SB_ROOT/share/shares"
+        for f in "$SHARES_DIR"/*.json; do
+            [[ -f "$f" ]] || continue
+            [[ "$(jq -r .tag "$f" 2>/dev/null)" == "$tag" ]] && rm -f "$f"
+        done
+    fi
+    # 3) 若有 all 聚合分享, 重建聚合 + 刷新内容 (token 不变, 内容即时更新)。
+    #    这里**无条件**跑: 记录已不在本地, 判断"有没有 all 分享"要去问服务。
+    if [[ -f "$here/share.sh" ]]; then
+        bash "$here/share.sh" regen-aggregate >/dev/null 2>&1 || true
+    fi
     return 0
 }
 
