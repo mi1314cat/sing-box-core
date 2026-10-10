@@ -277,47 +277,6 @@ def profile_from_uri(uri):
     return pnc.parse_uri(uri)
 
 
-# ---- 已知缺陷绕行（P0, 只此一条; 用 SB_COMPAT_NO_SHIMS=1 可关掉复现原判）------
-# proxy-node-compat 的 uri.py:310 把**任何非空**的 encryption 参数都当成
-# "VLESS Encryption" feature:
-#     if proto_id == "standard:vless" and q.get("encryption") not in (None, ""):
-# 而 `encryption=none` 是 VLESS 分享链接规范里的**哨兵值**, 意思是"不加密"
-# —— v2rayN / Xray 生成的 vless 链接**一律**带它（RN 服务端自己生成的
-# sb_share-reality01-REALITY.txt 就是 `?encryption=none&security=reality&...`）。
-# 于是 singbox.vless.encryption.never 命中 → 判 UNSUPPORTED → 本来能用的
-# vless 节点被丢掉。CC 实测: 13 条真实链接里有 2 条（reality01/vless01）中招。
-#
-# 这里做的是**解析层校正**, 不是加能力规则: 摘掉一个语义上等于"没有这个 feature"
-# 的 feature, 判定仍然只在 compat 里发生一次（喂进去的 profile 更忠实于链接本意）。
-# 痕迹必须留: 结果里带 shims[], 文案里也会说。等 compat 侧修好 uri.py 后应删除本段
-# —— tools/check_compat_wiring.sh 有一条回归盯着它（none 不丢 / 非 none 仍然丢）。
-_ENC_NONE = ("none",)
-
-
-def _apply_shims(prof):
-    shims = []
-    if os.environ.get("SB_COMPAT_NO_SHIMS") == "1":
-        return shims
-    if (prof.source_format or "") != "URI" or not prof.raw_uri:
-        return shims
-    if prof.raw_uri.split("://", 1)[0].lower() != "vless":
-        return shims
-    feat = prof.get_feature("standard:vless.encryption")
-    if feat is None:
-        return shims
-    fld = feat.params.get("encryption")
-    val = (fld.v if fld is not None else None)
-    if val is None or str(val).strip().lower() not in _ENC_NONE:
-        return shims
-    prof.features = [f for f in prof.features if f.id != "standard:vless.encryption"]
-    detail = ("encryption=%r 是 VLESS 链接的「不加密」哨兵值, 不是 VLESS Encryption; "
-              "已从 profile 摘除（uri.py:310 的已知缺陷, 非能力规则）" % val)
-    prof.diagnostics.append({"code": "SHIM_ENC_NONE", "detail": detail})
-    shims.append({"code": "SHIM_ENC_NONE", "detail": detail,
-                  "why": "compat uri.py 把任何非空 encryption 都当 feature; none 是哨兵值"})
-    return shims
-
-
 # ==========================================================================
 # 3 · 旧判定（SB 客户端现有实现, 一行都没改; 这里只是**调用**它）
 # ==========================================================================
@@ -667,7 +626,7 @@ def judge(uri=None, outbound=None, tag=None, tgt=None, engine=None):
     res = {"ok": True, "verdict": "UNKNOWN", "engine": engine, "verdict_source": "",
            "reason_codes": [], "message": [], "raw_uri": None, "target": tgt.to_dict(),
            "compat": None, "legacy": None, "extensions": [], "client_losses": [],
-           "downgrades": [], "warnings": [], "unknowns": [], "shims": [], "tag": tag}
+           "downgrades": [], "warnings": [], "unknowns": [], "tag": tag}
 
     prof = None
     prof_json = None
@@ -686,7 +645,6 @@ def judge(uri=None, outbound=None, tag=None, tgt=None, engine=None):
         res.update(ok=False, verdict="UNSUPPORTED",
                    message=["既没有可解析的分享链接, 也没有出站配置"])
         return res
-    res["shims"] = _apply_shims(prof)
     res["raw_uri"] = prof.raw_uri or uri
     res["extensions"] = list(prof.extensions)
     if prof_json is not None and prof is not prof_json:
@@ -738,8 +696,6 @@ def judge(uri=None, outbound=None, tag=None, tgt=None, engine=None):
     res["downgrades"] = downgrades
     res["ok"] = verdict != "UNSUPPORTED"
     res["message"] = render_reason(cres, tgt, prof)
-    for sh in res["shims"]:
-        res["message"].append("走了一条已知缺陷绕行: " + sh["detail"])
     if verdict == "UNSUPPORTED" and not res["message"]:
         res["message"] = [leg.get("detail") or "compat 判定不可用"]
 

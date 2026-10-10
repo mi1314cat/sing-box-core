@@ -29,7 +29,7 @@ COMPAT_REPO="${PROXY_NODE_COMPAT_DIR:-$REPO/../proxy-node-compat}"
 UPSTREAM="$COMPAT_REPO/proxy_node_compat"
 # vendored 快照钉在 proxy-node-compat 的**提交版**上（不是谁的工作区）:
 # 上游仓库当时有未提交的在途改动（mihomo 的 trojan uri_rule）, 那些不属于"已完成"的快照。
-COMPAT_REV="${PROXY_NODE_COMPAT_REV:-3a75ba5}"
+COMPAT_REV="${PROXY_NODE_COMPAT_REV:-9b73cc9}"
 
 # 离线夹具: 两台真实部署机（CC/RW）上 `sing-box version` 打印的 Tags
 GATE_OFFLINE_VERSION="${GATE_OFFLINE_VERSION:-1.14.2}"
@@ -91,11 +91,11 @@ fi
 python3 - "$LIB/data/rules.json" <<'PY' || bad "rules.json 结构不对"
 import json, sys
 d = json.load(open(sys.argv[1], encoding="utf-8"))
-assert len(d["rules"]) >= 67, len(d["rules"])
-assert len(d["evidence"]) >= 26, len(d["evidence"])
+assert len(d["rules"]) >= 68, len(d["rules"])
+assert len(d["evidence"]) >= 29, len(d["evidence"])
 assert d["uri_rules"], "uri_rules 为空"
 sb = [r for r in d["rules"] if r["target"].get("kernel") == "singbox"]
-assert len(sb) >= 21, len(sb)
+assert len(sb) >= 22, len(sb)
 print("  \033[32m✓\033[0m rules.json 可加载: %d 规则 / %d 证据 / %d URI 规则（singbox %d）"
       % (len(d["rules"]), len(d["evidence"]), len(d["uri_rules"]), len(sb)))
 PY
@@ -222,6 +222,44 @@ if "legacy（" not in (run(REALITY, {"SB_COMPAT_VERSION": "1.14.1",
                                     "SB_COMPAT_TAGS": PINNED["SB_COMPAT_TAGS"]})["verdict_source"] or ""):
     fails.append("1.14.1 上 Reality 应回退旧判定（UNKNOWN 不等于不支持）")
 
+# ---- 5b: build tags 规则（canonical 9b73cc9 新补的 with_quic / with_naive_outbound）
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(COMPAT)), "lib"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(COMPAT)))
+import compat2                                            # noqa: E402
+from proxy_node_compat import Target as _T                # noqa: E402
+BASE = dict(kernel="singbox", distribution="upstream",
+            version=os.environ.get("SB_COMPAT_VERSION", "1.14.2"))
+def tgt(tags):
+    return _T(build_tags=tags, **BASE)
+def j(uri=None, ob=None, tags=None):
+    return compat2.judge(uri=uri, outbound=ob, tgt=tgt(tags))
+
+hy2 = f"hysteria2://pw@1.2.3.4:8443?sni=a.com#hy2"
+tuic = f"tuic://{U1}:pw@1.2.3.4:8443?sni=a.com#tuic"
+naive_ob = {"type": "naive", "tag": "nv", "server": "1.2.3.4", "server_port": 443,
+            "username": "u", "password": "p",
+            "tls": {"enabled": True, "server_name": "a.com"}}
+TAGS_OK = ["with_gvisor", "with_quic", "with_utls", "with_naive_outbound"]
+TAGS_NOQUIC = ["with_gvisor", "with_utls", "with_naive_outbound"]
+TAGS_NONAIVE = ["with_gvisor", "with_quic", "with_utls"]
+
+for label, kw, tags, want in (
+        ("hy2+with_quic", dict(uri=hy2), TAGS_OK, "SUPPORTED"),
+        ("hy2-without_quic", dict(uri=hy2), TAGS_NOQUIC, "UNSUPPORTED"),
+        ("tuic+with_quic", dict(uri=tuic), TAGS_OK, "SUPPORTED"),
+        ("tuic-without_quic", dict(uri=tuic), TAGS_NOQUIC, "UNSUPPORTED"),
+        ("naive+with_naive_outbound", dict(ob=naive_ob), TAGS_OK, "SUPPORTED"),
+        ("naive-without_naive_outbound", dict(ob=naive_ob), TAGS_NONAIVE, "UNSUPPORTED")):
+    r = j(tags=tags, **kw)
+    if r["verdict"] != want:
+        fails.append("build tags %s: got=%s want=%s rc=%s"
+                     % (label, r["verdict"], want, r["reason_codes"]))
+    if want == "UNSUPPORTED" and "BUILD_NOT_ENABLED" not in r["reason_codes"]:
+        fails.append("build tags %s: 缺 reason_code BUILD_NOT_ENABLED（%s）"
+                     % (label, r["reason_codes"]))
+if not fails:
+    print("    \033[32m✓\033[0m build tags 真的参与判定: with_quic -> hy2/tuic, with_naive_outbound -> naive")
+
 # 回滚开关: 必须完全回到旧判定, 且不跑 compat
 r = run([c for c in CASES_A if c[0].endswith("#xhttp")][0][0], {"SB_COMPAT_ENGINE": "legacy"})
 if r["compat"] is not None:
@@ -231,14 +269,15 @@ if r["verdict"] != "SUPPORTED":
 if "回滚开关" not in (r["verdict_source"] or ""):
     fails.append("回滚开关没有在 verdict_source 里留痕")
 
-# 已知缺陷绕行必须可关: 关掉以后 encryption=none 要回到 compat 的原判（UNSUPPORTED）
-r_off = run(CASES_A[0][0], {"SB_COMPAT_NO_SHIMS": "1"})
-if r_off["verdict"] != "UNSUPPORTED" or not r_off.get("shims") == []:
-    fails.append("SB_COMPAT_NO_SHIMS=1 没能复现 compat 原判（got=%s shims=%s）"
-                 % (r_off["verdict"], r_off.get("shims")))
-r_on = run(CASES_A[0][0])
-if not r_on.get("shims"):
-    fails.append("encryption=none 的绕行没有留痕（shims 为空）")
+# canonical 9b73cc9 自己修掉了 encryption=none（#716 哨兵值不再建 feature）,
+# 所以适配层里的绕行已删除。这里钉住"删了以后行为不变"的两侧:
+r_sent = run(CASES_A[0][0])                       # encryption=none
+if r_sent["verdict"] != "SUPPORTED":
+    fails.append("encryption=none 又被判死了（canonical 回归? got=%s）" % r_sent["verdict"])
+if "shims" in r_sent:
+    fails.append("结果里还有 shims 字段 —— 绕行的残留没删干净")
+if os.environ.get("SB_COMPAT_NO_SHIMS"):
+    fails.append("环境里还留着 SB_COMPAT_NO_SHIMS")
 
 # 客户端转换损失: httpupgrade 节点必须被报出来（to_sb.py 静默降级 tcp 的那个坑）
 r = run([c for c in CASES_A if c[0].endswith("#hu")][0][0])
