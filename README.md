@@ -888,6 +888,36 @@ bash src/conf/share.sh check all                   # 生成后一致性校验 (�
 `out/sb_links-all.txt`）里的无效 obfs 参数就地删掉；`vmess://` 的老形态无法原地
 修好（字段名与片段都在 base64 里），删掉节点重建即可。
 
+### 门禁: 「SB 分享 → SB 客户端」对角线必须一直能跑通
+
+用户点名的一条红线：**自家分享给自家客户端，不能自己认不出来**。这不是假想 ——
+mihomo 侧真的断过一次（加旗帜命名把自家分享生成打成 0/19，整条不可用）。
+
+```bash
+# 服务端: 发一条聚合分享, 拿到 URL (token 用完/过期就再发一条)
+bash src/conf/share.sh create-all 8 1
+
+# 客户端机 (装过 sb-client 的机器): 跑门禁的 E 段
+bash tools/check_share_links.sh \
+     --share-url http://<server>:9443/share/<token> \
+     --client-bin /opt/sb-client/core/sing-box
+```
+
+断言四件事（缺一即 FAIL）：
+
+1. 走客户端**真实入口** `client.sh add <url>`（CLI 分派直接调 `add_node`），
+   导入节点数**非 0** 并打印具体数字；
+2. 导入后的客户端配置 `sing-box check` 通过；
+3. 至少一条真连 204；
+4. 生产 `sb-client` 的 MainPID 前后不变（隔离没漏）。
+
+隔离做法：`CLIENT_ROOT`/`CONF`/`NODES` 全部指向 `mktemp` 目录，只调 `add_node`
+**不调 `apply_change`/`do_start`**，所以不会重启生产服务；若 `/etc/sb-client.env`
+把 `CLIENT_ROOT` 抢走，这一段立刻 fail-closed 退出。
+
+实测基线（CC 真机 arm64 + sing-box 1.14.2 内核）：**13 节点导入 / check 通过 /
+真连 204**；改前（`7009d93`）与改后（本次修复）逐项一致 —— 对角线没有倒退。
+
 > 注意区分**修复在仓库 HEAD** 与**修复已分发到某台服务器**：改完代码不等于
 > 现网产物就变了 —— `out/` 里的链接是**生成时**写下的快照，节点不重建就不会变。
 > 升级后请跑一次 `check_share_links.sh`（看 `--out-dir` 那段的结论）。

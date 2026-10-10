@@ -36,12 +36,17 @@ set -u
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 SRC="$(cd "$SELF/.." && pwd)"
 OUT_DIR=""; DO_GEN=1; DO_FIX=0; KEEP=""
+SHARE_URL="${SB_CHECK_SHARE_URL:-}"
+CLIENT_BIN_OVERRIDE=""; CLIENT_SRC_OVERRIDE=""
 while (( $# )); do
     case "$1" in
         --out-dir) OUT_DIR="${2:-}"; shift 2 ;;
         --no-gen)  DO_GEN=0; shift ;;
         --fix)     DO_FIX=1; shift ;;
         --keep)    KEEP=1; shift ;;
+        --share-url)   SHARE_URL="${2:-}"; shift 2 ;;      # E 段: 对角线 (SB 分享 -> SB 客户端)
+        --client-bin)  CLIENT_BIN_OVERRIDE="${2:-}"; shift 2 ;;
+        --client-src)  CLIENT_SRC_OVERRIDE="${2:-}"; shift 2 ;;
         -h|--help) sed -n '2,30p' "${BASH_SOURCE[0]}"; exit 0 ;;
         *) echo "未知参数: $1 (试试 --help)" >&2; exit 2 ;;
     esac
@@ -361,6 +366,117 @@ YAML
     fi
 }
 
+# ---------------------------------------------------------------- E. 对角线自测
+# 「SB 分享 -> SB 客户端」必须一直能用 —— 这是用户点名的红线:
+# "我是怕修着修着之后, 它自己这个就不认得啦。即 SB 分享给 SB。"
+# 不是假想: mihomo 侧真的发生过一次(加旗帜命名把自家的分享生成打断成 0/19)。
+#
+# 跑的是**客户端真实代码路径**: `client.sh add <share-url>` (CLI 分派直接调
+# add_node, 不碰 systemd) + 内核 check + 一次真连。
+#
+# 安全边界 (为什么敢在服务器上跑):
+#   * CLIENT_ROOT 整个隔离到 mktemp 目录, 不读不写 /opt/sb-client 的配置;
+#   * 只用 add_node + 自己起内核, **不调 apply_change/do_start** ⇒ 生产 unit
+#     不会被重启; 脚本前后各取一次生产 unit 的 MainPID, 不一致就判 FAIL;
+#   * 若 /etc/sb-client.env 把 CLIENT_ROOT 抢走, 立刻 fail-closed 退出该段。
+#
+# 需要: --share-url URL (服务器上 `bash conf/share.sh create-all 8 1` 拿到的地址)
+#       --client-bin PATH (默认找 /opt/sb-client/core/sing-box)
+run_diagonal() {
+    echo "== E. 对角线: SB 分享 -> SB 客户端 =="
+    if [[ -z "$SHARE_URL" ]]; then
+        note "未提供 --share-url, 跳过对角线自测 (线上验: --share-url http://…:9443/share/<token>)"
+        return 0
+    fi
+    local cbin="$CLIENT_BIN_OVERRIDE"
+    [[ -z "$cbin" ]] && cbin="/opt/sb-client/core/sing-box"
+    if [[ ! -x "$cbin" ]]; then
+        note "找不到客户端内核 ($cbin), 跳过对角线自测 (可用 --client-bin 指定)"
+        return 0
+    fi
+    command -v curl >/dev/null 2>&1 || { note "没有 curl, 跳过对角线自测"; return 0; }
+    local csrc="$CLIENT_SRC_OVERRIDE"; [[ -z "$csrc" ]] && csrc="$SRC/src/client"
+    [[ -f "$csrc/client.sh" && -f "$csrc/to_sb.py" ]] || { bad "E: 找不到客户端脚本 ($csrc)"; return 1; }
+
+    local W="$SANDBOX/client" port
+    rm -rf "$W"; mkdir -p "$W/conf" "$W/nodes" "$W/share-state" "$W/core"
+    ln -sf "$cbin" "$W/core/sing-box"
+    port=$(python3 - <<'PYPORT'
+import socket
+s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()
+PYPORT
+)
+    cat > "$W/conf/00-mixed.json" <<JSON
+{ "inbounds": [ { "type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1", "listen_port": $port } ] }
+JSON
+    # 骨架里的 DNS 片段: 客户端的 regen_selector 会给 route 写
+    # default_domain_resolver={server:"doh-main"} —— 缺了这个 tag, 内核 check 直接
+    # `initialize outbound[N]: default domain resolver not found: doh-main`。
+    # 这里按 client.sh 的 write_dns_conf 默认值 (阿里 DoH 主 + Cloudflare 兜底,
+    # IP + tls.server_name 以免引导解析泄露) 复刻一份最小骨架。
+    cat > "$W/conf/02-dns.json" <<'JSON'
+{
+  "dns": {
+    "servers": [
+      { "type": "https", "tag": "doh-main", "server": "223.5.5.5", "server_port": 443,
+        "path": "/dns-query", "tls": { "enabled": true, "server_name": "dns.alidns.com" } },
+      { "type": "https", "tag": "doh-fallback", "server": "1.1.1.1", "server_port": 443,
+        "path": "/dns-query", "tls": { "enabled": true, "server_name": "cloudflare-dns.com" } }
+    ],
+    "final": "doh-fallback",
+    "strategy": "ipv4_only"
+  }
+}
+JSON
+    # 客户端代码用**仓库里的这一份** (自测的就是"自家代码能不能吃自家分享")
+    cp "$csrc/client.sh" "$csrc/to_sb.py" "$W/share-state/" 2>/dev/null
+    [[ -f "$csrc/compat2.py" ]] && cp "$csrc/compat2.py" "$W/share-state/" 2>/dev/null
+    [[ -d "$csrc/lib" ]] && cp -r "$csrc/lib" "$W/share-state/lib" 2>/dev/null
+
+    local prod_before="" prod_after=""
+    command -v systemctl >/dev/null 2>&1 && prod_before=$(systemctl show -p MainPID --value sb-client 2>/dev/null || true)
+
+    local out rc
+    out=$(CLIENT_ROOT="$W" CLIENT_BIN="$W/core/sing-box" CLIENT_CONF="$W/conf"           CLIENT_NODE_DIR="$W/nodes" SB_TO_SB="$W/share-state/to_sb.py"           SB_COMPAT_PY="$W/share-state/compat2.py"           SB_COMPAT_REPORT="$W/share-state/.compat-last.json"           bash -c '[[ "$CLIENT_ROOT" == "'"$W"'" ]] || { echo "FATAL: CLIENT_ROOT 被 /etc/sb-client.env 覆盖成 $CLIENT_ROOT"; exit 9; }
+                   exec bash "'"$csrc"'/client.sh" add "$1"' _ "$SHARE_URL" </dev/null 2>&1)
+    rc=$?
+    local n
+    n=$(jq '(.outbounds | map(select(.detour != null) | .detour)) as $dep
+            | [.outbounds[]? | select(.type!="selector" and .type!="urltest" and .type!="direct")
+               | select((.tag as $t | $dep | index($t)) == null)] | length' \
+          "$W/conf/90-outbounds.json" 2>/dev/null)
+    if (( rc != 0 )) || [[ "${n:-0}" -lt 1 ]]; then
+        bad "E1: 自家的分享自家客户端吃不下 (rc=$rc, 导入 ${n:-0} 个节点)"
+        printf '%s\n' "$out" | grep -E "ERR|Error|失败|FATAL" | tail -3 | sed 's/^/         /'
+        return 1
+    fi
+    ok "E1: client.sh add 导入 $n 个节点 (非 0), exit=0"
+
+    local chk; chk=$("$W/core/sing-box" check -D "$W" -C "$W/conf" 2>&1)
+    if (( $? == 0 )); then ok "E2: 导入后的客户端配置 sing-box check 通过"
+    else bad "E2: sing-box check 不通过"; printf '%s\n' "$chk" | tail -3 | sed 's/^/         /'; return 1; fi
+
+    # E3: 真连 (隔离端口, 跑完就杀)
+    nohup "$W/core/sing-box" run -D "$W" -C "$W/conf" > "$W/run.log" 2>&1 &
+    local kp=$!
+    sleep 3
+    local code; code=$(curl -s -o /dev/null -w '%{http_code}|%{time_total}' --max-time 15 \
+                      -x "http://127.0.0.1:$port" "https://www.gstatic.com/generate_204" 2>/dev/null)
+    kill $kp 2>/dev/null; wait $kp 2>/dev/null
+    if [[ "$code" == 204* ]]; then ok "E3: 真连 http=$code (走节点, 端口 $port)"
+    else bad "E3: 真连失败 (http=$code)"; grep -E "FATAL|ERROR" "$W/run.log" 2>/dev/null | tail -2 | sed 's/^/         /'; fi
+
+    if command -v systemctl >/dev/null 2>&1; then
+        prod_after=$(systemctl show -p MainPID --value sb-client 2>/dev/null || true)
+        if [[ "$prod_before" == "$prod_after" ]]; then
+            ok "E4: 生产 sb-client MainPID 未变 ($prod_before) —— 隔离生效, 未碰生产"
+        else
+            bad "E4: 生产 sb-client PID 变了 ($prod_before -> $prod_after)"
+        fi
+    fi
+    return 0
+}
+
 # ---------------------------------------------------------------- C. --fix
 fix_out_dir() {
     echo "== C. --fix: 删掉产物里的无效 obfs 参数 ($OUT_DIR) =="
@@ -398,6 +514,7 @@ PY
 echo "SB 分享链接回归检查 (源码: $SRC)"
 (( DO_GEN )) && run_selftest
 (( DO_GEN )) && run_client_selftest
+run_diagonal        # 自带开关: 没给 --share-url 就跳过
 scan_out_dir
 (( DO_FIX )) && fix_out_dir
 
