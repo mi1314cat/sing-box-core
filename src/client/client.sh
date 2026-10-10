@@ -6,7 +6,8 @@
 # 管理: Clash API (external_controller) + metacubexd Web UI
 # 服务: systemd sb-client.service (缺失时回退 transient sb-client-adhoc)
 # 导入: client.sh add <share-url | local.json>
-# CLI: bash client.sh {install|init|add|list|update|del|start|stop|restart|reload|status|info|check|install-ui|service|settings}
+# CLI: bash client.sh {install|init|add|list|update|del|start|stop|restart|reload|status|info|check|compat|install-ui|service|settings}
+# 兼容性判定: proxy-node-compat(判定层) + compat2.py(适配层), 详见 src/client/compat2.py
 # 部署根目录默认 /opt/sb-client (可在 /etc/sb-client.env 覆盖)
 # ==============================================================
 set -u
@@ -291,6 +292,12 @@ SUB_PORT="${SUB_PORT:-9293}"
 SUB_SERVER="${SUB_SERVER:-$CLIENT_ROOT/share-state/sub_server.py}"
 # 订阅格式转换器 (install.sh 随 client.sh 一起复制过来)
 SB_TO_SB="${SB_TO_SB:-$CLIENT_ROOT/share-state/to_sb.py}"
+# 兼容性判定适配层 (proxy-node-compat 的 vendored 副本 + compat2.py)。
+# 判定只在 compat 里发生一次; 这里是**消费方**: 丢掉它明确说"内核没有"的节点,
+# 并把 reason_code 生成的说明打给用户。缺文件/异常/回滚开关下自动回到旧路径。
+SB_COMPAT_PY="${SB_COMPAT_PY:-$CLIENT_ROOT/share-state/compat2.py}"
+# compat 最近一次的判定结果 (losses/unknowns/extensions/raw_uri 都在里面)
+SB_COMPAT_REPORT="${SB_COMPAT_REPORT:-$CLIENT_ROOT/share-state/.compat-last.json}"
 
 # 下载通道选择 (auto / off / 代理地址)。
 # 必须放在 CLIENT_ROOT 之后 —— 之前它写在前面, set -u 下引用未定义的
@@ -1083,6 +1090,67 @@ sub_menu() {
     done
 }
 
+# ---------- compat: 判定结果摘要 ----------
+# 只做展示: 判定与文案都由 compat2.py 出, 这里不重新判断任何东西。
+compat_brief() { # compat_brief <report.json>
+    local rep="$1"
+    [[ -s "$rep" ]] || return 0
+    python3 - "$rep" <<'PYEOF2' >&2
+import json, sys
+try:
+    d = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    sys.exit(0)
+# to_sb.py 的报告: {"compat": {"nodes": [...]}}
+nodes = (d.get("compat") or {}).get("nodes") or d.get("nodes") or []
+drop = [n for n in nodes if not n.get("ok", True)]
+loss = [n for n in nodes if n.get("ok", True) and n.get("client_losses")]
+tgt = (d.get("compat") or {}).get("target") or d.get("target") or {}
+if not nodes:
+    sys.exit(0)
+print("  compat 判定: %d 个节点, 跳过 %d, 转换有损失 %d (内核 %s %s)"
+      % (len(nodes), len(drop), len(loss), tgt.get("version") or "?",
+         ("tags=" + ",".join(tgt.get("build_tags") or [])) if tgt.get("build_tags") else "tags=未知"))
+for n in drop[:6]:
+    print("    ✗ %s -> %s" % (n.get("tag"), (n.get("message") or ["不支持"])[0][:160]))
+for n in loss[:6]:
+    print("    ⚠ %s: %s" % (n.get("tag"), n["client_losses"][0].get("what", "")[:160]))
+if len(drop) > 6:
+    print("    … 其余 %d 条见 %s" % (len(drop) - 6, sys.argv[1]))
+PYEOF2
+}
+
+# ---------- compat 闸门: 输入已经是 sing-box JSON ----------
+# 客户端的自家 share / 本地配置走这条路（以前一个字段都不判）。过滤是**原地**的:
+# 只有 compat 明确说 UNSUPPORTED 的出站会被拿掉, 其余原样保留。
+compat_gate_json() { # compat_gate_json <profile.json>; 返回非 0 = 全被拿掉了
+    local f="$1" out="$1.gated"
+    [[ -s "$f" ]] || return 0
+    if [[ ! -f "$SB_COMPAT_PY" ]]; then
+        print_warn "compat 适配层缺失 ($SB_COMPAT_PY), 本次不做兼容性判定 (重跑安装脚本可补上)"
+        return 0
+    fi
+    command -v python3 >/dev/null 2>&1 || return 0
+    rm -f "$out" "$SB_COMPAT_REPORT"
+    local line
+    while IFS= read -r line; do [[ -n "$line" ]] && print_warn "$line"; done < <(
+        python3 "$SB_COMPAT_PY" filter-json "$f" --out "$out" --report "$SB_COMPAT_REPORT" 2>&1 >/dev/null
+    )
+    local n; n=$(jq '.outbounds|length' "$out" 2>/dev/null || echo 0)
+    if [[ -s "$out" ]] && [[ "$n" != "0" ]]; then
+        mv -f "$out" "$f"
+        compat_brief "$SB_COMPAT_REPORT"
+        return 0
+    fi
+    rm -f "$out"
+    compat_brief "$SB_COMPAT_REPORT"
+    if [[ "$n" == "0" ]]; then
+        print_err "compat 判定后这份配置里没有可用节点了 (逐条原因见 $SB_COMPAT_REPORT)"
+        return 1
+    fi
+    return 0
+}
+
 # ---------- add: share URL / 本地文件导入 ----------
 add_node() {
     local src="$1"
@@ -1156,7 +1224,10 @@ add_node() {
         # 会被分词成多个参数, 前缀里有空格就彻底错位。
         local cargs=("$tmp")
         [[ -n "$prefix" ]] && cargs+=(--prefix "$prefix")
-        python3 "$SB_TO_SB" "${cargs[@]}" > "$conv" 2>"$cerr"
+        rm -f "$SB_COMPAT_REPORT"
+        # --compat-report: 把 compat 的全量结果(losses/unknowns/extensions/raw_uri)
+        # 落一份到 share-state, 供这里打印与事后核对。
+        python3 "$SB_TO_SB" "${cargs[@]}" --compat-report "$SB_COMPAT_REPORT" > "$conv" 2>"$cerr"
         local rep; rep=$(cat "$cerr" 2>/dev/null)
         if [[ ! -s "$conv" ]] || [[ "$(jq '.outbounds|length' "$conv" 2>/dev/null || echo 0)" == "0" ]]; then
             rm -f "$tmp"; print_err "无法识别的订阅格式"
@@ -1167,6 +1238,7 @@ add_node() {
         fmt=$(printf '%s' "$rep" | sed -n 's/.*格式=\([^ ]*\).*/\1/p')
         cnt=$(jq '.outbounds|length' "$conv" 2>/dev/null || echo 0)
         print_ok "识别为 ${fmt:-未知} 格式, 转换出 $cnt 个节点"
+        compat_brief "$SB_COMPAT_REPORT"
         mv -f "$conv" "$tmp"
 
         # 登记订阅, 供「订阅管理」页列出/更新
@@ -1183,6 +1255,15 @@ add_node() {
                 --arg nm "$prefix" --argjson n "$cnt" --arg ts "$(date -Is)" \
                 '{id:$id,name:$nm,prefix:$pre,url:$url,kind:"external",nodes:$n,added_at:$ts}')"
             print_msg "已登记订阅「$prefix」($cnt 个节点), 可在「订阅管理」里更新"
+        fi
+    else
+        # 自家 share / 本地 sing-box JSON: 客户端以前**完全不判**（只靠整份
+        # sing-box check + 真实拨测）, 于是内核根本没有的字段只能等用户发现
+        # "这个节点连不上"。这里补一道 compat 闸门: 判定仍然是 compat 出的,
+        # 本脚本只决定"留还是丢"。
+        if ! compat_gate_json "$tmp"; then
+            rm -f "$tmp"
+            return 1
         fi
     fi
     local n_count
@@ -1201,9 +1282,16 @@ add_node() {
     else
         local n=0 t tags
           tags=$(jq -r "$HELPER_JQ | .tag" "$tmp" 2>/dev/null)
-        for t in $tags; do
-            IMPORTED_TAGS="$IMPORTED_TAGS $t"
+        # 必须逐行读 tag, **不能**写 `for t in $tags`: 分享链接里的节点名带空格和
+        # emoji（RN 服务端自己生成的就是 "🇺🇸 rn vless01-TLS-CDN"）, for 会按空格把它
+        # 拆成好几个假 tag; 每个假 tag 都 select 不到出站 → jq 整个表达式无输出 →
+        # 落下一批**空文件**, 紧接着 regen_selector 读空文件抛 JSONDecodeError, 配置
+        # 从此再也生成不出来（CC 实测: 13 条真实链接 → 24 个假节点 + 90-outbounds.json
+        # 直接卡在旧内容上）。while read 用 <<< 喂进来, 不会开子 shell, n 和
+        # IMPORTED_TAGS 照常累加。
+        while IFS= read -r t; do
             [[ -n "$t" ]] || continue
+            IMPORTED_TAGS="$IMPORTED_TAGS $t"
               # 必须连 detour 依赖一起切出来。
               # shadowtls 是两层结构: shadowsocks(tag=X) detour→ shadowtls(tag=X-out, 带
               # server/port)。只按 tag 选主节点会把 X-out 丢掉, 得到一份
@@ -1218,7 +1306,7 @@ add_node() {
             echo "$src" > "$CLIENT_NODE_DIR/node-$t.txt"
             echo "{\"tag\":\"$t\",\"source\":\"share\",\"imported_at\":\"$(date -Is)\"}" > "$CLIENT_NODE_DIR/node-$t.meta"
             n=$((n+1))
-        done
+        done <<< "$tags"
           for t in $(jq -r '.outbounds[] | select(.type == "selector" or .type == "urltest" or .type == "direct") | .tag' "$tmp" 2>/dev/null) \
                    $(jq -r '(.outbounds | map(select(.detour != null) | .detour)) as $deps | .outbounds[] | select((.tag as $t | $deps | index($t)) != null) | .tag' "$tmp" 2>/dev/null); do
               [[ -n "$t" ]] || continue
@@ -1921,6 +2009,18 @@ do_info(){ # Web UI / Clash API
     echo; echo
 }
 
+compat_cli(){ # 兼容性判定自检: 目标四元组(真探测的版本+build tags) + 适配层自检
+    if [[ ! -f "$SB_COMPAT_PY" ]]; then
+        print_err "compat 适配层缺失: $SB_COMPAT_PY (重跑安装脚本可补上)"
+        return 1
+    fi
+    command -v python3 >/dev/null 2>&1 || { print_err "需要 python3"; return 1; }
+    print_title "compat 目标 (真读 sing-box version)"
+    python3 "$SB_COMPAT_PY" version || return 1
+    echo
+    python3 "$SB_COMPAT_PY" selftest
+}
+
 check_menu(){ # 配置检查
     collect_status
     ui_title "配置检查"
@@ -2261,6 +2361,7 @@ case "${1:-}" in
     del) shift; del_node "$@" ;;
     update) shift; update_node ;;
     check) client_check_cli ;;
+    compat) compat_cli ;;
     start) do_start ;;
     stop) do_stop ;;
     restart) do_restart ;;
@@ -2270,5 +2371,5 @@ case "${1:-}" in
     settings) settings_menu ;;
     install-ui) download_ui ;;
     info) do_info ;;
-    *) echo "用法: client.sh {install|init|add <url>|list|del <tag>|update|start|stop|restart|reload|status|check|service|install-ui|info}"; exit 1 ;;
+    *) echo "用法: client.sh {install|init|add <url>|list|del <tag>|update|start|stop|restart|reload|status|check|compat|service|install-ui|info}"; exit 1 ;;
 esac

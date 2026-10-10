@@ -458,6 +458,75 @@ def _std_uri(scheme, rest, frag, prefix):
 
 
 # --------------------------------------------------------------------------
+# compat 接入（proxy-node-compat 适配层 = compat2.py, 与本文件同目录）
+#
+# 分工: 这里**不判**任何能力, 只把"这个节点是什么"（原文链接 / 出站 dict）交给
+# compat2, 由它调 check_node 判一次, 然后消费结论。判定只在 compat 发生一次。
+#
+# 三条纪律:
+#   * compat 只能收紧: 它说 UNSUPPORTED 才丢节点; 其余一律保留（旧行为不变）
+#   * 回滚: SB_COMPAT_ENGINE=legacy 或 SB_COMPAT_DISABLE=1 → 完全回到旧路径
+#   * compat2 缺失/异常 → 自动落回旧路径, 绝不让导入失败
+# --------------------------------------------------------------------------
+_COMPAT = None
+
+
+def _compat_mod():
+    global _COMPAT
+    if _COMPAT is None:
+        try:
+            here = os.path.dirname(os.path.abspath(__file__))
+            if here not in sys.path:
+                sys.path.insert(0, here)
+            import compat2                                  # noqa: WPS433
+            _COMPAT = compat2
+        except Exception:                                   # noqa: BLE001
+            _COMPAT = False
+    return _COMPAT or None
+
+
+def compat_enabled():
+    return (_compat_mod() is not None
+            and os.environ.get("SB_COMPAT_ENGINE", "").strip().lower() != "legacy"
+            and os.environ.get("SB_COMPAT_DISABLE", "") != "1")
+
+
+def _compat_gate(rep, uri, ob, tag):
+    """判一个节点 → 记录到 rep["compat"]; 返回结果 dict 或 None（未接入/异常）。"""
+    mod = _compat_mod() if compat_enabled() else None
+    if mod is None:
+        return None
+    try:
+        r = mod.judge(uri=uri, outbound=ob, tag=tag or (ob or {}).get("tag"))
+    except Exception as e:                                  # noqa: BLE001
+        rep.setdefault("compat", {}).setdefault("errors", []).append(
+            "%s: %s" % (type(e).__name__, e))
+        return None
+    slot = rep.setdefault("compat", {})
+    slot.setdefault("target", r.get("target"))
+    slot.setdefault("nodes", []).append({
+        "tag": r.get("tag"), "type": (ob or {}).get("type"),
+        "verdict": r["verdict"], "verdict_source": r["verdict_source"],
+        "ok": r["ok"], "reason_codes": r["reason_codes"], "message": r["message"],
+        "raw_uri": r.get("raw_uri"), "extensions": r.get("extensions"),
+        "unknowns": r.get("unknowns"), "client_losses": r.get("client_losses"),
+        "downgrades": r.get("downgrades"),
+        "losses": (r.get("compat") or {}).get("losses"),
+        "warnings": r.get("warnings"),
+        "legacy": r.get("legacy"),
+    })
+    return r
+
+
+def _compat_reason(r):
+    """跳过原因: 用 compat 的第一条文案（由 reason_code 生成, 已经说了缺什么/支持什么）"""
+    msgs = r.get("message") or []
+    m = msgs[0] if msgs else "compat 判定不支持"
+    rc = ",".join(r.get("reason_codes") or [])
+    return "compat[%s] %s" % (rc or "?", m[:180])
+
+
+# --------------------------------------------------------------------------
 # 输入分类
 # --------------------------------------------------------------------------
 URI_RE = re.compile(r"^(vmess|vless|trojan|ss|socks5?|http|hysteria2|hy2|tuic|anytls)://", re.I)
@@ -487,6 +556,14 @@ def convert(data, prefix=""):
         rep["skip"] += 1
         rep["reasons"][r] = rep["reasons"].get(r, 0) + 1
 
+    def _keep(ob, uri=None, tag=None):
+        """compat 闸门: 说 UNSUPPORTED 就不留（文案由 compat 的 reason_code 生成）。"""
+        r = _compat_gate(rep, uri, ob, tag)
+        if r is not None and not r["ok"]:
+            _note(_compat_reason(r))
+            return False
+        return True
+
     text = data.decode("utf-8", "replace") if isinstance(data, bytes) else data
 
     # 1) sing-box JSON
@@ -497,14 +574,17 @@ def convert(data, prefix=""):
                    and o.get("type") not in ("selector", "urltest", "direct", "block", "dns")]
             rep["format"] = "sing-box-json"
             rep["total"] = len(obs)
+            keep = []
             for o in obs:
                 if prefix and o.get("tag"):
                     o["tag"] = prefix + o["tag"]
-            rep["ok"] = len(obs)
-            return obs, rep
+                if _keep(o, tag=o.get("tag")):
+                    keep.append(o)
+            rep["ok"] = len(keep)
+            return keep, rep
         if isinstance(j, list):
             rep["format"] = "mihomo-json"
-            return _from_clash_list(j, prefix, rep)
+            return _from_clash_list(j, prefix, rep, _keep)
     except Exception:
         pass
 
@@ -517,10 +597,10 @@ def convert(data, prefix=""):
         if isinstance(y, dict):
             lst = y.get("proxies") or []
             rep["format"] = "mihomo-yaml"
-            return _from_clash_list(lst, prefix, rep)
+            return _from_clash_list(lst, prefix, rep, _keep)
         if isinstance(y, list):
             rep["format"] = "mihomo-yaml-list"
-            return _from_clash_list(y, prefix, rep)
+            return _from_clash_list(y, prefix, rep, _keep)
 
     # 3) base64 订阅
     if looks_base64_sub(text):
@@ -547,6 +627,10 @@ def convert(data, prefix=""):
             if not o:
                 _note("不支持的 URI: %s" % l.split("://", 1)[0])
                 continue
+            # 原文链接一并交给 compat: 它是"节点是什么"的唯一可信来源
+            # （to_sb 遇到没写的传输是静默降级, 只看出站看不出问题）
+            if not _keep(o, uri=l, tag=o.get("tag")):
+                continue
             obs.append(o)
             rep["ok"] += 1
         return obs, rep
@@ -555,7 +639,7 @@ def convert(data, prefix=""):
     return [], rep
 
 
-def _from_clash_list(lst, prefix, rep):
+def _from_clash_list(lst, prefix, rep, _keep=None):
     rep["total"] = len(lst)
     obs = []
     for d in lst:
@@ -566,6 +650,10 @@ def _from_clash_list(lst, prefix, rep):
         if not o:
             _note("不支持的 clash type: %s" % (d.get("type") if isinstance(d, dict) else "?"))
             continue
+        # mihomo 的 proxies 里没有分享原文（除了 yaml 片段本身）, 所以只能用出站判;
+        # 原始片段由 compat 的 raw_fields 保真（不变式 I1）。
+        if _keep is not None and not _keep(o, tag=o.get("tag")):
+            continue
         obs.append(o)
         rep["ok"] += 1
     return obs, rep
@@ -574,7 +662,7 @@ def _from_clash_list(lst, prefix, rep):
 def main():
     args = sys.argv[1:]
     if not args:
-        print("用法: to_sb.py <输入文件> [--prefix P]", file=sys.stderr)
+        print("用法: to_sb.py <输入文件> [--prefix P] [--compat-report R]", file=sys.stderr)
         return 2
     path = args[0]
     prefix = ""
@@ -582,6 +670,9 @@ def main():
         prefix = args[args.index("--prefix") + 1] + "-"
     elif "--prefix" in args[:-1]:
         prefix = ""
+    report = ""
+    if "--compat-report" in args:
+        report = args[args.index("--compat-report") + 1]
     try:
         data = open(path, "rb").read()
     except OSError as e:
@@ -592,6 +683,14 @@ def main():
     sys.stderr.write("[to_sb] 格式=%s 共=%d 成功=%d 跳过=%d %s\n" % (
         rep.get("format"), rep["total"], rep["ok"], rep["skip"],
         ("跳过原因=" + json.dumps(rep["reasons"], ensure_ascii=False)) if rep["reasons"] else ""))
+    # compat 全量结果（losses / unknowns / extensions / raw_uri 都在里面）落盘一份,
+    # 给 client.sh 打印与事后核对用 —— 节点文件里**绝不能**塞这些键, 内核会拒绝。
+    if report:
+        try:
+            with open(report, "w", encoding="utf-8") as fh:
+                json.dump(rep, fh, ensure_ascii=False, indent=1)
+        except OSError as e:
+            sys.stderr.write("[to_sb] compat 报告写不进去: %s\n" % e)
     return 0 if obs else 1
 
 

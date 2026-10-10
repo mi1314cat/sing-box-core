@@ -379,6 +379,15 @@ do_client() {
     # 会让那个文件凭空多几百行, 而且没法单独更新。
     mkdir -p "$CLI_ROOT/share-state"
     cp -f "$SRC_DIR/src/client/to_sb.py" "$CLI_ROOT/share-state/to_sb.py" 2>/dev/null || true
+    # 兼容性判定层: 适配层 compat2.py + vendored 的 proxy-node-compat(含 rules.json)。
+    # 判定只在 compat 里发生一次, to_sb.py/client.sh 只消费结论。缺了它就自动回到
+    # 旧路径(只靠 sing-box check + 拨测), 不会因为少文件而拒绝导入。
+    cp -f "$SRC_DIR/src/client/compat2.py" "$CLI_ROOT/share-state/compat2.py" 2>/dev/null || true
+    rm -rf "$CLI_ROOT/share-state/lib"
+    mkdir -p "$CLI_ROOT/share-state/lib"
+    cp -r "$SRC_DIR/src/client/lib/proxy_node_compat" "$CLI_ROOT/share-state/lib/" 2>/dev/null || true
+    find "$CLI_ROOT/share-state/lib" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
+    chmod +x "$CLI_ROOT/share-state/compat2.py" 2>/dev/null || true
     # 配置分发服务: 让局域网其他设备通过 URL 拉取本客户端的完整配置。
     # 缺了它菜单 19 会起不来 —— 单独抽成文件而不是塞进 client.sh, 就是
     # 为了它只有几十行、但需要能单独读单独改。
