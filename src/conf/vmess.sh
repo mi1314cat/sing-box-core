@@ -131,7 +131,11 @@ add_config() {
     esac
       
     local uuid; uuid=$(cat /proc/sys/kernel/random/uuid)
-    local REAL_PRIV REAL_PUB
+    # 赋空初值而不是只声明: 非 reality 形态下这两个变量不会走到赋值分支,
+    # 而 PYGEN 的位置参数里要传 $REAL_PUB —— 只声明不赋值时, 任何以
+    # `set -u` 跑的调用方 (批量脚本、自测脚本) 都会在这里
+    # "REAL_PUB: unbound variable" 直接中断。
+    local REAL_PRIV="" REAL_PUB=""
     if [[ "$CERT_MODE" == "reality" ]]; then
         . "$SB_OUT_DIR/reality-keys.json" 2>/dev/null || true
         [[ -f "$SB_OUT_DIR/reality-keys.json" ]] && REAL_PRIV=$(jq -r .private_key "$SB_OUT_DIR/reality-keys.json") && REAL_PUB=$(jq -r .public_key "$SB_OUT_DIR/reality-keys.json")
@@ -216,10 +220,35 @@ EOF
     server_ip=$(sb_cdn_finalize "$file" "$server_ip")
     # CDN 只在 443 上提供服务; 沿用源站端口会得到连不通的 域名:源站端口
     sb_node_is_cdn "$file" && listen_port=443
+    # ---- 分享链接: vmess:// 一律 base64(JSON), 且**末尾不追 #片段** ----
+    #
+    # 三条实测结论 (mihomo 1.19.32, 2026-10; 每一条的后果都是"整条订阅归零",
+    # 而不是单条节点失效 —— 客户端把 provider 判成 0 节点, 好节点一起消失):
+    #   ① 少了 "ps" 字段: mihomo 不把这一行当 vmess 链接,
+    #      `convert v2ray subscribe error: format invalid`;
+    #   ② 末尾追 "`#名字`": mihomo 把 #片段一起塞进 base64 解码 -> 解码失败
+    #      -> 同样 0 节点。vless / trojan / hy2 等链接的 #片段是正常写法,
+    #      **只有 vmess:// 特殊** (它的名字在 JSON 的 "ps" 里);
+    #   ③ reality 形态原来写成 `vless://…encryption=aes-128-gcm…`:
+    #      协议名本身就错 (服务端是 vmess inbound), 且 mihomo 直接
+    #      `invaild vless encryption value: aes-128-gcm` -> 0 节点。
+    # 所以这里: UUID 用标准字段 "id" (同时保留 "uuid", 老读法不受影响),
+    #           名字进 "ps", 其余按 v2rayN 约定补齐, 链接**不加任何后缀**。
+    local ps_name; ps_name=$(sb_tag_display "$tag")
+    # grpc 的"路径"就是 service_name: v2ray/v2rayN 的 vmess JSON 约定把
+    # service name 放在 path 字段里, 而 grpc 的 TR_PATH 是**空的** (服务名在
+    # TR_SVC)。这里原来一律写 $tpath, 于是 vmess+gRPC 节点分享出去
+    # service_name 为空 —— 客户端拿到必然连不上 (三个 grpc 预置方案全中)。
+    local vpath="$tpath"; [[ "$ttype" == "grpc" ]] && vpath="$svc"
+    local vjson
     if [[ "$CERT_MODE" == "reality" ]]; then
         pbk="$REAL_PUB"
-        url="vless://$uuid@$server_ip:$listen_port?encryption=aes-128-gcm&security=reality&sni=$rnd&fp=chrome&pbk=$pbk&sid=$sid"
-        url="$url$(sb_transport_link_params "$ttype" "$tpath" "$svc" "$TR_HOST")"
+        vjson=$(jq -c -n --arg ps "$ps_name" --arg add "$server_ip" --arg port "$listen_port" \
+            --arg id "$uuid" --arg net "${ttype:-tcp}" --arg path "$vpath" \
+            --arg host "${TR_HOST:-$DOM}" --arg sni "$rnd" --arg pbk "$pbk" --arg sid "$sid" \
+            '{v:"2",ps:$ps,add:$add,port:$port,id:$id,uuid:$id,aid:"0",scy:"auto",security:"auto",
+              net:$net,type:"none",host:$host,path:$path,tls:"reality",sni:$sni,fp:"chrome",
+              pbk:$pbk,sid:$sid}')
     else
         # vmess:// 是 **base64 编码的 JSON payload**, 不像 vless:// 那样用
         # &query 明文。之前这里把 security/tls 硬编码成 "none"/"" ,
@@ -229,17 +258,20 @@ EOF
         local vtls="" vsni=""
         case "$CERT_MODE" in
             real|selfsign)    vtls="tls" ;;
-            reality)          vtls="reality" ;;
         esac
-        [[ "$vtls" == "tls" || "$vtls" == "reality" ]] && vsni="$CERT_DOMAIN"
-        url="vmess://$(printf '{"add":"%s","port":"%s","uuid":"%s","aid":"0","net":"%s","path":"%s","host":"%s","security":"%s","tls":"%s","sni":"%s","alpn":"%s"}' \
-            "$server_ip" "$listen_port" "$uuid" "${ttype:-tcp}" "$tpath" "${TR_HOST:-$CERT_DOMAIN}" \
-            "auto" "$vtls" "$vsni" "$(sb_transport_alpn "$ttype" | tr -d '[]\"' | cut -d, -f1)" | base64 -w0)"
+        [[ "$vtls" == "tls" ]] && vsni="$CERT_DOMAIN"
+        vjson=$(jq -c -n --arg ps "$ps_name" --arg add "$server_ip" --arg port "$listen_port" \
+            --arg id "$uuid" --arg net "${ttype:-tcp}" --arg path "$vpath" \
+            --arg host "${TR_HOST:-$CERT_DOMAIN}" --arg tls "$vtls" --arg sni "$vsni" \
+            --arg alpn "$(sb_transport_alpn "$ttype" | tr -d '[]\"' | cut -d, -f1)" \
+            '{v:"2",ps:$ps,add:$add,port:$port,id:$id,uuid:$id,aid:"0",scy:"auto",security:"auto",
+              net:$net,type:"none",host:$host,path:$path,tls:$tls,sni:$sni,alpn:$alpn}')
     fi
+    url="vmess://$(printf '%s' "$vjson" | base64 -w0)"
     if [[ "$CERT_MODE" == "selfsign" ]]; then
         secpin=$(cert_spki_pin_base64 "$CERT_FILE")
     fi
-    url="$url#$(sb_tag_display "$tag")"
+    # 注意: **不要**在这里追加 "#$(sb_tag_display "$tag")" —— 见上面 ②。
     local utls_fp; utls_fp=$(ask_utls_fingerprint)
     export SB_UTLS_FP="$utls_fp"
     # 公共参数已在服务端那一步问过, 这里只渲染, 不重复提问。

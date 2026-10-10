@@ -257,6 +257,24 @@ SB_BATCH_HOP=31000-31999 SB_BATCH_OBFS=y bash conf/batch.sh
 `obfs: salamander` + `obfs-password`。fscarmen 那一版**没有** obfs
 （他的 `HY2_REALM_CONFIG` 是 hy2 realm 中转，不是混淆层）。
 
+> **不开混淆时，分享链接里不会出现任何 obfs 参数**（不写即无混淆）。
+>
+> 这是一条**实测踩出来的硬规矩**：旧代码无条件往链接里写
+> `&obfs=none&obfs-password=`，mihomo 解析到"有 obfs 但没密码"直接报
+> `initial proxy provider t error: proxy 0 error: missing obfs password`，
+> 并把**整条订阅**判成 **0 节点** —— 同一条链接里另外 8 个好节点一起消失
+> （跨内核 E2E 实测；M 内核同病，X 侧已先修）。
+>
+> 严重性口径（实测区分，别记混）：
+>
+> | 客户端 | 遇到 `obfs=none` |
+> |---|---|
+> | **mihomo** | **硬失败**：provider 归零，同订阅好节点全丢 |
+> | sing-box / xray | **静默忽略**：只当没写 obfs，节点照常用 |
+>
+> 所以受害面是"把 SB 链接喂给 mihomo 订阅"的场景；SB 自己（分享内容是
+> sing-box JSON）与 sing-box/xray 客户端不受影响。
+
 ### 设计取舍：为什么是单选而不是逐协议勾选
 
 能不能用 multiplex / CDN 是**内核字段有没有**的问题，不是用户偏好：
@@ -734,6 +752,18 @@ sing-box 客户端两种传输都能用，所以服务端配置照常生成，�
 > 与其产出一份**看着正常、实际连不上的** YAML，不如跳过并写明原因。
 > 服务端配置照常生成 —— 换 sing-box 客户端是能用的。
 
+**URI 分享链接层面**（2026-10 用 mihomo 1.19.32 逐条实测，13 条 SB 链接）：
+
+| 链接 | mihomo 能否解析 | 能否连通 |
+|---|---|---|
+| vless/trojan(shadowsocks)/hy2/tuic/ss/anytls(纯 TLS)/vmess(TLS) | 能 | 能（8/11 实测 204） |
+| vless+REALITY | 能 | **能**（REALITY 只有 vless 在 mihomo 里可用） |
+| trojan+REALITY / vmess+REALITY / anytls+REALITY | 能解析 | **连不通**（mihomo 的 REALITY 只支持 vless） |
+| `naive+https://` / `shadowtls://` | **认不出** | —（mihomo 没有这两个独立出站；这两行会被**跳过**，不会打挂整条订阅） |
+
+⇒ 给 mihomo 用的订阅，**REALITY 节点请用 vless 形态**；naive / shadowtls 的链接
+只对 sing-box / xray 系客户端有意义。
+
 ---
 
 ## CDN / nginx 前置
@@ -793,7 +823,9 @@ bash src/conf/share.sh create hysteria01 10 168
 bash src/conf/share.sh list
 bash src/conf/share.sh toggle <token|tag>          # 立即禁用
 bash src/conf/share.sh del|regen <token|tag>
-# 服务: systemd (sing-box-share, 默认 :9292)
+bash src/conf/share.sh check all                   # 生成后一致性校验 (只读)
+# 存储: 公共基础服务 proxy-share-service (provider=sing-box, 默认 :9443,
+#       端口由 share_client.py 读, 不写死) —— 与 mihomo / xray 共用一套存储
 ```
 
 - URL 仅含 128-bit 随机 token，**不**包含任何节点信息；返回完整客户端 outbound JSON
@@ -801,6 +833,47 @@ bash src/conf/share.sh del|regen <token|tag>
 - 并发安全：flock 串行 read-modify-write，10 并发抢 1 次授权仍只放行 1 个（已实测）
 - 客户端只有**收到完整 200 响应**才计数；服务端配置异常一律 `503` 且不消耗次数
 - **删除任何节点会自动清理其 share token** 并刷新 all 聚合，不会把已删节点悄悄分发出去
+  （这条承诺一度失效：存储搬到公共服务后，删除路径只扫了**旧的本地目录**
+  `share/shares/`，等于空转 —— 记录留在服务里、内容冻结在"已删节点的客户端配置"，
+  而刷新逻辑找不到产物只能跳过，那条链接**永远不会自愈**。现已补上公共服务侧下架。）
+
+### 分享内容 vs 真实监听：生成后一致性校验
+
+分享内容 = `out/sb_client-<tag>.json` 的**字节副本**（不做二次渲染，所以不存在
+"分享层与产物不一致"）。但副本在创建那一刻**冻结**，于是有另一类不一致：
+**产物 vs 真实配置/监听**。发布前现在会过一遍 `sb_share_consistency_check`：
+
+1. 内容里每个 outbound 的 tag 必须能在 `config/*.json` 的 `inbounds[].tag` 找到
+   （兼容聚合产物的 `<服务器前缀>-` 前缀与 shadowtls 的内层 `<tag>-out`）；
+2. 直连节点的 `server_port` 必须等于该 inbound 的 `listen_port`
+   （CDN 节点跳过：它只听 `127.0.0.1`，客户端走 `域名:443`，两者本来不同）；
+3. 端口当前是否真的在监听（`ss`）—— 只告警不拦（刚写完配置还没 reload 会短暂为假）。
+
+**不一致就拒绝发布**（并把具体节点打出来），绝不发死节点。刷新路径同理：产物已经
+不存在（节点被删）的记录会被**直接下架**，而不是留在服务里继续发旧内容。
+
+### 链接格式：几条会让对方**整条订阅归零**的硬规矩
+
+`tools/check_share_links.sh` 把这些规矩固化成回归检查（可在服务器上直接跑，
+支持 `--out-dir DIR` / `--fix` / `--no-gen`），断言：
+
+| 规矩 | 违反后果（mihomo 实测） |
+|---|---|
+| hy2 不写无效 obfs（`obfs=none` / 空密码） | `missing obfs password` → provider **0 节点** |
+| 真开混淆时 `obfs=salamander` 必须带非空密码 | 同上 |
+| `vmess://` 必须是 base64(JSON)，含 `ps` 与标准 `id`，且**结尾不加 `#片段`** | `convert v2ray subscribe error: format invalid` → **0 节点** |
+| vmess+REALITY 必须写成 `vmess://`（不能写成 `vless://`） | vless 链接错误：`invaild vless encryption value: aes-128-gcm` → **0 节点**；而且协议本身就错 |
+| `vless://` 的 `encryption` 只能是 `none` | 同上（这是"vmess 被误标成 vless"的指纹） |
+| 链接里的 `sni` 不能是 IP | `x509: cannot validate certificate for <IP>` |
+| hy2 / tuic 必须带 `alpn` | 部分中间设备/客户端直接握手失败 |
+
+`--fix` 会把**已经发出去**的老产物（旧代码生成的 `out/sb_share-*.txt` /
+`out/sb_links-all.txt`）里的无效 obfs 参数就地删掉；`vmess://` 的老形态无法原地
+修好（字段名与片段都在 base64 里），删掉节点重建即可。
+
+> 注意区分**修复在仓库 HEAD** 与**修复已分发到某台服务器**：改完代码不等于
+> 现网产物就变了 —— `out/` 里的链接是**生成时**写下的快照，节点不重建就不会变。
+> 升级后请跑一次 `check_share_links.sh`（看 `--out-dir` 那段的结论）。
 
 ---
 
@@ -811,7 +884,7 @@ bash src/conf/share.sh del|regen <token|tag>
 ```bash
 bash src/client/client.sh install           # 内核 (arm64/amd64, glibc/musl 回退)
 bash src/client/client.sh init             # 建配置 + 装 sb-client.service + 自动启动
-bash src/client/client.sh add https://<server>:9292/share/<token>
+bash src/client/client.sh add http://<server>:9443/share/<token>   # 公共分享服务端口 (不写死, 见 share_client.py)
 bash src/client/client.sh list|del|update  # 多节点池 (share 来源去重)
 bash src/client/client.sh start|stop|restart|reload|status|check
 bash src/client/client.sh service          # 只安装/更新 systemd unit

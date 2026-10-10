@@ -304,11 +304,12 @@ def parse_vmess(uri, name):
 
     host = check_host(d.get("add", ""), ctx)
     port = check_port(d.get("port", ""), ctx)
-    uuid = check_uuid(d.get("id", ""), ctx)
+    # 标准字段名是 "id"; 本面板 2026-10 之前发出去的链接写的是 "uuid"
+    uuid = check_uuid(d.get("id") or d.get("uuid") or "", ctx)
 
     ob = {"type": "vmess", "server": host, "server_port": port, "uuid": uuid}
 
-    sec = (d.get("scy") or "auto").strip() or "auto"
+    sec = (d.get("scy") or d.get("security") or "auto").strip() or "auto"
     if sec not in VMESS_SECURITY:
         raise UriError("vmess 加密方式非法: %r (支持 %s)" % (sec, "/".join(VMESS_SECURITY)))
     ob["security"] = sec
@@ -320,12 +321,22 @@ def parse_vmess(uri, name):
     if aid:
         ob["alter_id"] = aid
 
-    tls_on = str(d.get("tls", "")).strip().lower() in ("tls", "true", "1", "reality")
+    tlsmode = str(d.get("tls", "")).strip().lower()
+    tls_on = tlsmode in ("tls", "true", "1", "reality")
     sni = (d.get("sni") or d.get("host") or "").strip()
     alpn = (d.get("alpn") or "").strip()
     fp = (d.get("fp") or "").strip()
     if tls_on:
-        ob["tls"] = build_tls(sni, False, alpn, fp)
+        if tlsmode == "reality":
+            # vmess+REALITY: 只给 sni 是不够的 —— 少了 pbk/sid 会被当成
+            # 普通 TLS 节点导入 (看着成功, 实际永远连不通)。
+            pbk = str(d.get("pbk") or "").strip()
+            sid = str(d.get("sid") or "").strip()
+            if not pbk:
+                raise UriError("reality 需要 pbk (公钥) 参数")
+            ob["tls"] = build_tls(sni, False, alpn, fp, pbk, sid)
+        else:
+            ob["tls"] = build_tls(sni, False, alpn, fp)
 
     net = (d.get("net") or "").strip()
     host_hdr = (d.get("host") or "").strip()
@@ -473,6 +484,13 @@ def parse_hysteria2(uri, name):
 
     obfs_type = q1(query, "obfs").strip().lower()
     obfs_line = "无"
+    # obfs=none / 空值 一律当"无混淆"。
+    # 原因: 带 `obfs=none&obfs-password=` 的链接在 mihomo 里会报
+    # `proxy 0 error: missing obfs password` 并把**整条订阅**判成 0 节点
+    # (跨内核 E2E 实测)。别人家的面板 (M / 老版 X) 确实这么发过, 我们这边
+    # 不该因为对方多了一个无效参数就整条拒绝导入。
+    if obfs_type in ("none", "null", "off", "false", "0"):
+        obfs_type = ""
     if obfs_type:
         if obfs_type != "salamander":
             raise UriError("不支持的 obfs: %r (仅 salamander)" % obfs_type)

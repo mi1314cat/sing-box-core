@@ -302,16 +302,36 @@ def _vmess_uri(rest, frag, prefix):
     d = _decode_vmess_payload(rest)
     if not isinstance(d, dict):
         return None
-    ob = {"type": "vmess", "tag": (prefix + frag) if prefix else frag,
+    # 名字: vmess:// 的 v2rayN 约定是放在 JSON 的 "ps" 里, base64 串后面
+    # **不带** #片段 —— mihomo 会把 #片段一起塞进 base64 解码, 解不开就
+    # 把整条订阅判成 0 节点。老链接 (含本面板 2026-10 以前发的) 把名字放在
+    # #片段, 两种都认。
+    name = str(d.get("ps") or "").strip() or frag
+    ob = {"type": "vmess", "tag": (prefix + name) if prefix else name,
           "server": d.get("add"), "server_port": int(d.get("port") or 0),
-          "uuid": d.get("id") or "", "security": d.get("scy") or "auto",
+          # 标准字段名是 "id"; 本面板 2026-10 之前发出去的链接写的是 "uuid"
+          "uuid": d.get("id") or d.get("uuid") or "",
+          "security": d.get("scy") or d.get("security") or "auto",
           "alter_id": int(d.get("aid") or 0)}
     if not ob["server"] or not ob["server_port"]:
         return None
     tls = {}
-    if str(d.get("tls", "")).lower() in ("tls", "true", "1"):
+    tlsmode = str(d.get("tls", "")).lower()
+    if tlsmode in ("tls", "true", "1"):
         tls["enabled"] = True
         tls["server_name"] = d.get("sni") or d.get("host") or ob["server"]
+    elif tlsmode == "reality":
+        # vmess/trojan + REALITY 的链接: tls 段只"借"目标站点的握手, 真正的
+        # 身份校验在 pbk/sid 上。原来这里只认 tls/true/1, 于是 REALITY 链接
+        # 被当**明文** vmess 导入 —— 内核不报错, 节点却永远连不通。
+        tls["enabled"] = True
+        tls["server_name"] = d.get("sni") or d.get("host") or ob["server"]
+        r = {"enabled": True}
+        if d.get("pbk"):
+            r["public_key"] = d["pbk"]
+        if d.get("sid"):
+            r["short_id"] = d["sid"]
+        tls["reality"] = r
     if d.get("alpn"):
         tls["alpn"] = str(d["alpn"]).split(",")
     if d.get("scy") == "chacha20-poly1305":
@@ -400,8 +420,14 @@ def _std_uri(scheme, rest, frag, prefix):
         ob["password"] = user
     elif scheme in ("hysteria2", "hy2"):
         ob["password"] = user
-        if qd.get("obfs") == "salamander":
-            ob["obfs"] = {"type": "salamander", "password": qd.get("obfs-password", "")}
+        # 只在**真有密码**时才写 obfs。别人家的链接可能带
+        # `obfs=none&obfs-password=` (M / 老版 X 都这么发过):
+        #   * 写进 obfs 会得到一个内核 check 不过的 outbound -> 整份客户端配置
+        #     失效, 一条坏链接拖掉全部节点;
+        #   * mihomo 更直接: "missing obfs password" -> 整条订阅 0 节点。
+        # 不写 obfs 就是"无混淆", 语义与 obfs=none 完全一致。
+        if qd.get("obfs") == "salamander" and qd.get("obfs-password"):
+            ob["obfs"] = {"type": "salamander", "password": qd["obfs-password"]}
         if qd.get("mport"):
             ob["server_ports"] = [int(x) for x in qd["mport"].split(",") if x.strip().isdigit()]
             ob.pop("server_port", None)
@@ -639,6 +665,21 @@ def convert(data, prefix=""):
     return [], rep
 
 
+def _skip_note(rep, msg):
+    """记一条"跳过 + 原因"。
+
+    ★ 必须是**模块级**函数: `_note` 是 convert() 内部的闭包, 模块级函数里根本
+      调不到它。原来 `_from_clash_list` 直接调 `_note` —— 于是**任何一条**不能
+      转换的代理 (不认识的 type / 值非法触发异常) 都会抛 NameError, 把整批
+      转换炸掉: 实测 M 分享的 19 节点订阅喂进来 -> 0 导入; 把唯一那条脏值
+      剔掉之后 18/18 通过。这就是"一条坏条目毁掉整批"。
+    纪律: 单条异常只跳过那一条并记录原因, 绝不影响同批其它节点。
+    """
+    rep["skip"] = rep.get("skip", 0) + 1
+    reasons = rep.setdefault("reasons", {})
+    reasons[msg] = reasons.get(msg, 0) + 1
+
+
 def _from_clash_list(lst, prefix, rep, _keep=None):
     rep["total"] = len(lst)
     obs = []
@@ -648,7 +689,7 @@ def _from_clash_list(lst, prefix, rep, _keep=None):
         except Exception:
             o = None
         if not o:
-            _note("不支持的 clash type: %s" % (d.get("type") if isinstance(d, dict) else "?"))
+            _skip_note(rep, "不支持的 clash type: %s" % (d.get("type") if isinstance(d, dict) else "?"))
             continue
         # mihomo 的 proxies 里没有分享原文（除了 yaml 片段本身）, 所以只能用出站判;
         # 原始片段由 compat 的 raw_fields 保真（不变式 I1）。

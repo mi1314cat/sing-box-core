@@ -291,7 +291,17 @@ EOF
         pin_field=",
         \"certificate_public_key_sha256\": \"$pin\""
     fi
-    local link="hysteria2://$auth@$server_ip:$listen_port?${hop:+mport=$hop&}sni=$CERT_DOMAIN&obfs=$( [[ $mask != none ]] && echo salamander || echo none )&obfs-password=$( [[ $mask != none ]] && echo $mask )&alpn=h3"
+    # obfs 参数**只在真正启用混淆时**写进链接。
+    #
+    # 旧写法无条件吐 `&obfs=none&obfs-password=`，是一条会连累**整条订阅**的
+    # 脏参数：mihomo 解析到 obfs 非空却拿不到密码，直接
+    #   `initial proxy provider t error: proxy 0 error: missing obfs password`
+    # 并把 provider 判成 **0 节点** —— 同一订阅里其它 8 条好好的链接一起消失
+    # （跨内核 E2E 实测，M / SB 两家同现象；这是生态共有问题，X 侧已先修）。
+    # 不写 obfs 就是"无混淆"，这是所有客户端的默认语义，也是唯一安全的写法。
+    local obfs_q=""
+    [[ -n "$mask" && "$mask" != "none" ]] && obfs_q="&obfs=salamander&obfs-password=$mask"
+    local link="hysteria2://$auth@$server_ip:$listen_port?${hop:+mport=$hop&}sni=$CERT_DOMAIN${obfs_q}&alpn=h3"
     [[ "$CERT_TRUSTED" == "false" ]] && link="$link&pinSHA256=$pin"
     link="$link$(sb_ech_link_params)#$(sb_tag_display "$tag")"
     # 简化: 对标准客户端, 自签统一用 insecure=1 提示, 或者 pin=hex (v2rayN 等)
