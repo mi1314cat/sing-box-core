@@ -1396,6 +1396,22 @@ SB_MUX_PROTOCOLS=(h2mux yamux smux)
 SB_BRUTAL_UP_DEFAULT=100
 SB_BRUTAL_DOWN_DEFAULT=200
 
+# ---- Hysteria2 带宽提示 (Mbps) ----
+# 对齐用户偏好: **上行 60 / 下行 150~200** —— 默认取区间上沿 (60/200)。
+#
+# 这两个字段不是限速: sing-box 的 hysteria2 up_mbps/down_mbps 是给内核的链路
+# 速率提示 (拥塞控制参考值), 写小了会自己压住吞吐, 写大了没有惩罚。
+# 客户端侧字段名是 up_mbps / down_mbps, mihomo 侧是裸数字 up / down
+# (跨内核对照结论, to_mihomo.py 里做转换)。
+#
+# 显式设置的两条路 (都不会被默认值覆盖):
+#   1) 环境变量 SB_HY2_UP_MBPS / SB_HY2_DOWN_MBPS —— 批量/非交互用这个;
+#   2) 交互建节点时按提示填 (回车 = 用默认值)。
+# 分享链接里**不带**带宽参数 (mihomo 的 hy2 链接解析只认 up/down 是另一套),
+# 所以链接下发的节点带宽由**客户端**决定; 需要固定值就改客户端配置。
+SB_HY2_UP_MBPS="${SB_HY2_UP_MBPS:-60}"
+SB_HY2_DOWN_MBPS="${SB_HY2_DOWN_MBPS:-200}"
+
 # ---- TCP Brutal 可用性探测 ----
 #
 # brutal 不是纯用户态特性: sing-box 会 setsockopt(TCP_CONGESTION, "brutal"),

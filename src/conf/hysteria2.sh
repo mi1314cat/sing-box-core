@@ -220,6 +220,25 @@ add_config() {
     fi
     local auth; auth=$(openssl rand -hex 16)
 
+    # ---- 带宽提示 (Mbps): 默认 60 / 200 (用户偏好: 上行 60, 下行 150~200) ----
+    #
+    # 这两个字段**不是限速**, 是给内核的链路速率提示; 内核字段名 up_mbps /
+    # down_mbps (mihomo 那边是裸数字 up / down, 由 to_mihomo.py 转换)。
+    # 值取环境变量 (批量/非交互) 或交互输入, 都只在**显式给出**时才生效 ——
+    # 回车即用默认, 不会覆盖用户已经设好的偏好。
+    local hy2_up="${SB_HY2_UP_MBPS:-60}" hy2_dn="${SB_HY2_DOWN_MBPS:-200}"
+    [[ "$hy2_up" =~ ^[0-9]+$ && "$hy2_up" -gt 0 ]] || hy2_up=60
+    [[ "$hy2_dn" =~ ^[0-9]+$ && "$hy2_dn" -gt 0 ]] || hy2_dn=200
+    if [[ -z "${SB_BATCH:-}" ]]; then
+        local _u _d
+        _u=$(clean_input "$(safe_read "上行 Mbps (仅速率提示, 不是限速)" "$hy2_up")")
+        _d=$(clean_input "$(safe_read "下行 Mbps" "$hy2_dn")")
+        [[ "$_u" =~ ^[0-9]+$ && "$_u" -gt 0 ]] && hy2_up="$_u"
+        [[ "$_d" =~ ^[0-9]+$ && "$_d" -gt 0 ]] && hy2_dn="$_d"
+    else
+        print_info "HY2 带宽: up=${hy2_up} / down=${hy2_dn} Mbps (SB_HY2_UP_MBPS / SB_HY2_DOWN_MBPS 可改)"
+    fi
+
     # 端口跳跃的客户端侧字段: 开了跳跃就要让客户端知道往哪个范围发, 否则
     # 客户端一直打真实端口, 服务端 iptables 的 DNAT 规则形同虚设。
     # sing-box hysteria2 出站用 server_ports (数组, "起:止"), mihomo 用 ports。
@@ -257,8 +276,8 @@ add_config() {
       "listen": "$listen_ip",
       "listen_port": $listen_port,
       "users": [ { "name": "user", "password": "$auth" } ],
-      "up_mbps": 100,
-      "down_mbps": 500,
+      "up_mbps": $hy2_up,
+      "down_mbps": $hy2_dn,
       "obfs": { "type": "salamander", "password": "$mask" },
       "tls": { "enabled": true, "alpn": ["h3"], $cert_paths_line$ech_sep }
     }
@@ -319,8 +338,8 @@ EOF
       "server": "$server_ip",
       "server_port": $listen_port${hop_field},
       "password": "$auth",
-      "up_mbps": 100,
-      "down_mbps": 500,
+      "up_mbps": $hy2_up,
+      "down_mbps": $hy2_dn,
       "obfs": { "type": "salamander", "password": "$mask" },
       "tls": {
         "enabled": true,

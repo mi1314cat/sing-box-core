@@ -275,6 +275,23 @@ SB_BATCH_HOP=31000-31999 SB_BATCH_OBFS=y bash conf/batch.sh
 > 所以受害面是"把 SB 链接喂给 mihomo 订阅"的场景；SB 自己（分享内容是
 > sing-box JSON）与 sing-box/xray 客户端不受影响。
 
+### Hysteria2 的带宽提示（up_mbps / down_mbps）
+
+| 项 | 值 |
+|---|---|
+| 默认 | **上行 60 / 下行 200** Mbps（= 用户偏好 上行 60、下行 150~200 的上沿） |
+| 内核字段名 | sing-box：`up_mbps` / `down_mbps`（服务端 inbound 与客户端 outbound 都写） |
+| mihomo 字段名 | 裸 `up` / `down`（`to_mihomo.py` 转换时写成 `"200 Mbps"`；**两种写法 mihomo 都收**，实测 `up: 200` 与 `up: 200 Mbps` 都能连） |
+| 改法（非交互） | `SB_HY2_UP_MBPS=60 SB_HY2_DOWN_MBPS=200 bash conf/batch.sh` |
+| 改法（交互） | 建 hy2 节点时会问"上行/下行 Mbps"，**回车即默认** |
+| 分享链接 | **不带**带宽参数 —— URI 里没有 up/down，谁导入谁自己定；要固定值就改客户端配置 |
+
+这不是限速，是给内核的链路速率提示（拥塞控制参考值）：写小了会自己压住吞吐，
+写大了没有惩罚。**显式给的值不会被默认值覆盖** —— 环境变量与交互输入优先。
+
+> 顺带一句：TCP Brutal（多路复用里的 `brutal`）默认值仍是 100/200，它和 hy2 的
+> `up_mbps/down_mbps` 是两套东西（brutal 是真限速，填高会丢包），这里没有一起改。
+
 ### 设计取舍：为什么是单选而不是逐协议勾选
 
 能不能用 multiplex / CDN 是**内核字段有没有**的问题，不是用户偏好：
