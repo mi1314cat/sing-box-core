@@ -34,7 +34,7 @@ sb_arch() {
 }
 
 # ---- 版本工具 ----
-sb_current_version() { "$SB_BIN" version 2>/dev/null | head -1 | awk '{print $3}'; }
+sb_current_version() { "$SB_BIN" version 2>/dev/null | awk 'NR==1' | awk '{print $3}'; }
 
 sb_latest_version() {
     local v
@@ -47,7 +47,7 @@ sb_latest_version() {
 }
 
 sb_latest_pre() { # 最新（含 pre-release）—— 仅 --pre 用
-    curl -s --max-time 10 "$SB_REPO_API/releases?per_page=15" | jq -r '.[].tag_name' | sed 's/^v//' | head -1
+    curl -s --max-time 10 "$SB_REPO_API/releases?per_page=15" | jq -r '.[].tag_name' | sed 's/^v//' | awk 'NR==1'
 }
 
 core_status() {

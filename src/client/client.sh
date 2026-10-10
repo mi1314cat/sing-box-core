@@ -24,14 +24,64 @@ if [[ -f /etc/sb-client.env ]]; then source /etc/sb-client.env; fi
 # 结果就是本机明明开着代理, 下载却走直连直到超时。
 # 这里主动探测本机常见代理端口, 能用就导出变量, curl 会自动采用。
 # 不覆盖用户显式设置: 已有 http_proxy/https_proxy 时原样交给 curl。
+# ---------- 本机自己的 mixed 端口 ----------
+#
+# 为什么必须读真实值, 而不是只扫那 11 个常用端口:
+#   列表是 7890 7891 7897 10808 10809 8080 8118 1080 1081 20171 33211,
+#   **里面没有 SB 自己的默认端口 2080** —— 于是默认配置下本机代理自己就在跑,
+#   探测却永远扫不到它。表现是"明明开着代理, 内核/UI 下载还是直连直到超时",
+#   而且没有任何报错, 因为没找到代理时的行为就是静默直连。
+#
+# 用户可以改端口 (客户端设置里能改), 改完就彻底对不上这个列表了。
+# 所以顺序是: 先认本机真实的端口, 再去扫常用端口当兜底。
+#
+# 顺序很要紧: **生成物是事实来源, 环境变量不是。**
+#
+# 踩过的坑: 用户在面板里把端口从 2080 改成 45678, 但 /etc/sb-client.env 里还留着
+# 旧的 PORT_MIXED=2080。按"env 优先"读, 探测就会去戳一个没人听的端口 —— 正好
+# 是这个函数要解决的问题本身。
+#
+# 所以: 先读 conf/00-mixed.json (内核真正在用的), 再退到环境变量, 最后才用默认值。
+sb_own_mixed_port() {
+    local v="" f="$CLIENT_CONF/00-mixed.json"
+    if [[ -r "$f" ]]; then
+        v=$(sed -n 's/.*"listen_port"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$f" 2>/dev/null | head -1)
+    fi
+    [[ "$v" =~ ^[0-9]+$ ]] && { printf '%s' "$v"; return; }
+
+    if [[ -r /etc/sb-client.env ]]; then
+        v=$(sed -n 's/^PORT_MIXED=["]*\([0-9]\+\)["]*$/\1/p' /etc/sb-client.env 2>/dev/null | head -1)
+    fi
+    [[ "$v" =~ ^[0-9]+$ ]] && { printf '%s' "$v"; return; }
+
+    v="${PORT_MIXED:-}"
+    [[ "$v" =~ ^[0-9]+$ ]] && { printf '%s' "$v"; return; }
+
+    printf '2080'
+}
+
+# 候选端口: 本机真实的排在最前, 后面才是常用端口。重复的只留第一次。
+sb_proxy_ports() {
+    local -a out=() p
+    local own; own=$(sb_own_mixed_port)
+    for p in "$own" 7890 7891 7897 10808 10809 8080 8118 1080 1081 20171 33211; do
+        [[ "$p" =~ ^[0-9]+$ ]] || continue
+        local dup=0 q
+        for q in "${out[@]}"; do [[ "$q" == "$p" ]] && { dup=1; break; }; done
+        [[ $dup == 0 ]] && out+=("$p")
+    done
+    printf '%s\n' "${out[@]}"
+}
+
 sb_detect_proxy() {
     if [[ -n "${https_proxy:-}${http_proxy:-}" ]]; then
         SB_PROXY_MODE="环境变量 ($(echo "${https_proxy:-$http_proxy}"))"
         return 0
     fi
     local host port code
+    local -a PORTS; mapfile -t PORTS < <(sb_proxy_ports)
     for host in 127.0.0.1 localhost; do
-        for port in 7890 7891 7897 10808 10809 8080 8118 1080 1081 20171 33211; do
+        for port in "${PORTS[@]}"; do
             # 探测必须带超时。裸的 (exec 3<>/dev/tcp/...) 在端口被防火墙
             # DROP (而不是 REJECT) 时不会立刻失败, 而是挂满整个 TCP 超时
             # (Linux 默认约 130 秒)。11 个端口 x 2 个 host 串下来就是几分钟,
@@ -71,8 +121,9 @@ sb_proxy_scan() { # 探测本机可用 HTTP 代理, 结果放进 SB_PROXY_CANDS
     SB_PROXY_CANDS=()
     [[ -n "${https_proxy:-}${http_proxy:-}" ]] && return 0
     local host port code
+    local -a PORTS; mapfile -t PORTS < <(sb_proxy_ports)
     for host in 127.0.0.1 localhost; do
-        for port in 7890 7891 7897 10808 10809 8080 8118 1080 1081 20171 33211; do
+        for port in "${PORTS[@]}"; do
             # 探测必须带超时。裸的 (exec 3<>/dev/tcp/...) 在端口被防火墙
             # DROP (而不是 REJECT) 时不会立刻失败, 而是挂满整个 TCP 超时
             # (Linux 默认约 130 秒)。11 个端口 x 2 个 host 串下来就是几分钟,
@@ -121,13 +172,16 @@ proxy_settings_menu() {
         ui_title "下载通道"
         ui_kv_ascii "当前" "$desc"
         echo
+        ui_kv_ascii "本机 mixed" "$(sb_own_mixed_port)"
+        echo
         ui_menu 1 "自动 (环境变量 / 探测本机代理)"
         ui_menu 2 "强制直连 (不走任何代理)"
         ui_menu 3 "固定使用某个代理地址"
         ui_menu 4 "扫描本机可用代理端口"
+        ui_menu 5 "手动指定本机代理端口"
         ui_menu 0 "返回"
         ui_rule
-        read -r -p "请输入选项 [0-4]: " c || return 0
+        read -r -p "请输入选项 [0-5]: " c || return 0
         case "$c" in
             1) sb_proxy_set_mode auto;   print_ok "已设为: 自动" ;;
             2) sb_proxy_set_mode off;    print_ok "已设为: 强制直连" ;;
@@ -150,6 +204,25 @@ proxy_settings_menu() {
                         printf "  %d) %s\n" "$((i+1))" "${SB_PROXY_CANDS[$i]}" >&2
                     done
                 fi ;;
+            5)
+                # 只输端口, 不输地址 —— 监听地址一律本机。
+                # 探测列表里的 11 个常用端口是死的, 用户把 mixed 改成别的端口
+                # 之后那些就全扫不到了, 所以这里给一个自己填的口子。
+                local own; own=$(sb_own_mixed_port)
+                printf '  本机 mixed 端口当前是 %s (来自 conf/00-mixed.json)' "$own" >&2
+                printf '  %s\n' "回车=用它, 或输入别的端口" >&2
+                read -r -p "  请输入端口: " a || return 0
+                a="${a// /}"
+                if [[ -z "$a" ]]; then a="$own"; print_msg "沿用 $a"; fi
+                if [[ ! "$a" =~ ^[0-9]+$ ]] || (( a < 1 || a > 65535 )); then
+                    print_err "端口必须是 1-65535 的数字"; continue
+                fi
+                # 先确认真的有东西在听, 否则设了也是白设
+                if ! timeout 2 bash -c "exec 3<>/dev/tcp/127.0.0.1/$a" 2>/dev/null; then
+                    print_warn "127.0.0.1:$a 没人监听 —— 仍按你的设置保存, 但下载会走不通"
+                fi
+                sb_proxy_set_mode "http://127.0.0.1:$a"
+                print_ok "已设为: http://127.0.0.1:$a" ;;
             0) return ;;
             *) print_err "无效选项 $c" ;;
         esac
