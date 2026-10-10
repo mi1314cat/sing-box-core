@@ -29,6 +29,10 @@
     "key: value" 的极简 YAML 解析器 —— 用户贴的片段本来就是平铺的,
     足够用。
   - 不联网, 不写文件。识别不了的直接跳过并计数, 绝不猜。
+  - **不静默降级**（2026-10 修）: 传输写不出来（xhttp / mkcp / httpupgrade / 未知名）
+    就明确拒绝并说明, 绝不"不认识就当成 tcp"; 只要写出 tls 段就一定带
+    enabled: true; ECH 写不成内核要的 PEM 就**声明不可用**, 绝不塞个内核会 FATAL
+    的值。能力判定仍然只由 compat 出（见 _keep 的两道闸门）。
 """
 import base64
 import json
@@ -141,14 +145,99 @@ def _as_list(v):
 
 
 # --------------------------------------------------------------------------
+# 转换器的"表达能力"（**不是**内核能力 —— 内核能力只由 compat 出结论）
+# --------------------------------------------------------------------------
+# 显式 tcp/raw/空: 不写 transport 段就是内核默认 tcp, 语义完全一致。
+_TCP_NET = ("", "tcp", "raw", "none")
+# to_sb 只会**忠实写出**这几个传输（ws / grpc / h2-http, 字段映射在本文件里写全、
+# 且实测内核接受这种写法）。别的传输一律进闸门: 要么 compat 判内核不可用（xhttp /
+# mkcp）, 要么明确拒绝 —— 绝不再"不认识就当成 tcp"（内核不报错, 节点却永远连不上;
+# 本仓库的老毛病, 见 _keep 的两道闸门）。
+# 内部标记: 只在本文件里流转, 进配置前一定被 _keep 取走（main() 另有一道兜底剥离）。
+_TR_KEY = "_sb_unwritable_transport"     # 链接里的传输 to_sb 写不出 -> 传输名
+_ECH_KEY = "_sb_ech_not_carried"         # 链接里有 ECH, 但写不成 sing-box 的 PEM 形态
+
+_ECH_PEM_BEGIN = "-----BEGIN ECH CONFIGS-----"
+
+
+def _is_ech_pem(v):
+    """sing-box 的 tls.ech.config 只认 PEM（-----BEGIN ECH CONFIGS-----）。
+
+    实测（sing-box 1.14.2 linux/amd64）: 喂 base64 →
+    `FATAL initialize outbound[0]: invalid ECH configs pem`, **整份配置作废**。
+    所以这里只放行 PEM 原文; 别的形态一律"不写 + 标不可用", 绝不猜。
+    """
+    return isinstance(v, str) and _ECH_PEM_BEGIN in v
+
+
+def _raw_query_param(q, key):
+    """从**原始** query 串里取参数值。
+
+    不能用 parse_qs/parse_qsl: 它们按 form-encoding 把 '+' 解成空格, 而
+    `ech=` / base64 这类取值里 '+' 是字面量（compat 的 uri.py 出于同一原因自己
+    写了解析器）。这里只为 ECH 取值服务, 语义与 compat 对齐。
+    """
+    for chunk in (q or "").split("&"):
+        if not chunk:
+            continue
+        k, _, v = chunk.partition("=")
+        if up.unquote(k) == key:
+            return up.unquote(v)
+    return ""
+
+
+def _ech_ref(kind, query=None, raw=None):
+    """给报告与判定用的"这条链接的 ECH 长什么样"。"""
+    return {"kind": kind, "query": query or "", "raw": (raw or "")[:80]}
+
+
+def _ech_loss_note(ref):
+    """ECH 没写进配置时的**显式**声明（绝不静默丢能力）。"""
+    ref = ref or {}
+    q = ref.get("query") or ""
+    raw = ref.get("raw") or ""
+    what = ("分享里的 ECH（%s%s）写不成 sing-box 的 tls.ech.config —— 内核只认 PEM"
+            "（-----BEGIN ECH CONFIGS-----）, 给的是 %s; 转换器不联网、不能现场取 "
+            "ECHConfig, 也绝不写 base64（实测喂 base64 = FATAL invalid ECH configs "
+            "pem, 整份配置作废）。**这条节点的 ECH 没有启用**; 若它必须靠 ECH 才能"
+            "连通, 表现就是连不上。"
+            % (ref.get("kind") or "ECH", ("/" + q) if q else "",
+               raw if raw else "运行时查 DNS(HTTPS/SVCB) 的形态"))
+    return {"feature": "standard:ech", "source": "to_sb", "what": what}
+
+
+def _unwritable_reason(name, r):
+    """转换器写不出这个传输 → 明确拒绝（并说清这不是"内核不支持"的判定）。"""
+    v = (r or {}).get("verdict") or "（compat 未接入）"
+    msgs = (r or {}).get("message") or []
+    extra = ("; compat: " + msgs[0][:160]) if msgs else ""
+    return ("本转换器不会写 transport '%s'（compat 判定=%s%s）—— 明确拒绝, 不静默"
+            "降级成 tcp（内核侧不会报错, 只会永远连不上）" % (name, v, extra))
+
+
+# --------------------------------------------------------------------------
 # 传输层
 # --------------------------------------------------------------------------
 def transport_from_clash(d):
-    """mihomo 的 network/grpc-opts/ws-opts -> sing-box transport 对象。"""
+    """mihomo 的 network/ws-opts/grpc-opts/h2-opts -> (transport, 写不出的传输名)。
+
+    ★ 三种返回, 语义必须分清（历史缺陷就是在这里"不认识 → 当成 tcp"）:
+        (dict, None)  能忠实写出
+        (None, None)  显式 tcp/raw/空 —— 内核默认就是 tcp, 语义一致, 不写 transport 段
+        (None, name)  写不出（xhttp / mkcp / httpupgrade / 任何没见过的名字）
+    """
     net = (d.get("network") or "").strip().lower()
+    if net in _TCP_NET:
+        return None, None
     t = {}
     if net in ("ws", "websocket"):
         ws = d.get("ws-opts") or {}
+        # mihomo **没有** network: httpupgrade —— 它把 httpupgrade 写成
+        # `network: ws` + `ws-opts.v2ray-http-upgrade: true`（本仓库 to_mihomo.py 也这么发）。
+        # 只按 ws 读 = 把 httpupgrade 静默换成 ws, 同样是"看着对、连不上"。
+        if _to_bool(ws.get("v2ray-http-upgrade")) or _to_bool(d.get("v2ray-http-upgrade")) \
+                or _to_bool(d.get("http-upgrade")):
+            return None, "httpupgrade"
         path = ws.get("path") or d.get("ws-path") or "/"
         hdrs = (ws.get("headers") or {})
         host = hdrs.get("Host") or d.get("ws-headers", {}).get("Host")
@@ -171,8 +260,8 @@ def transport_from_clash(d):
         if host:
             t["host"] = [host]
     else:
-        return None
-    return t
+        return None, net
+    return t, None
 
 
 # --------------------------------------------------------------------------
@@ -201,6 +290,13 @@ def clash_to_outbound(d, prefix=""):
     tls_on = _to_bool(d.get("tls")) or ctype in ("trojan", "hysteria2", "hy2", "tuic", "anytls")
     tls = {}
     if tls_on:
+        # ★ 只要写出 tls 段, 就必须显式带 enabled: true。
+        #   sing-box 的 TLS 选项默认关; 缺了它:
+        #     * anytls / tuic / hy2 → 整份配置 FATAL `initialize outbound[0]: TLS required`
+        #       （内核连 check 都过不去, 一条就废掉整批节点）
+        #     * vless / trojan     → tls 段被**无声忽略**, 明文去连, 永远 502/超时
+        #   实测 M 分享 18 个节点真连 0/18, 精确归因就是这一行。
+        tls["enabled"] = True
         if d.get("sni") or d.get("servername"):
             tls["server_name"] = d["servername"] if d.get("servername") else d["sni"]
         elif d.get("server"):
@@ -220,11 +316,28 @@ def clash_to_outbound(d, prefix=""):
             if ro.get("short-id"):
                 r["short_id"] = ro["short-id"]
             tls["reality"] = r
+
+    # ECH（mihomo 的 ech-opts）: 语义是"运行时按域名去查 DNS(HTTPS/SVCB 记录)拿
+    # ECHConfig"。sing-box 的 tls.ech.config 只吃**静态 PEM** —— 转换器不联网, 取不到;
+    # 也绝不把域名/base64 塞进去（内核 FATAL, 整份配置作废）。
+    eo = d.get("ech-opts")
+    if isinstance(eo, dict) and _to_bool(eo.get("enable")):
+        ecfg = eo.get("config") or eo.get("config-path")
+        if tls_on and _is_ech_pem(ecfg):
+            tls["ech"] = {"enabled": True, "config": str(ecfg)}
+        else:
+            ob[_ECH_KEY] = _ech_ref("mihomo ech-opts",
+                                    query=eo.get("query-server-name"))
+
+    if tls:
         ob["tls"] = tls
 
-    tr = transport_from_clash(d)
+    tr, refused_net = transport_from_clash(d)
     if tr:
         ob["transport"] = tr
+    if refused_net:
+        # 写不出的传输: 绝不静默当 tcp, 交给 _keep 的转换闸门明确处理。
+        ob[_TR_KEY] = refused_net
 
     # 各协议自己的必填字段
     if sbtype in ("shadowsocks", "shadowsocksr"):
@@ -317,28 +430,32 @@ def _vmess_uri(rest, frag, prefix):
         return None
     tls = {}
     tlsmode = str(d.get("tls", "")).lower()
-    if tlsmode in ("tls", "true", "1"):
+    if tlsmode in ("tls", "true", "1", "reality"):
+        # ★ tls 段写出来就必须带 enabled（理由同 clash 侧: 缺了它, vless/trojan 会被
+        #   内核无声当明文连, 永远连不上）。
         tls["enabled"] = True
         tls["server_name"] = d.get("sni") or d.get("host") or ob["server"]
-    elif tlsmode == "reality":
-        # vmess/trojan + REALITY 的链接: tls 段只"借"目标站点的握手, 真正的
-        # 身份校验在 pbk/sid 上。原来这里只认 tls/true/1, 于是 REALITY 链接
-        # 被当**明文** vmess 导入 —— 内核不报错, 节点却永远连不通。
-        tls["enabled"] = True
-        tls["server_name"] = d.get("sni") or d.get("host") or ob["server"]
-        r = {"enabled": True}
-        if d.get("pbk"):
-            r["public_key"] = d["pbk"]
-        if d.get("sid"):
-            r["short_id"] = d["sid"]
-        tls["reality"] = r
-    if d.get("alpn"):
-        tls["alpn"] = str(d["alpn"]).split(",")
-    if d.get("scy") == "chacha20-poly1305":
-        pass
-    fp = d.get("fp")
-    if fp and fp not in ("", "random"):
-        tls["utls"] = {"enabled": True, "fingerprint": fp}
+        if tlsmode == "reality":
+            # vmess/trojan + REALITY 的链接: tls 段只"借"目标站点的握手, 真正的
+            # 身份校验在 pbk/sid 上。原来这里只认 tls/true/1, 于是 REALITY 链接
+            # 被当**明文** vmess 导入 —— 内核不报错, 节点却永远连不通。
+            r = {"enabled": True}
+            if d.get("pbk"):
+                r["public_key"] = d["pbk"]
+            if d.get("sid"):
+                r["short_id"] = d["sid"]
+            tls["reality"] = r
+        if d.get("alpn"):
+            tls["alpn"] = str(d["alpn"]).split(",")
+        fp = d.get("fp")
+        if fp and fp not in ("", "random"):
+            tls["utls"] = {"enabled": True, "fingerprint": fp}
+    ech = d.get("ech")
+    if ech:
+        if tls and _is_ech_pem(ech):
+            tls["ech"] = {"enabled": True, "config": str(ech)}
+        else:
+            ob[_ECH_KEY] = _ech_ref("vmess JSON ech", raw=str(ech))
     if tls:
         ob["tls"] = tls
     net = (d.get("net") or "tcp").lower()
@@ -350,6 +467,8 @@ def _vmess_uri(rest, frag, prefix):
     elif net == "h2":
         ob["transport"] = {"type": "http", "path": d.get("path") or "/",
                            "host": [d.get("host") or ob["server"]]}
+    elif net not in _TCP_NET:
+        ob[_TR_KEY] = net
     return ob
 
 
@@ -462,6 +581,17 @@ def _std_uri(scheme, rest, frag, prefix):
         tls = {"enabled": True, "server_name": qd.get("sni") or qd.get("peer") or host}
         if qd.get("insecure", "").lower() in ("1", "true"):
             tls["insecure"] = True
+    # ECH: sing-box 只认 PEM。X 侧链接写的是 "域名+DoH"（运行时去查该域名的
+    # HTTPS/SVCB 记录拿 ECHConfig）, mihomo 是 ech-opts（同一种 DNS 形态）。
+    # 转换器不联网 → 取不到; 也绝不把域名/base64 写进 tls.ech.config
+    # （内核 FATAL: invalid ECH configs pem, 整份配置作废）。
+    ech_raw = _raw_query_param(q, "ech") or _raw_query_param(q, "pcs") \
+        or _raw_query_param(q, "vcn")
+    if ech_raw:
+        if tls and _is_ech_pem(ech_raw):
+            tls["ech"] = {"enabled": True, "config": ech_raw}
+        else:
+            ob[_ECH_KEY] = _ech_ref("链接 ech 参数", raw=ech_raw)
     if tls:
         ob["tls"] = tls
 
@@ -480,6 +610,9 @@ def _std_uri(scheme, rest, frag, prefix):
         ob["transport"] = {"type": "http",
                            "path": up.unquote(qd.get("path") or "/"),
                            "host": [qd.get("host") or qd.get("sni") or host]}
+    elif net not in _TCP_NET:
+        # xhttp / mkcp / httpupgrade / 任何没见过的传输: 绝不静默当 tcp。
+        ob[_TR_KEY] = net
     return ob
 
 
@@ -517,20 +650,33 @@ def compat_enabled():
             and os.environ.get("SB_COMPAT_DISABLE", "") != "1")
 
 
-def _compat_gate(rep, uri, ob, tag):
-    """判一个节点 → 记录到 rep["compat"]; 返回结果 dict 或 None（未接入/异常）。"""
+def _compat_gate(rep, uri, ob, tag, declare=None):
+    """判一个节点 → 记录到 rep["compat"]; 返回 (结果 dict, 报告里那条记录)。
+
+    未接入 compat / compat 异常 → (None, None)（自动落回旧路径）。
+
+    declare: 转换器自己产生的"损失声明"（如 ECH 写不成 PEM）。它是**声明**, 不是
+    判定 —— 判定仍然只由 compat 出; 这里只把它挂到同一个节点记录上, 让 client.sh
+    的摘要和报告都能看见（绝不静默丢能力）。
+    """
     mod = _compat_mod() if compat_enabled() else None
     if mod is None:
-        return None
+        return None, None
     try:
         r = mod.judge(uri=uri, outbound=ob, tag=tag or (ob or {}).get("tag"))
     except Exception as e:                                  # noqa: BLE001
         rep.setdefault("compat", {}).setdefault("errors", []).append(
             "%s: %s" % (type(e).__name__, e))
-        return None
+        return None, None
+    declare = [d for d in (declare or [])
+               if d.get("feature") not in
+               {(c or {}).get("feature") for c in (r.get("client_losses") or [])}]
+    for d in declare:
+        r["client_losses"] = list(r.get("client_losses") or []) + [d]
+        r["message"] = list(r.get("message") or []) + [d["what"]]
     slot = rep.setdefault("compat", {})
     slot.setdefault("target", r.get("target"))
-    slot.setdefault("nodes", []).append({
+    rec = {
         "tag": r.get("tag"), "type": (ob or {}).get("type"),
         "verdict": r["verdict"], "verdict_source": r["verdict_source"],
         "ok": r["ok"], "reason_codes": r["reason_codes"], "message": r["message"],
@@ -540,8 +686,9 @@ def _compat_gate(rep, uri, ob, tag):
         "losses": (r.get("compat") or {}).get("losses"),
         "warnings": r.get("warnings"),
         "legacy": r.get("legacy"),
-    })
-    return r
+    }
+    slot.setdefault("nodes", []).append(rec)
+    return r, rec
 
 
 def _compat_reason(r):
@@ -583,11 +730,58 @@ def convert(data, prefix=""):
         rep["reasons"][r] = rep["reasons"].get(r, 0) + 1
 
     def _keep(ob, uri=None, tag=None):
-        """compat 闸门: 说 UNSUPPORTED 就不留（文案由 compat 的 reason_code 生成）。"""
-        r = _compat_gate(rep, uri, ob, tag)
+        """闸门。返回 True = 这条出站可以进配置。
+
+        两道闸门, 顺序固定:
+
+          ① **转换闸门**（本转换器写不写得出 —— 不是内核能力）
+            链接里的传输 / ECH, to_sb 写不出就**明确拒绝**, 绝不静默降级成 tcp、
+             也绝不静默丢 ECH。标记由 uri_to_outbound / clash_to_outbound 挂在
+             出站 dict 上（_TR_KEY / _ECH_KEY）, 这里第一件事就是取走 ——
+             保证内部键绝不会落进配置文件。
+             为什么必须写不出就拒: 静默成 tcp 的出站内核不报错, 只是永远连不上
+             （M 分享的 xhttp 节点就是这样被"导入成功"的）。
+          ② **compat 闸门**（内核能不能用）—— 判定与文案全部出自 compat;
+             它说 UNSUPPORTED 才丢节点。
+
+        ①的判定也要 compat 的结论来兜底/说明: 把链接里**真实的**传输 / ECH
+        写进一份"只为判定"的副本交给 compat（它绝不进配置）。
+        """
+        tr_ref = ob.pop(_TR_KEY, None)
+        ech_ref = ob.pop(_ECH_KEY, None)
+        judge_ob = ob
+        declare = []
+        if (tr_ref or ech_ref) and not uri:
+            # 没有原文链接时（mihomo YAML 片段 / 手贴 JSON）, compat 只能看出站 ——
+            # 那就把"链接里真实的传输 / ECH"写进一份**只为判定**的副本, 让它有的判。
+            # 有原文链接时**不这么做**: 原文才是权威, 而且必须保住 compat 自己那条
+            # "客户端转换环节丢了 X" 的对比（不能让它以为转换器把 X 写出来了）。
+            judge_ob = dict(ob)
+            if tr_ref:
+                judge_ob["transport"] = {"type": tr_ref}
+            if ech_ref:
+                t = dict(judge_ob.get("tls") or {})
+                t["enabled"] = True
+                t["ech"] = {"enabled": True,
+                            "query_server_name": ech_ref.get("query") or ""}
+                judge_ob["tls"] = t
+                declare.append(_ech_loss_note(ech_ref))
+        r, rec = _compat_gate(rep, uri, judge_ob, tag, declare=declare)
         if r is not None and not r["ok"]:
             _note(_compat_reason(r))
             return False
+        if tr_ref:
+            why = _unwritable_reason(tr_ref, r)
+            _note(why)
+            if rec is not None:
+                # 报告必须与最终结果一致: compat 没判死, 是**转换闸门**拒的 ——
+                # 记录成"跳过 + 原因", 否则摘要里会显示成"留着但有损失"。
+                rec["ok"] = False
+                rec["dropped_by"] = "to_sb.transport"
+                rec["message"] = list(rec.get("message") or []) + [why]
+            return False
+        if declare:
+            rep.setdefault("conversion_losses", []).extend(declare)
         return True
 
     text = data.decode("utf-8", "replace") if isinstance(data, bytes) else data
@@ -720,10 +914,17 @@ def main():
         print("读不到 %s: %s" % (path, e), file=sys.stderr)
         return 1
     obs, rep = convert(data, prefix)
+    # 兜底: 内部标记（_sb_*）绝不会进配置 —— 内核 DisallowUnknownFields/解码是严格的,
+    # 一个内部键就能让整份配置作废。_keep 已经取走过它们, 这里再兜一道。
+    obs = [{k: v for k, v in o.items() if not str(k).startswith("_sb_")} for o in obs]
     json.dump({"outbounds": obs}, sys.stdout, ensure_ascii=False, indent=1)
     sys.stderr.write("[to_sb] 格式=%s 共=%d 成功=%d 跳过=%d %s\n" % (
         rep.get("format"), rep["total"], rep["ok"], rep["skip"],
         ("跳过原因=" + json.dumps(rep["reasons"], ensure_ascii=False)) if rep["reasons"] else ""))
+    if rep.get("conversion_losses"):
+        sys.stderr.write("[to_sb] 转换损失 %d 条（能力没搬过去, 已保留节点并显式声明）: %s\n"
+                         % (len(rep["conversion_losses"]),
+                            "；".join(d["what"][:90] for d in rep["conversion_losses"][:3])))
     # compat 全量结果（losses / unknowns / extensions / raw_uri 都在里面）落盘一份,
     # 给 client.sh 打印与事后核对用 —— 节点文件里**绝不能**塞这些键, 内核会拒绝。
     if report:

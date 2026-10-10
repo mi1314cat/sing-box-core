@@ -307,13 +307,17 @@ EOF
 python3 "$CLIENT/to_sb.py" "$TMP/sub.txt" --prefix gate --compat-report "$TMP/rep.json" \
     >"$TMP/out.json" 2>"$TMP/err.txt"
 TAGS="$(python3 -c 'import json;print(",".join(o["tag"] for o in json.load(open("'"$TMP"'/out.json"))["outbounds"]))' 2>/dev/null)"
-if [[ "$TAGS" == "gate-wsenone,gate-hu" ]]; then ok "xhttp/mkcp 被拦下; ws(encryption=none)/httpupgrade 保留"
+# xhttp / mkcp: compat 判 KERNEL_NEVER_SUPPORTED（内核从来没有这两种出站）。
+# httpupgrade: 内核支持（compat 判 SUPPORTED）, 但**本转换器不会写它** —— 现在
+# 明确拒绝 + 说明, 不再像以前那样静默当成 tcp（那种节点内核不报错、只会永远连不上）。
+if [[ "$TAGS" == "gate-wsenone" ]]; then ok "xhttp/mkcp 被 compat 拦下; httpupgrade 明确拒绝（不静默 tcp）; ws(encryption=none) 保留"
 else bad "转换结果不对: tags=$TAGS"; fi
 if grep -q "KERNEL_NEVER_SUPPORTED" "$TMP/err.txt"; then ok "跳过原因带 reason_code"
 else bad "跳过原因没有 reason_code"; fi
-python3 - "$TMP/rep.json" <<'PY' || bad "compat 报告字段不全"
+python3 - "$TMP/rep.json" "$TMP/out.json" <<'PY' || bad "compat 报告字段不全"
 import json, sys
 d = json.load(open(sys.argv[1], encoding="utf-8"))
+out = json.load(open(sys.argv[2], encoding="utf-8"))
 c = d["compat"]
 assert c["target"]["version"], "target.version 空"
 assert len(c["nodes"]) == 4, len(c["nodes"])
@@ -321,11 +325,229 @@ assert any(n["tag"].endswith("wsenone") and n["ok"] for n in c["nodes"]), "encry
 n = [x for x in c["nodes"] if x["tag"].endswith("xhttp")][0]
 assert n["ok"] is False and n["raw_uri"], n
 assert n["message"], "没有可读文案"
+assert "KERNEL_NEVER_SUPPORTED" in (n["reason_codes"] or []), n["reason_codes"]
 hu = [x for x in c["nodes"] if x["tag"].endswith("hu")][0]
 assert hu["client_losses"], "httpupgrade 的转换损失丢了"
+# ★ 不许静默 tcp: httpupgrade 这条被拒之后, 理由必须点名传输, 且不许出现在出站里
+assert hu["ok"] is False, "httpupgrade 被静默降级成 tcp 了"
+assert all("httpupgrade" in m for m in hu["message"]), hu["message"]
+assert not any("hu" == o["tag"].split("-")[-1] for o in out["outbounds"]), out["outbounds"]
 assert hu["extensions"] is not None and hu["unknowns"] is not None
 print("    \033[32m✓\033[0m 报告含 target/raw_uri/losses/unknowns/extensions/client_losses")
 PY
+
+# --------------------------------- 6b 三条缺口回归（M→SB 那格的三条根因, 逐条钉死）
+title "6b · 三条缺口回归（tls.enabled / 不许静默 tcp / ECH）"
+cat > "$TMP/m.yaml" <<'EOF'
+proxies:
+- name: m-anytls
+  type: anytls
+  server: 1.2.3.4
+  port: 443
+  password: pw
+  sni: a.example.com
+  alpn: h2,http/1.1
+  client-fingerprint: chrome
+- name: m-hy2
+  type: hysteria2
+  server: 1.2.3.4
+  port: 8443
+  password: pw
+  sni: a.example.com
+- name: m-tuic
+  type: tuic
+  server: 1.2.3.4
+  port: 8443
+  uuid: 11111111-1111-1111-1111-111111111111
+  password: pw
+  sni: a.example.com
+- name: m-trojan-tls
+  type: trojan
+  server: 1.2.3.4
+  port: 443
+  password: pw
+  sni: a.example.com
+- name: m-vless-reality
+  type: vless
+  server: 1.2.3.4
+  port: 443
+  uuid: 11111111-1111-1111-1111-111111111111
+  network: tcp
+  tls: true
+  servername: www.microsoft.com
+  client-fingerprint: chrome
+- name: m-vless-xhttp
+  type: vless
+  server: 1.2.3.4
+  port: 443
+  uuid: 11111111-1111-1111-1111-111111111111
+  network: xhttp
+  tls: true
+  servername: a.example.com
+- name: m-httpupgrade-as-ws
+  type: vless
+  server: 1.2.3.4
+  port: 443
+  uuid: 11111111-1111-1111-1111-111111111111
+  network: ws
+  tls: true
+  servername: a.example.com
+  v2ray-http-upgrade: true
+EOF
+# ECH 的 mihomo 形态是嵌套的 ech-opts; PyYAML 缺失时 to_sb 用极简解析器（不支持嵌套）,
+# 那时不加这段, 由下面的 URI 用例覆盖 ECH。
+HAVE_YAML=0
+python3 -c 'import yaml' 2>/dev/null && HAVE_YAML=1
+if [[ "$HAVE_YAML" == 1 ]]; then
+cat >> "$TMP/m.yaml" <<'EOF'
+- name: m-trojan-ech
+  type: trojan
+  server: 1.2.3.4
+  port: 443
+  password: pw
+  sni: a.example.com
+  tls: true
+  ech-opts:
+    enable: true
+    query-server-name: hxicc.example.com
+EOF
+fi
+python3 "$CLIENT/to_sb.py" "$TMP/m.yaml" --prefix gap --compat-report "$TMP/m.rep.json" \
+    >"$TMP/m.out.json" 2>"$TMP/m.err.txt"
+# ECH 的 URI 形态（X 侧就是这么发的: ech=域名+DoH）—— 不依赖 PyYAML, 永远跑
+cat > "$TMP/ech.txt" <<'EOF'
+vless://11111111-1111-1111-1111-111111111111@1.2.3.4:443?security=tls&type=ws&sni=a.com&path=%2Fws&ech=cloudflare-ech.com%2Bhttps%3A%2F%2Fdns.alidns.com%2Fdns-query#echws
+EOF
+if python3 - "$TMP/m.out.json" "$TMP/m.rep.json" "$BIN" <<'PY'
+import json, os, subprocess, sys
+out = json.load(open(sys.argv[1], encoding="utf-8"))
+rep = json.load(open(sys.argv[2], encoding="utf-8"))
+BIN = sys.argv[3]
+obs = out["outbounds"]
+fails = []
+# 只要写出 tls 段就必须有 "enabled": true。缺了它:
+#   * anytls / tuic / hy2 → 整份配置 FATAL `initialize outbound[0]: TLS required`
+#   * vless / trojan     → tls 段被内核**无声忽略**, 明文去连, 永远连不上
+# M 分享 18 个节点真连 0/18 的根因就是它（同一批节点在 mihomo 侧 14/19 可用）。
+noen = [o.get("tag") for o in obs
+        if isinstance(o.get("tls"), dict) and o["tls"].get("enabled") is not True]
+if noen:
+    fails.append("有 tls 段缺 enabled:true: %s" % noen)
+n_tls = sum(1 for o in obs if isinstance(o.get("tls"), dict))
+if n_tls < 4:
+    fails.append("夹具只产出 %d 个 tls 段（夹具或转换器坏了）" % n_tls)
+if any(str(k).startswith("_sb_") for o in obs for k in o):
+    fails.append("内部标记 _sb_* 漏进了出站配置")
+# 真内核必须接受整份产出（缺 enabled 的老产物在这一步是 rc=1）
+cfg = os.path.join(os.path.dirname(os.path.abspath(sys.argv[1])), "m.all.json")
+json.dump({"log": {"level": "warn"},
+           "outbounds": obs + [{"type": "direct", "tag": "direct"}]},
+          open(cfg, "w", encoding="utf-8"), ensure_ascii=False)
+if BIN and os.access(BIN, os.X_OK):
+    p = subprocess.run([BIN, "check", "-c", cfg], capture_output=True, text=True)
+    if p.returncode != 0:
+        fails.append("内核 check 不过（%s）: %s" % (BIN, (p.stderr or "").strip()[:200]))
+if fails:
+    for f in fails:
+        print("    \033[31m✗ %s\033[0m" % f)
+    raise SystemExit(1)
+print("%d 个 tls 段全部带 enabled:true%s" % (
+    n_tls, "；整份产出被真内核 check 接受" if BIN and os.access(BIN, os.X_OK) else ""))
+PY
+then ok "缺口① 产出的 tls 段一律带 enabled: true"
+else bad "缺口① 产出缺 tls.enabled:true"
+fi
+
+if python3 - "$TMP/m.out.json" "$TMP/m.rep.json" <<'PY'
+import json, sys
+out = json.load(open(sys.argv[1], encoding="utf-8"))
+rep = json.load(open(sys.argv[2], encoding="utf-8"))
+tags = [o.get("tag") for o in out["outbounds"]]
+nodes = (rep.get("compat") or {}).get("nodes") or []
+fails = []
+# 不许静默 tcp: xhttp 节点不许出现在产出里, 且拒绝理由必须点名传输 + 带 compat 的
+# reason_code（sing-box 内核从来没有 xhttp/splithttp 出站; 硬造 transport 会让整份
+# 配置 FATAL `unknown transport type: xhttp`, 静默成 tcp 则节点永远连不上）。
+if "gap-m-vless-xhttp" in tags:
+    fails.append("xhttp 节点被静默降级成 tcp 导入了")
+xn = [n for n in nodes if str(n.get("tag", "")).endswith("xhttp")]
+if not xn or xn[0].get("ok"):
+    fails.append("xhttp 没有被明确拒绝（报告里没有这条记录）")
+else:
+    if "KERNEL_NEVER_SUPPORTED" not in (xn[0].get("reason_codes") or []):
+        fails.append("拒绝理由没有 compat 的 reason_code: %s" % xn[0].get("reason_codes"))
+    if not any("xhttp" in m for m in (xn[0].get("message") or [])):
+        fails.append("文案没点名 xhttp: %s" % xn[0].get("message"))
+# mihomo 把 httpupgrade 写成 network: ws + ws-opts.v2ray-http-upgrade: true。
+# 只按 ws 读 = 把 httpupgrade 静默换成 ws（同样是"看着对、连不上"）—— 必须拒绝。
+if "gap-m-httpupgrade-as-ws" in tags:
+    fails.append("mihomo 的 httpupgrade(network:ws + v2ray-http-upgrade) 被静默当成 ws 导入了")
+hu = [n for n in nodes if str(n.get("tag", "")).endswith("httpupgrade-as-ws")]
+if not hu or hu[0].get("ok"):
+    fails.append("mihomo 的 httpupgrade 没有被明确拒绝（报告里没有这条记录）")
+elif not any("httpupgrade" in m for m in (hu[0].get("message") or [])):
+    fails.append("httpupgrade 的文案没点名传输: %s" % hu[0].get("message"))
+if fails:
+    for f in fails:
+        print("    \033[31m✗ %s\033[0m" % f)
+    raise SystemExit(1)
+print("xhttp 被明确拒绝（compat: %s）, 没有静默 tcp" % ",".join(xn[0]["reason_codes"]))
+PY
+then ok "缺口② xhttp 明确拒绝, 不静默降级成 tcp"
+else bad "缺口② xhttp 被静默降级成 tcp"
+fi
+
+if python3 - "$TMP/m.out.json" "$TMP/m.rep.json" "$TMP/ech.txt" "$HAVE_YAML" "$CLIENT/to_sb.py" <<'PY'
+import json, subprocess, sys
+out = json.load(open(sys.argv[1], encoding="utf-8"))
+rep = json.load(open(sys.argv[2], encoding="utf-8"))
+ECH_URI_FILE, have_yaml, TO_SB = sys.argv[3], sys.argv[4] == "1", sys.argv[5]
+obs = out["outbounds"]
+tags = [o.get("tag") for o in obs]
+nodes = (rep.get("compat") or {}).get("nodes") or []
+fails = []
+# sing-box 的 tls.ech.config 只认 PEM（-----BEGIN ECH CONFIGS-----）。实测喂 base64 →
+# `FATAL initialize outbound[0]: invalid ECH configs pem`（整份配置作废）。链接/mihomo
+# 给的是"运行时查 DNS"的形态, 转换器不联网取不到 → 一律**不写**, 但必须显式声明。
+for o in obs:
+    if (o.get("tls") or {}).get("ech"):
+        fails.append("往 tls.ech 里写了值（内核只认 PEM）: %s" % o.get("tag"))
+if have_yaml:      # mihomo 的 ech-opts 是嵌套结构, 极简 YAML 解析器不支持
+    if "gap-m-trojan-ech" not in tags:
+        fails.append("带 ech-opts 的节点被丢了（ECH ≠ 节点不可用）")
+    en = [n for n in nodes if str(n.get("tag", "")).endswith("ech")]
+    if not en:
+        fails.append("带 ech-opts 的节点没有报告记录")
+    elif not any((c or {}).get("feature") == "standard:ech"
+                 for c in (en[0].get("client_losses") or [])):
+        fails.append("ECH 被静默丢了（没有 standard:ech 的转换损失声明）")
+# URI 形态（X 侧就是这么发的: ech=域名+DoH）—— 不依赖 PyYAML, 永远跑
+p = subprocess.run([sys.executable, TO_SB, ECH_URI_FILE, "--prefix", "gap",
+                    "--compat-report", ECH_URI_FILE + ".rep.json"],
+                   capture_output=True, text=True)
+if p.returncode != 0:
+    fails.append("ECH 链接转换失败 rc=%s %s" % (p.returncode, p.stderr[-200:]))
+else:
+    eo = json.loads(p.stdout)["outbounds"]
+    if not eo:
+        fails.append("ECH 链接被整条丢了")
+    elif (eo[0].get("tls") or {}).get("ech"):
+        fails.append("ECH 链接写了 tls.ech（内核只认 PEM）")
+    else:
+        erep = json.load(open(ECH_URI_FILE + ".rep.json", encoding="utf-8"))
+        en = ((erep.get("compat") or {}).get("nodes") or [{}])[0]
+        if not any((c or {}).get("feature") == "standard:ech"
+                   for c in (en.get("client_losses") or [])):
+            fails.append("ECH 链接的 ECH 被静默丢了（报告里没有 standard:ech 声明）")
+if fails:
+    for f in fails:
+        print("    \033[31m✗ %s\033[0m" % f)
+    raise SystemExit(1)
+print("ECH 一律不写进配置, 并在报告里声明（standard:ech 转换损失）")
+PY
+then ok "缺口③ ECH 不写非 PEM 值, 且显式声明不可用"
+else bad "缺口③ ECH 被静默丢弃"
+fi
 
 # ---------------------------------------------------------- 7 单节点 JSON 闸门
 title "7 · 单节点 sing-box JSON 闸门（filter-json）"
