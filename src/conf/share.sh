@@ -29,6 +29,14 @@ touch "$SHARE_BASE/.share.lock"
 # ==============================================================
 SHARE_CLIENT="${SHARE_CLIENT:-$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/share_client.py}"
 
+# ---------------------------------------------------------------- 三家互通
+# 声明（我是哪个内核的哪个发行版、我提供哪些格式、每种格式从哪取）与
+# "URI 装不下什么"的标注。设计: proxy-node-compat/docs/three-way-interop.md
+_SB_CONF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+SB_INTEROP_PY="${SB_INTEROP_PY:-$_SB_CONF_DIR/interop.py}"
+SB_URI_EXPRESS_PY="${SB_URI_EXPRESS_PY:-$_SB_CONF_DIR/uri_express.py}"
+SB_LINK_GUARD_PY="${SB_LINK_GUARD_PY:-$_SB_CONF_DIR/link_guard.py}"
+
 # 公共服务的实际端口 —— 它可能因端口回避而不是 9443, 绝不能写死
 sb_share_port() {
     local p=""
@@ -115,9 +123,234 @@ ask_addr_family_now() {
 
 share_url_for() {   # 入参改成 token (存储已不在本地, 不再接受文件路径)
     local tok="${1:-}" host
-    host=$(sb_addr_current)
+    # SB_SHARE_HOST: 对外地址覆盖（用域名下发 / 多网卡机器 / 验证台）。
+    # 默认仍按"产物地址族"自动选本机地址 —— 覆盖只影响下发的地址, 不改配置。
+    host="${SB_SHARE_HOST:-}"
+    [[ -n "$host" ]] || host=$(sb_addr_current)
     [[ -z "$host" ]] && host=$(default_server_ip)
     echo "http://$(sb_url_host "$host"):$(sb_share_port)/share/$tok"
+}
+
+
+# ==============================================================
+# 三家互通 · 内核声明 + 两条产品
+#
+# 用户拍板的方案（原话）: "服务端这边加一个自己是什么内核的。如果客户端一看是
+# 自己的内核, 那就直接拉取。如果不是, 就用普通话。"
+#
+#   · 普通话（主产品）= **URI 列表** —— 谁都能读（xbd / mihomo / 第三方面板）。
+#   · 原生（附带产品）= **sing-box JSON** —— 只有同内核同发行版的客户端读,
+#     它没有 URI 那层表达力损失。
+#   · 声明写在**服务端自己生成的订阅地址**的查询串上, 客户端读一个地址就能
+#     单方面决定拉哪一份（零往返、不猜 User-Agent、不改已发出的载荷格式）。
+#
+# 为什么声明能放查询串: 公共分享服务的路由先剥查询串再分发
+#   (`share_service.py:768` `path = self.path.split("?", 1)[0]`) → 带声明的
+#   地址与裸地址返回**逐字节相同**的内容（门禁有断言）。响应头与独立 /meta
+#   端点两条路都被冻结的公共服务堵死了。
+# ==============================================================
+
+# 节点名里的服务器前缀。**唯一实现**: gen_full_profile 通过参数拿它, 不再
+# 自己算一遍 —— 两处各算一次, 迟早有一天聚合产物的 tag 与 URI 链接文件对不上,
+# 而表现是"分享里少一个节点"这种静默错误。
+sb_server_slug() {
+    local s h
+    s=$(sb_server_name 2>/dev/null)
+    s=$(printf '%s' "$s" | sed 's/[^A-Za-z0-9._-]\+/-/g; s/^-*//; s/-*$//' | cut -c1-32)
+    [[ -n "$s" ]] && { printf '%s' "$s"; return 0; }
+    h=$(hostname -s 2>/dev/null | sed 's/[^A-Za-z0-9._-]\+/-/g; s/^-*//; s/-*$//' | cut -c1-32)
+    printf '%s' "${h:-server}"
+}
+
+# 本机内核事实（真探测）。探测不到发行版 → **不产出原生**: 不猜一个默认值。
+sb_share_self_facts() { python3 "$SB_INTEROP_PY" self 2>/dev/null; }
+sb_share_fact() { # <facts json> <字段名>
+    printf '%s' "$1" | python3 -c 'import sys, json
+try: print((json.load(sys.stdin) or {}).get(sys.argv[1], ""))
+except Exception: print("")' "$2" 2>/dev/null
+}
+
+# 把声明并进订阅地址 —— 声明只有 interop.py 一处实现（客户端读的是同一份定义,
+# 门禁比对两份拷贝的 sha256）。
+sb_share_declare_url() { # <主地址> <发行版> <版本> [原生地址]
+    local url="$1" dist="$2" ver="$3" native="${4:-}"
+    local -a extra=()
+    [[ -n "$native" && -n "$dist" ]] && extra=(--url-"$dist" "$native")
+    python3 "$SB_INTEROP_PY" declare --kernel sing-box --distribution "$dist" \
+        --version "$ver" --url "$url" "${extra[@]}" 2>/dev/null
+}
+
+# 一条分享 → 该给用户的**带声明地址**。
+# 地址**不落盘**, 每次现算: 地址族切换 (sb_switch_addr_family) 会改对外 host,
+# 落盘的声明会留着旧 host 而面板显示一切正常 —— 那就是一条死链。
+sb_share_declared_url() { # <主 token> [原生 token]
+    local tok="$1" ntok="${2:-}" port host url facts dist ver d
+    port=$(sb_share_port)
+    host="${SB_SHARE_HOST:-}"
+    [[ -n "$host" ]] || host=$(sb_addr_current)
+    [[ -z "$host" ]] && host=$(default_server_ip)
+    [[ -n "$host" ]] || return 1          # 拿不到 host 时**不编**一个地址出来
+    url="http://$(sb_url_host "$host"):$port/share/$tok"
+    facts=$(sb_share_self_facts)
+    dist=$(sb_share_fact "$facts" distribution)
+    ver=$(sb_share_fact "$facts" version)
+    if [[ -z "$ntok" || -z "$dist" ]]; then
+        # 没有原生也要声明 —— 声明"我只提供普通话"比不声明更诚实:
+        # 客户端日志里会写"服务端清单里没有本机发行版", 而不是"地址上没有声明"。
+        d=$(sb_share_declare_url "$url" "" "$ver" "")
+    else
+        d=$(sb_share_declare_url "$url" "$dist" "$ver" \
+              "http://$(sb_url_host "$host"):$port/share/$ntok")
+    fi
+    printf '%s' "${d:-$url}"
+}
+
+# ---- 记录级读写（一条分享 = 主记录 + 可选的附带原生记录）----
+_sb_share_meta() { # <token> -> meta JSON
+    _sb_share_api get --token "$1" 2>/dev/null | python3 -c 'import sys, json
+try: print(json.dumps((json.load(sys.stdin) or {}).get("meta") or {}, ensure_ascii=False))
+except Exception: print("{}")' 2>/dev/null
+}
+_sb_share_meta_field() { # <token> <字段>
+    _sb_share_meta "$1" | python3 -c 'import sys, json
+try: print((json.load(sys.stdin) or {}).get(sys.argv[1], "") or "")
+except Exception: print("")' "$2" 2>/dev/null
+}
+_sb_share_native_of() { _sb_share_meta_field "$1" native_token; }
+_sb_share_role_of() { _sb_share_meta_field "$1" role; }
+# 用户选中的若是**原生产物**, 换回它的主记录 —— "停用/撤销/改次数"必须成对生效
+_sb_share_primary_of() {
+    local tok="$1" role parent
+    role=$(_sb_share_role_of "$tok")
+    [[ "$role" == "native" ]] || { printf '%s' "$tok"; return 0; }
+    parent=$(_sb_share_meta_field "$tok" parent)
+    printf '%s' "${parent:-$tok}"
+}
+
+# 发布闸门（两条产品**同一套节点集**）:
+# 逐个走**原生产物**里的非控制型 outbound, 取该节点的 URI 链接文件。
+#   ★ 为什么不直接用 sb_links-all.txt: 那个文件在节点删除路径里**不会被裁剪**
+#     (删除只删 sb_share-<tag>.txt), 直接发布就会把已删节点继续发给用户。
+#     以原生产物为准 = 两条产品的节点集合在构造上一致（设计文档 §5 的口径）。
+_sb_share_node_pairs() { # <tag> -> 逐行 "<原生 tag>\t<URI 链接文件的 basename>"
+    local tag="$1" native="$SB_OUT_DIR/sb_client-$tag.json" pref
+    pref=$(sb_server_slug)
+    jq -r --arg p "$pref-" '
+        (.outbounds | map(select(.detour != null) | .detour)) as $d
+        | .outbounds[]
+        | select(.type != "selector" and .type != "urltest" and .type != "direct"
+                 and .type != "block" and .type != "dns")
+        | select((.tag as $t | $d | index($t)) == null)
+        | [.tag, (.tag | if startswith($p) then .[($p | length):] else . end)]
+        | @tsv' \
+        "$native" 2>/dev/null
+}
+
+_sb_share_uri_payload() { # <tag> <输出文件> ; 0=成功
+    local tag="$1" out="$2" native="$SB_OUT_DIR/sb_client-$tag.json" ntag base n=0 bad=0
+    [[ -f "$native" ]] || { print_error "找不到原生客户端产物: $native"; return 1; }
+    : > "$out"
+    while IFS=$'\t' read -r ntag base; do
+        [[ -n "$base" ]] || continue
+        if [[ ! -s "$SB_OUT_DIR/sb_share-$base.txt" ]]; then
+            print_error "节点 $base 没有 URI 产物 ($SB_OUT_DIR/sb_share-$base.txt) —— 拒绝发布: URI(普通话) 里会少一个节点"
+            bad=1
+            continue
+        fi
+        cat "$SB_OUT_DIR/sb_share-$base.txt" >> "$out" || bad=1
+        n=$((n + 1))
+    done < <(_sb_share_node_pairs "$tag")
+    (( bad )) && return 1
+    (( n > 0 )) || { print_error "URI(普通话) 一个节点都没有 (原生产物 $native 里没有可发布节点?)"; return 1; }
+    return 0
+}
+
+# 发布闸门: **链接本身**的校验（唯一真源 conf/link_guard.py, 与
+# tools/check_share_links.sh 共用同一份规则）。有一条 problem 就拒绝发布 ——
+# 这些规则的后果不是"那个节点连不上", 而是**整个订阅对所有非 SB 客户端归零**
+# (mihomo/sing-box 遇到一条坏链接把 provider 判成 0 节点, 好节点一起消失)。
+# 把 URI 列表变成主产品之后, 这层从"回归断言"升级成"发布闸门"。
+_sb_share_link_guard() { # <tag> ; 输出 JSON 到 stdout, 有 problem 返回 1
+    local tag="$1" native="$SB_OUT_DIR/sb_client-$tag.json" ntag base out rc=0
+    local -a links=()
+    while IFS=$'\t' read -r ntag base; do
+        [[ -n "$base" ]] || continue
+        links+=(--link "$ntag=$SB_OUT_DIR/sb_share-$base.txt")
+    done < <(_sb_share_node_pairs "$tag")
+    out=$(python3 "$SB_LINK_GUARD_PY" product "$native" "${links[@]}" --json 2>/dev/null) || rc=$?
+    if [[ -z "$out" ]]; then
+        print_error "链接校验器没有输出 ($SB_LINK_GUARD_PY) —— 拒绝静默发布"
+        return 1
+    fi
+    printf '%s' "$out" | python3 -c '
+import json, sys
+r = json.load(sys.stdin)
+for w in r.get("warnings") or []:
+    print("  [注意] %s" % w, file=sys.stderr)
+for p in r.get("problems") or []:
+    print("  [FAIL] %s" % p, file=sys.stderr)
+print(json.dumps({"checked": r.get("checked", 0),
+                  "problems": r.get("problems") or [],
+                  "warnings": r.get("warnings") or []}, ensure_ascii=False))
+'
+    return "$rc"
+}
+
+# URI 表达力标注（"别假装有"）: 真源是 vendored 的 URI 表达力注册表
+# （`src/client/lib/.../data/rules.json` 的 uri_rules, 文档 docs/uri-representation.md）,
+# conf/uri_express.py 只做"出站↔URI"映射与查表。人看的报告走 stderr;
+# 机器读的摘要走 stdout（写进分享记录的 meta, 事后可核）。
+_sb_share_uri_loss_report() { # <tag> <原生产物文件>
+    local tag="$1" native="$2" js err rc=0 ntag base
+    local -a links=()
+    while IFS=$'\t' read -r ntag base; do
+        [[ -n "$base" ]] || continue
+        links+=(--link "$ntag=$SB_OUT_DIR/sb_share-$base.txt")
+    done < <(_sb_share_node_pairs "$tag")
+    js=$(mktemp); err=$(mktemp)
+    python3 "$SB_URI_EXPRESS_PY" report "$native" "${links[@]}" --json \
+        >"$js" 2>"$err" || rc=$?
+    if (( rc != 0 )) || [[ ! -s "$js" ]]; then
+        print_error "URI 表达力标注跑不起来 (rc=$rc) —— 拒绝静默发布"
+        sed 's/^/    /' "$err" >&2
+        rm -f "$js" "$err"
+        return 1
+    fi
+    sed 's/^/    /' "$err" >&2
+    python3 - "$js" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1], encoding="utf-8"))
+loss = r.get("losses") or []
+unreg = r.get("unregistered") or []
+uscheme = r.get("unknown_scheme") or []
+# 一行总账: "标注过"这件事本身必须可见（发布 URI 产品却不标注 = 静默降级）
+print("  [标注] URI 表达力标注: 逐节点查过 %d 个; 损失 %d 条; UNKNOWN %d 项 "
+      "(注册表 uri_rules 逐节点查; UNKNOWN 不折算成'没损失')"
+      % (r.get("nodes", 0), len(loss), len(unreg) + len(uscheme)), file=sys.stderr)
+if r.get("missing_uri") or r.get("extra_uri"):
+    print("  [ERR] 两条产品的节点集合不一致: 缺 URI %s / 多 URI %s"
+          % (",".join(map(str, r.get("missing_uri") or [])),
+             ", ".join(map(str, r.get("extra_uri") or []))), file=sys.stderr)
+if loss:
+    print("  [注意] URI 路径表达力损失 %d 条（原生路径没有这些损失）:" % len(loss),
+          file=sys.stderr)
+    for l in loss:
+        print("    · %-24s %-22s %s  [%s] %s"
+              % (l["tag"], l["feature"], l["kind"], l["rule"], l["what"]), file=sys.stderr)
+else:
+    print("  [OK]   URI 路径按注册表没有表达力损失（未入册项另计, 不折算成没损失）",
+          file=sys.stderr)
+if uscheme:
+    print("  [UNKNOWN] scheme 没入册, 表达力判不了: %s"
+          % ", ".join(sorted({u["scheme"] for u in uscheme})), file=sys.stderr)
+if unreg:
+    print("  [UNKNOWN] 原生有、URI 侧查不到且注册表没这一行（UNKNOWN, 不猜）: %s"
+          % ", ".join(sorted({u["feature"] for u in unreg})), file=sys.stderr)
+print(json.dumps({"nodes": r.get("nodes", 0), "losses": loss,
+                  "unregistered": unreg, "unknown_scheme": uscheme},
+                 ensure_ascii=False))
+PY
+    rm -f "$js" "$err"
 }
 
 
@@ -125,10 +358,14 @@ share_url_for() {   # 入参改成 token (存储已不在本地, 不再接受文
 gen_full_profile() {
     local out="$SB_OUT_DIR/sb_client-all.json"
     local srvname; srvname="$(sb_server_name)"
-    python3 - "$SB_OUT_DIR" "$out" "$srvname" <<'PY'
+    # 前缀由 bash 端 sb_server_slug() 算好传进来（**唯一实现**）: 聚合产物的
+    # tag 前缀必须与 "节点 tag ↔ sb_share-<tag>.txt" 的配对规则完全一致,
+    # 两处各算一次的话, 迟早有一条分享的 URI 产品少一个节点而无人报错。
+    python3 - "$SB_OUT_DIR" "$out" "$srvname" "$(sb_server_slug)" <<'PY'
 import json,glob,sys,os,re
 odir,ofile=sys.argv[1],sys.argv[2]
 SRV=sys.argv[3] if len(sys.argv)>3 else ""
+PREF=sys.argv[4] if len(sys.argv)>4 else ""
 
 def slug(s):
     # tag 会进配置文件、分享链接的 # 片段、Clash API 的节点名, 还是
@@ -146,7 +383,7 @@ def slug(s):
     h=re.sub(r'[^A-Za-z0-9._-]+','-',h).strip('-') or "server"
     return h[:32]
 
-pref=slug(SRV) if SRV else ""
+pref=PREF if PREF else (slug(SRV) if SRV else "")
 obs=[]; seen=set()
 for f in sorted(glob.glob(os.path.join(odir,"sb_client-*.json"))):
     base=os.path.basename(f)
@@ -285,14 +522,102 @@ for r in recs:
         return 1
     fi
     local ttl_s=0; [[ "$ttl" -gt 0 ]] && ttl_s=$((ttl * 3600))
-    rec=$(_sb_share_api create --type node --content-file "$tmp" --ttl "$ttl_s" \
+
+    # ---- 两条产品 + 内核声明（三家互通）----
+    # 主产品 = **普通话(URI 列表)**: xbd / mihomo / 第三方面板都读得懂它。
+    # 附带产品 = **原生(sing-box JSON)**: 只有同内核同发行版的客户端读, 零损失。
+    # 声明写在给用户的地址上 —— 客户端据此单方面决定拉哪一份。
+    local uri_payload loss_json native_tok="" declared="" nrec meta2 facts dist ver
+    uri_payload=$(mktemp) || { rm -f "$tmp"; print_error "临时文件创建失败"; return 1; }
+    if ! _sb_share_uri_payload "$tag" "$uri_payload"; then
+        rm -f "$tmp" "$uri_payload"
+        print_error "URI(普通话)产品生成失败 —— 拒绝发布（不许发一份少节点的订阅）"
+        return 1
+    fi
+    # ---- 发布闸门 1: 链接本身对不对 ----
+    local guard_json
+    if ! guard_json=$(_sb_share_link_guard "$tag"); then
+        rm -f "$tmp" "$uri_payload"
+        print_error "分享链接校验不通过 —— 拒绝发布（这些链接会让对方整条订阅归零）"
+        print_error "把上面对应的节点产物重新生成一次（面板重建该节点 / 批量重建），再发分享"
+        return 1
+    fi
+    # URI 表达力损失必须**显式标注**再发布（"别假装有"）。标注失败 = 不发。
+    if ! loss_json=$(_sb_share_uri_loss_report "$tag" "$tmp"); then
+        rm -f "$tmp" "$uri_payload"
+        print_error "URI 表达力标注失败 —— 拒绝发布"
+        return 1
+    fi
+    local uri_bytes; uri_bytes=$(wc -c < "$uri_payload" | tr -d ' ')
+    rec=$(_sb_share_api create --type node --content-type "text/plain; charset=utf-8" \
+            --content-file "$uri_payload" --ttl "$ttl_s" \
             --max-uses "$max_uses" --meta "{\"tag\":\"$tag\"}" 2>/dev/null)
-    rm -f "$tmp"
     token=$(printf '%s' "$rec" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("token",""))' 2>/dev/null)
-    [[ -n "$token" ]] || { print_error "公共服务创建分享失败"; return 1; }
+    if [[ -z "$token" ]]; then
+        rm -f "$tmp" "$uri_payload"
+        print_error "公共服务创建分享失败 (普通话)"
+        return 1
+    fi
+
+    # 附带记录: 原生产物。TTL 与次数上限**同源** —— 一条永久一条 24 小时会让
+    # 用户以为"原生自己坏了"。（地址就写在主记录的声明里, 额度不同 = 后门。）
+    facts=$(sb_share_self_facts)
+    dist=$(sb_share_fact "$facts" distribution)
+    ver=$(sb_share_fact "$facts" version)
+    if [[ -z "$dist" ]]; then
+        print_warn "内核发行版探测不到 ($(sb_share_fact "$facts" note)) —— 不产出原生, 只发普通话(URI)"
+    else
+        nrec=$(_sb_share_api create --type node --content-type "application/json" \
+                 --content-file "$tmp" --ttl "$ttl_s" --max-uses "$max_uses" \
+                 --meta "$(python3 -c '
+import json, sys
+print(json.dumps({"tag": sys.argv[1], "role": "native", "kernel": "sing-box",
+                  "distribution": sys.argv[2], "kernel_version": sys.argv[3],
+                  "parent": sys.argv[4]}, ensure_ascii=False))
+' "$tag" "$dist" "$ver" "$token")" 2>/dev/null)
+        native_tok=$(printf '%s' "$nrec" | python3 -c 'import sys,json
+try: print(json.load(sys.stdin).get("token",""))
+except Exception: print("")' 2>/dev/null)
+        if [[ -z "$native_tok" ]]; then
+            print_error "原生产物的分享记录没建起来 —— 已建好的普通话记录将被撤销（两条记录必须成对）"
+            _sb_share_api delete --token "$token" >/dev/null 2>&1
+            rm -f "$tmp" "$uri_payload"
+            return 1
+        fi
+    fi
+
+    # 声明与"原生产物在哪"写进主记录的 meta —— 列表/刷新/吊销都靠它。
+    # meta 是**整体替换**, 所以 tag 必须一起带上。
+    meta2=$(python3 -c '
+import json, sys
+print(json.dumps({"tag": sys.argv[1], "role": "primary", "kernel": "sing-box",
+                  "distribution": sys.argv[2], "kernel_version": sys.argv[3],
+                  "formats": ["uri"] + ([sys.argv[2]] if sys.argv[4] else []),
+                  "native_token": sys.argv[4],
+                  "uri_bytes": int(sys.argv[6]),
+                  "uri_losses": json.loads(sys.argv[5] or "{}"),
+                  "link_guard": json.loads(sys.argv[7] or "{}")}, ensure_ascii=False))
+' "$tag" "$dist" "$ver" "$native_tok" "$loss_json" "$uri_bytes" "$guard_json" 2>/dev/null)
+    if [[ -n "$meta2" ]]; then
+        _sb_share_api update --token "$token" --meta "$meta2" >/dev/null 2>&1 \
+            || print_warn "声明没写进 meta (分享本身可用, 但列表里看不到原生地址)"
+    else
+        print_warn "声明 meta 组装失败 (分享本身可用, 但列表里看不到原生地址)"
+    fi
+    rm -f "$tmp" "$uri_payload"
 
     local url; url="$(share_url_for "$token")"
+    declared=$(sb_share_declared_url "$token" "$native_tok"); [[ -n "$declared" ]] || declared="$url"
+    # 落盘的是**裸地址**: 地址族切换 (switch-family) 会改写这个文件里的 host,
+    # 而带声明的地址里还嵌着一条百分号编码的原生地址 —— 落盘它会变成死链。
+    # 带声明的地址每次**现算**并打印给用户（列表里也是现算）。
     echo "$url" | tee "$SB_OUT_DIR/share_tag-$tag.txt"
+    if [[ -n "$native_tok" ]]; then
+        print_info "格式: 普通话(URI 列表, N 行) + 原生(sing-box JSON) —— 同内核同发行版的客户端自动拉原生, 其余走普通话"
+    else
+        print_info "格式: 仅普通话(URI 列表) —— 地址上仍带声明, 客户端据此走通用格式"
+    fi
+    print_info "带声明的地址(客户端据此决策, 从**这里**复制): $declared"
     expires=$(printf '%s' "$rec" | python3 -c 'import sys,json;print(int(json.load(sys.stdin).get("expires_at",0)))' 2>/dev/null)
     if [[ "${expires:-0}" -gt 0 ]]; then
         print_ok "max_uses=$max_uses, 有效期 ${ttl} 小时 ($(date -d @$expires '+%F %T'))"
@@ -453,19 +778,27 @@ share_refresh_all() {
         print_warn "公共分享服务不可达, 已有分享链接的内容未刷新" >&2
         return 0
     fi
-    local n=0 tok tag tmp newh curh dead=0
-    while IFS=$'\t' read -r tok tag; do
+    local n=0 nn=0 tok tag ntok tmp newh curh dead=0
+    # ★ 只遍历**主记录**(role=primary/空), 由它带着自己的原生记录一起走。
+    #   为什么不能逐条独立遍历: 两条产品的节点集合必须一致, 一条刷新成功
+    #   另一条失败, 地址上却还声明着"原生在那边" —— 同内核客户端拉过去
+    #   解析出 0 个节点, 看起来像"订阅空了", 而面板上一切正常。
+    while IFS=$'\t' read -r tok tag ntok; do
         [[ -n "$tok" ]] || continue
         tmp=$(mktemp)
-        if ! _sb_share_content_file "$tag" "$tmp"; then
-            # 产物已经不在了 ⇒ 这条记录指向一个**已删除的节点**, 而且再也
-            # 刷不动 (没有内容可刷)。留着它等于长期给用户发死节点 —— 直接下架。
+        if ! _sb_share_uri_payload "$tag" "$tmp"; then
+            # 主产品(URI)建不出来 = 这条分享指向的节点/产物已经不完整, 而且
+            # 再也刷不动。留着它等于长期给用户发死订阅 —— **两条记录一起下架**
+            # (只删主记录会留下一条还活着的原生分享, 这个错误是静默的)。
             rm -f "$tmp"
-            if _sb_share_api delete --token "$tok" >/dev/null 2>&1; then
+            local del=0
+            _sb_share_api delete --token "$tok" >/dev/null 2>&1 && del=1
+            [[ -n "$ntok" ]] && _sb_share_api delete --token "$ntok" >/dev/null 2>&1
+            if (( del )); then
                 dead=$((dead+1))
-                print_warn "已下架指向已删节点 $tag 的分享链接 (内容无法再刷新)" >&2
+                print_warn "已下架指向已删/不完整节点 $tag 的分享链接 (主记录与原生记录一起)" >&2
             else
-                print_warn "$tag 的客户端产物已不存在, 但下架失败, 请到菜单手动删除" >&2
+                print_warn "$tag 的内容无法再刷新, 但下架失败, 请到菜单手动删除" >&2
             fi
             continue
         fi
@@ -476,14 +809,47 @@ share_refresh_all() {
             _sb_share_api update --token "$tok" --content-file "$tmp" >/dev/null 2>&1 && n=$((n+1))
         fi
         rm -f "$tmp"
+        # ---- 附带的原生产物 ----
+        [[ -n "$ntok" ]] || continue
+        tmp=$(mktemp)
+        if ! _sb_share_content_file "$tag" "$tmp"; then
+            # 产物没了 ⇒ 声明里不许再挂着一条取不到的原生地址: 删掉原生记录,
+            # 并把主记录 meta 里的 native_token/formats 清掉(地址是现算的,
+            # 清掉后声明自动变成"只有普通话")。绝不留下一个假的"原生在那边"。
+            rm -f "$tmp"
+            if _sb_share_api delete --token "$ntok" >/dev/null 2>&1; then
+                _sb_share_api update --token "$tok" --meta "$(python3 -c '
+import json, sys
+print(json.dumps({"tag": sys.argv[1], "role": "primary", "kernel": "sing-box",
+                  "distribution": sys.argv[2], "kernel_version": sys.argv[3],
+                  "formats": ["uri"], "native_token": ""}, ensure_ascii=False))
+' "$tag" "$(_sb_share_fact "$(sb_share_self_facts)" distribution)" \
+   "$(_sb_share_fact "$(sb_share_self_facts)" version)")" >/dev/null 2>&1
+                print_warn "$tag 的原生产物已不存在, 已下架原生记录并清除声明里的原生地址 (普通话照常)" >&2
+            else
+                print_warn "$tag 的原生产物已不存在, 但原生记录下架失败 —— 那条地址还能拉到旧内容" >&2
+            fi
+            continue
+        fi
+        newh=$(sha256sum "$tmp" | awk '{print $1}')
+        curh=$(_sb_share_api get --token "$ntok" 2>/dev/null \
+               | python3 -c 'import sys,json;print(json.load(sys.stdin).get("content_sha256",""))' 2>/dev/null)
+        if [[ "$newh" != "$curh" ]]; then
+            _sb_share_api update --token "$ntok" --content-file "$tmp" >/dev/null 2>&1 && nn=$((nn+1))
+        fi
+        rm -f "$tmp"
     done < <(_sb_share_list | python3 -c '
 import sys, json
 try: recs = json.load(sys.stdin)
 except Exception: recs = []
 for r in recs:
-    print("%s\t%s" % (r.get("token",""), (r.get("meta") or {}).get("tag","")))
+    m = r.get("meta") or {}
+    if m.get("role") == "native":
+        continue                      # 原生记录跟着它的主记录走
+    print("%s\t%s\t%s" % (r.get("token",""), m.get("tag",""), m.get("native_token","")))
 ' 2>/dev/null)
-    (( n > 0 )) && print_info "已刷新 ${n} 条分享链接的内容 (token 与地址未变)"
+    (( n > 0 )) && print_info "已刷新 ${n} 条分享链接的普通话(URI)内容 (token 与地址未变)"
+    (( nn > 0 )) && print_info "已刷新 ${nn} 条分享链接的原生(sing-box JSON)内容"
     (( dead > 0 )) && print_info "已下架 ${dead} 条指向已删节点的分享链接"
     return 0
 }
@@ -515,26 +881,81 @@ for i, r in enumerate(recs, 1):
     elif ex and now > ex: st = "Expired"
     elif mu and u >= mu: st = "UsedUp"
     exp = "永久" if not ex else time.strftime("%F %T", time.localtime(ex))
-    tag = (r.get("meta") or {}).get("tag", "") or "-"
-    print("%s) %s…  tag=%s  uses=%s/%s  有效期=%s  %s" % (
-        i, str(r.get("token",""))[:16], tag, u, "∞" if not mu else mu, exp, st))
+    m = r.get("meta") or {}
+    tag = m.get("tag", "") or "-"
+    # 一条分享是**两条记录**(普通话主 + 原生附带)。不给格式列的话, 用户会
+    # 把附带记录也当成一条独立入口去复制地址 —— 那条只有同内核客户端读得懂。
+    role = m.get("role") or ""
+    fmts = m.get("formats") or []
+    if isinstance(fmts, str): fmts = [fmts]
+    if role == "native":
+        kind = "原生(附带)"
+    elif fmts:
+        kind = "普通话+" + ",".join(x for x in fmts if x != "uri")
+    else:
+        kind = "普通话"
+    print("%s) %s…  tag=%s  uses=%s/%s  有效期=%s  %s  [%s]" % (
+        i, str(r.get("token",""))[:16], tag, u, "∞" if not mu else mu, exp, st, kind))
 ' 2>/dev/null
+    # ★ 打印**带声明的地址** —— 用户从这里复制的地址才带内核声明; 复制的若是
+    #   裸地址, 同内核客户端也只能走普通话(URI), 而这一点不会报错。
+    #   地址每次现算, 不落盘: 地址族切换会改对外 host。
+    printf '\n' >&2
+    print_info "拉取地址 (带内核声明; 客户端据此决定拉原生还是普通话):"
+    local i=1 tok tag ntok decl
+    while IFS=$'\t' read -r tok tag ntok; do
+        [[ -n "$tok" ]] || continue
+        decl=$(sb_share_declared_url "$tok" "$ntok") || decl=""
+        if [[ -z "$decl" ]]; then
+            print_warn "  $i) 取不到对外 host, 地址算不出来 (先跑一次「切换地址族」或用 share_url_for)"
+        else
+            printf '    %s) %s\n' "$i" "$decl" >&2
+        fi
+        i=$((i + 1))
+    done < <(printf '%s' "$js" | python3 -c '
+import sys, json
+try: recs = json.load(sys.stdin)
+except Exception: recs = []
+for r in recs:
+    m = r.get("meta") or {}
+    if m.get("role") == "native":
+        continue                      # 原生产物是附带记录, 不作为独立入口列出
+    print("%s\t%s\t%s" % (r.get("token",""), m.get("tag",""), m.get("native_token","")))
+' 2>/dev/null)
+    printf '    %s(裸地址=不带声明, 任何客户端都能拉; 机器可读、地址族切换会改写它: out/share_tag-*.txt)%s\n' \
+        "${DIM:-}" "${RESET:-}" >&2
+    print_info "原生(附带)记录不单独列出; 撤销/停用主记录会**连带**处理它"
 }
 
 meta_file_for() { meta_file "$1"; }
 
+# ★ 一条分享有**两条记录**: 普通话(主) 与 原生(附带)。停用/撤销必须成对 ——
+#   只处理主记录的话, 原生产物**还活着**: 用户以为停了/撤了, 而挂在声明里的
+#   那个地址依然能拉到同一批节点。这个错误是静默的(面板上主记录显示"已停用"),
+#   所以这里一律连带, 并且把连带结果**打出来**。
 del_share() {
-    local tok; tok=$(meta_file_for "$1")
+    local tok ntok; tok=$(meta_file_for "$1")
     [[ -z "$tok" ]] && { print_error "token|tag|编号 不存在: $1"; return 1; }
+    tok=$(_sb_share_primary_of "$tok")     # 选中的若是原生记录, 换回主记录
+    ntok=$(_sb_share_native_of "$tok")
     _sb_share_api delete --token "$tok" >/dev/null 2>&1 || { print_error "删除失败"; return 1; }
     # 回读确认 (静默失败在旧实现里踩过)
     _sb_share_api get --token "$tok" >/dev/null 2>&1 && { print_error "删除未生效"; return 1; }
-    print_ok "已删除"
+    print_ok "已删除 $tok"
+    if [[ -n "$ntok" ]]; then
+        if _sb_share_api delete --token "$ntok" >/dev/null 2>&1; then
+            print_ok "  连带: 已删除原生产物 ${ntok:0:12}…"
+        else
+            print_warn "  原生产物 ${ntok:0:12}… 删除失败 —— 那个地址还能拉到节点"
+        fi
+    fi
 }
 
 toggle_share() {
-    local tok; tok=$(meta_file_for "$1")
+    local tok ntok; tok=$(meta_file_for "$1")
     [[ -z "$tok" ]] && { print_error "token|tag|编号 不存在: $1"; return 1; }
+    tok=$(_sb_share_primary_of "$tok")
+    ntok=$(_sb_share_native_of "$tok")
     local cur want now
     cur=$(_sb_share_api get --token "$tok" 2>/dev/null \
           | python3 -c 'import sys,json;print("true" if json.load(sys.stdin).get("enabled",True) else "false")' 2>/dev/null)
@@ -544,20 +965,32 @@ toggle_share() {
           | python3 -c 'import sys,json;print("true" if json.load(sys.stdin).get("enabled",False) else "false")' 2>/dev/null)
     [[ "$now" == "$want" ]] || { print_error "切换未生效"; return 1; }
     print_ok "$1 -> enabled=$want"
+    if [[ -n "$ntok" ]]; then
+        if _sb_share_api update --token "$ntok" --enabled "$want" >/dev/null 2>&1; then
+            print_ok "  连带: 原生产物 ${ntok:0:12}… 同样$([[ "$want" == true ]] && echo 启用 || echo 停用)"
+        else
+            print_warn "  原生产物 ${ntok:0:12}… 没切换成功 —— 它还会应答, 建议手动检查"
+        fi
+    fi
 }
 
 regen_share() {
     # 公共服务的 token 就是主键, 没有"改名"这种操作 ——
     # 语义上用「建新的 + 删旧的」等价实现: 旧链接立刻失效, 新链接可用。
     # 内容/范围/次数上限/有效期全部照搬。
-    local tok; tok=$(meta_file_for "$1")
+    local tok ntok; tok=$(meta_file_for "$1")
     [[ -z "$tok" ]] && { print_error "token|tag|编号 不存在: $1"; return 1; }
+    tok=$(_sb_share_primary_of "$tok")
+    ntok=$(_sb_share_native_of "$tok")
     local rec tag maxu
     rec=$(_sb_share_api get --token "$tok" 2>/dev/null)
     tag=$(printf '%s' "$rec" | python3 -c 'import sys,json;print((json.load(sys.stdin).get("meta") or {}).get("tag",""))' 2>/dev/null)
     maxu=$(printf '%s' "$rec" | python3 -c 'import sys,json;print(int(json.load(sys.stdin).get("max_uses",1)))' 2>/dev/null)
     [[ -n "$tag" ]] || { print_error "读不到该分享的 tag"; return 1; }
     _sb_share_api delete --token "$tok" >/dev/null 2>&1
+    # 原生记录**一起**删: 只删主记录的话, 旧的原生地址还活着(它不在列表里,
+    # 用户看不见), 而新建的那一对又挂了新 token —— 静默留下一条后门。
+    [[ -n "$ntok" ]] && _sb_share_api delete --token "$ntok" >/dev/null 2>&1
     create_share "$tag" "${2:-${maxu:-1}}" "${3:-24}"
 }
 

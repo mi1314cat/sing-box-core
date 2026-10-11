@@ -78,98 +78,11 @@ note() { printf '  [--]   %s\n' "$*"; }
 
 # ---------------------------------------------------------------- 校验器
 # 一份链接文件逐行校验; 打印结论; 返回 1 表示有 FAIL。
-# 用 python3 做唯一真源: bash 正则处理 URL query 太容易出错。
+# ★ 规则的真源是 `src/conf/link_guard.py`（同一份规则也是**发布闸门**:
+#   conf/share.sh 发布前拿它拦下"会让对方整条订阅归零"的链接）。
+#   规则写在两处必然漂移 —— 而这里的漂移后果是"门禁绿着, 线上发出死订阅"。
 validate_file() { # <文件> <标签>
-    python3 - "$1" "$2" <<'PY'
-import base64, ipaddress, json, sys, urllib.parse as up
-
-path, label = sys.argv[1], sys.argv[2]
-problems, checked = [], 0
-try:
-    lines = [l.strip() for l in open(path, encoding="utf-8", errors="replace") if l.strip()]
-except OSError as e:
-    print("  [FAIL] %s: 读不到 %s (%s)" % (label, path, e)); sys.exit(1)
-
-def is_ip(s):
-    try:
-        ipaddress.ip_address(s.strip("[]")); return True
-    except ValueError:
-        return False
-
-for i, line in enumerate(lines, 1):
-    if "://" not in line:
-        problems.append("第 %d 行不是链接: %.60s" % (i, line)); continue
-    checked += 1
-    scheme = line.split("://", 1)[0].lower()
-    body = line.split("://", 1)[1]
-    frag = ""
-    if "#" in body:
-        body, frag = body.split("#", 1)
-    query = {}
-    if "?" in body:
-        query = {k: v[0] for k, v in up.parse_qs(body.split("?", 1)[1], keep_blank_values=True).items()}
-    tag = "第 %d 行 (%s)" % (i, scheme)
-
-    # ---- 1/2: hy2 obfs ----
-    if scheme in ("hysteria2", "hy2"):
-        o = (query.get("obfs") or "").strip().lower()
-        if "obfs" in query and (o in ("", "none", "null", "off", "false", "0")):
-            problems.append("%s: 带无效 obfs 参数 (obfs=%r) —— 对方会 missing obfs password, 整条订阅 0 节点"
-                            % (tag, query.get("obfs")))
-        if o == "salamander" and not (query.get("obfs-password") or "").strip():
-            problems.append("%s: obfs=salamander 但 obfs-password 为空" % tag)
-        if not query.get("alpn"):
-            problems.append("%s: 缺 alpn (hy2 应带 alpn=h3)" % tag)
-        if not query.get("sni"):
-            problems.append("%s: 缺 sni" % tag)
-
-    # ---- 5: tuic 必须带 alpn ----
-    if scheme == "tuic" and not query.get("alpn"):
-        problems.append("%s: 缺 alpn" % tag)
-
-    # ---- vless 的 encryption 只能是 none ----
-    # 写成 aes-128-gcm 的 vless 链接是"vmess+REALITY 被误标成 vless://"的指纹:
-    # 对方直接 `invaild vless encryption value: aes-128-gcm` -> 整条订阅 0 节点。
-    if scheme == "vless":
-        enc = (query.get("encryption") or "none").strip().lower()
-        if enc not in ("", "none"):
-            problems.append("%s: vless 链接的 encryption=%r 非法 (VLESS 只允许 none; "
-                            "vmess+REALITY 曾被误写成 vless://)" % (tag, enc))
-
-    # ---- 3: vmess 链接格式 ----
-    if scheme == "vmess":
-        if frag:
-            problems.append("%s: vmess 链接带了 #片段 (mihomo 会把片段一起塞进 "
-                            "base64 解码 -> format invalid -> 整条订阅 0 节点)" % tag)
-        try:
-            raw = base64.b64decode(body + "=" * (-len(body) % 4)).decode("utf-8", "replace")
-            d = json.loads(raw)
-        except Exception as e:
-            problems.append("%s: base64 payload 解不开 (%s)" % (tag, e)); d = None
-        if isinstance(d, dict):
-            if not (d.get("ps") or "").strip():
-                problems.append("%s: JSON 缺 ps 字段 (mihomo 认不出这是 vmess 链接)" % tag)
-            if not (d.get("id") or d.get("uuid")):
-                problems.append("%s: JSON 缺 id (标准字段名; uuid 只作兼容)" % tag)
-            sni = (d.get("sni") or "").strip()
-            if sni and is_ip(sni):
-                problems.append("%s: sni 是 IP (%s) —— 真证书必然校验失败" % (tag, sni))
-
-    # ---- 4: query 里的 sni 不能是 IP ----
-    sni = (query.get("sni") or "").strip()
-    if sni and is_ip(sni):
-        problems.append("%s: sni 是 IP (%s) —— 对方 x509 校验必然失败" % (tag, sni))
-
-if checked == 0:
-    print("  [--]   %s: 没有链接可查" % label)
-    sys.exit(0)
-if problems:
-    for p in problems:
-        print("  [FAIL] %s: %s" % (label, p))
-    sys.exit(1)
-print("  [OK]   %s: %d 条链接全部通过" % (label, checked))
-sys.exit(0)
-PY
+    python3 "$SRC/src/conf/link_guard.py" check "$1" --label "$2"
 }
 
 # ---------------------------------------------------------------- A. 动态自测
@@ -452,6 +365,23 @@ JSON
     fi
     ok "E1: client.sh add 导入 $n 个节点 (非 0), exit=0"
 
+    # E5: **决策必须可见**。地址上带内核声明时同内核客户端要走原生; 不带声明
+    # 时走普通话(URI 列表)。"没打出来"就等于用户不知道这次拉的是哪种产品 ——
+    # 而这正是"静默降级"最容易发生的地方。
+    if printf '%s' "$SHARE_URL" | grep -q 'interop=[0-9]'; then
+        if printf '%s' "$out" | grep -q '本次拉取: 原生'; then
+            ok "E5: 带声明的地址 → 客户端走原生（日志里有'本次拉取: 原生'）"
+        else
+            bad "E5: 带声明的地址没有走原生"; printf '%s\n' "$out" | grep -E "本次拉取" | sed 's/^/         /'
+        fi
+    else
+        if printf '%s' "$out" | grep -q '本次拉取: 普通话'; then
+            ok "E5: 裸地址（声明缺失）→ 走普通话, 且日志有原因行"
+        else
+            bad "E5: 裸地址没有走普通话 / 没有打出决策行"
+        fi
+    fi
+
     local chk; chk=$("$W/core/sing-box" check -D "$W" -C "$W/conf" 2>&1)
     if (( $? == 0 )); then ok "E2: 导入后的客户端配置 sing-box check 通过"
     else bad "E2: sing-box check 不通过"; printf '%s\n' "$chk" | tail -3 | sed 's/^/         /'; return 1; fi
@@ -475,6 +405,94 @@ JSON
         fi
     fi
     return 0
+}
+
+# ---------------------------------------------------------------- F. 三家互通
+# 声明/决策/回退链的**纯函数**断言（不需要内核二进制: 本机事实用
+# SB_INTEROP_VERSION 显式声明, 那是测试输入而不是生产写死）。
+# 每条都对应一个真实后果:
+#   · 声明缺失却报错 → 老链接(裸地址)全部拉不动
+#   · 跨内核却走原生 → 客户端解析出 0 个节点
+#   · 发行版不在清单却猜原生 → 静默丢字段
+#   · "声明只能放 query" 被破坏(片段也算声明) → 两套语义必然漂移
+run_interop_selftest() {
+    echo "== F. 三家互通（声明 / 决策 / 回退链） =="
+    local I="$SRC/src/conf/interop.py" IC="$SRC/src/client/lib/interop.py"
+    if [[ ! -f "$I" || ! -f "$IC" ]]; then
+        bad "F0: 缺 interop.py（服务端 $I / 客户端 $IC）"; return 0
+    fi
+    local a b
+    a=$(sha256sum "$I" | awk '{print $1}'); b=$(sha256sum "$IC" | awk '{print $1}')
+    if [[ "$a" = "$b" ]]; then ok "F1: 服务端与客户端的 interop.py 逐字节相同 (${a:0:16}…)"
+    else bad "F1: 两份 interop.py 不一致（服务端声明的字段名与客户端读的可能已经漂移, 表现是静默全走普通话）"; fi
+
+    local D="$SANDBOX/interop"; mkdir -p "$D"
+    export SB_INTEROP_VERSION="9.9.9"
+    local URL
+    URL=$(SB_INTEROP_VERSION=9.9.9 python3 "$I" declare --kernel sing-box \
+            --distribution sing-box --version 9.9.9 \
+            --url "http://h:9443/share/tok?x=1" \
+            --url-sing-box "http://h:9443/share/native" 2>/dev/null)
+    case "$URL" in
+        *"interop=1"*"kernel=sing-box"*"formats=uri"*) ok "F2: declare 产出的声明带 interop/kernel/formats" ;;
+        *) bad "F2: declare 产出的声明不完整: $URL" ;;
+    esac
+    case "$URL" in
+        *"url-sing-box="*) ok "F3: 原生取件地址写进声明（url-<发行版>）" ;;
+        *) bad "F3: 声明里没有 url-sing-box: $URL" ;;
+    esac
+    case "$URL" in
+        *"x=1"*) ok "F4: 地址原有的查询参数被保留（不重写别人的地址）" ;;
+        *) bad "F4: 原有查询参数被吃掉了: $URL" ;;
+    esac
+    # 决策矩阵: 逐条都是一个真实坑
+    local j
+    j=$(SB_INTEROP_VERSION=9.9.9 python3 "$I" decide "$URL" 2>/dev/null)
+    if printf '%s' "$j" | grep -q '"choice": "native"'; then ok "F5: 同内核同发行版 → 原生"
+    else bad "F5: 同内核同发行版没有走原生: $j"; fi
+    j=$(SB_INTEROP_VERSION=9.9.9 python3 "$I" decide "http://h:9443/share/tok" 2>/dev/null)
+    if printf '%s' "$j" | grep -q '"reason": "no-declaration"' && printf '%s' "$j" | grep -q '"choice": "uri"'; then
+        ok "F6: 声明缺失 → 普通话, 原因是 no-declaration（不报错）"
+    else bad "F6: 声明缺失的处理不对: $j"; fi
+    j=$(SB_INTEROP_VERSION=9.9.9 python3 "$I" decide \
+          "http://h:9443/share/tok?interop=1&kernel=xray&distribution=xray&formats=uri,xray&url-xray=http%3A%2F%2Fh%2Fs" 2>/dev/null)
+    if printf '%s' "$j" | grep -q '"reason": "cross-kernel"'; then ok "F7: 跨内核 → 普通话（cross-kernel）"
+    else bad "F7: 跨内核没有走普通话: $j"; fi
+    j=$(SB_INTEROP_VERSION=9.9.9 python3 "$I" decide \
+          "http://h:9443/share/tok?interop=99&kernel=sing-box&distribution=sing-box&formats=uri,sing-box" 2>/dev/null)
+    if printf '%s' "$j" | grep -q '"reason": "unknown-schema"'; then ok "F8: 规范版本不认识 → 普通话（不猜）"
+    else bad "F8: 不认识的规范版本没有保守处理: $j"; fi
+    j=$(SB_INTEROP_VERSION=9.9.9 python3 "$I" decide \
+          "http://h:9443/share/tok?interop=1&kernel=sing-box&distribution=sing-box&formats=uri" 2>/dev/null)
+    if printf '%s' "$j" | grep -q '"reason": "distribution-not-listed"'; then ok "F9: 发行版不在清单 → 普通话（不猜原生）"
+    else bad "F9: 发行版不在清单时的处理不对: $j"; fi
+    j=$(SB_INTEROP_VERSION=9.9.9 python3 "$I" decide \
+          "http://h:9443/share/tok?interop=1&kernel=sing-box&distribution=sing-box&formats=uri,sing-box" 2>/dev/null)
+    if printf '%s' "$j" | grep -q '"reason": "no-url-for-format"'; then ok "F10: 声明了格式却没给地址 → 普通话"
+    else bad "F10: 缺地址时的处理不对: $j"; fi
+    # 片段里的同名字段**不算**声明（同一语义只许一套载体）
+    j=$(SB_INTEROP_VERSION=9.9.9 python3 "$I" decide "http://h:9443/share/tok#interop=1&kernel=sing-box" 2>/dev/null)
+    if printf '%s' "$j" | grep -q '"reason": "no-declaration"'; then ok "F11: 片段里的声明不算声明（只读查询串）"
+    else bad "F11: 片段被当成了声明: $j"; fi
+    # 本机事实: 探测不到就**不猜**（不产出原生 / 走普通话）
+    j=$(python3 "$I" decide "$URL" --distribution "" 2>/dev/null)
+    if printf '%s' "$j" | grep -q '"reason": "self-unknown"'; then ok "F12: 本机发行版探测不出来 → 普通话（不猜自己是官方版）"
+    else bad "F12: 探测不出来时的处理不对: $j"; fi
+
+    # 发布闸门接线: 链接校验器必须是**同一份**规则（门禁与发布共用）
+    if grep -q 'link_guard.py' "$SRC/src/conf/share.sh" \
+       && grep -q 'link_guard.py' "$SRC/tools/check_share_links.sh"; then
+        ok "F13: 链接校验器被发布路径与门禁共用（同一份规则, 不会漂移）"
+    else bad "F13: 发布路径没有接 link_guard.py（门禁绿着, 线上却可能发出死订阅）"; fi
+    if grep -q '_sb_share_uri_payload' "$SRC/src/conf/share.sh" \
+       && grep -q 'uri_express.py' "$SRC/src/conf/share.sh"; then
+        ok "F14: 发布前生成 URI 产品并做表达力标注"
+    else bad "F14: share.sh 里缺 URI 产品生成 / 表达力标注"; fi
+    if grep -q '本次拉取' "$SRC/src/client/client.sh" \
+       && grep -q '原生取件失败' "$SRC/src/client/client.sh"; then
+        ok "F15: 客户端的决策与回退原因都会打出来（不静默）"
+    else bad "F15: 客户端没有决策日志 / 回退原因"; fi
+    unset SB_INTEROP_VERSION
 }
 
 # ---------------------------------------------------------------- C. --fix
@@ -514,6 +532,7 @@ PY
 echo "SB 分享链接回归检查 (源码: $SRC)"
 (( DO_GEN )) && run_selftest
 (( DO_GEN )) && run_client_selftest
+run_interop_selftest
 run_diagonal        # 自带开关: 没给 --share-url 就跳过
 scan_out_dir
 (( DO_FIX )) && fix_out_dir

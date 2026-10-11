@@ -1151,6 +1151,65 @@ compat_gate_json() { # compat_gate_json <profile.json>; 返回非 0 = 全被拿�
     return 0
 }
 
+# ---------------------------------------------------------------- 三家互通
+# 订阅地址上的**内核声明** → 这次拉哪一份产品。设计:
+# proxy-node-compat/docs/three-way-interop.md
+#
+#   同内核**同发行版** → 原生(sing-box JSON, URI 装不下的字段不丢)
+#   跨内核 / 声明缺失 / 声明不认识 / 发行版不在清单 → 普通话(URI 列表)
+#
+# 决策只看**地址本身**: 不额外发请求、不看 User-Agent、不做任何协商。
+# 服务端声明用的是查询串, 而公共分享服务的路由先剥查询串再分发
+# (share_service.py:768) —— 所以带声明的地址对第三方客户端零影响。
+#
+# 声明解析器与**服务端**用的是同一份实现(sha256 相同), 放在
+# share-state/lib/interop.py（install.sh 随 compat 层一起装）。
+_sb_interop_path() {   # 找得到打印路径, 找不到返回 1
+    local p="${SB_INTEROP_PY:-$CLIENT_ROOT/share-state/lib/interop.py}"
+    if [[ -s "$p" ]]; then printf '%s' "$p"; return 0; fi
+    if [[ -s "$CLIENT_ROOT/share-state/interop.py" ]]; then
+        printf '%s' "$CLIENT_ROOT/share-state/interop.py"; return 0
+    fi
+    return 1
+}
+
+# <订阅地址> → 一行 JSON（读不到打印空串）。CLIENT_BIN 显式传给解析器:
+# "我是哪个发行版"必须与客户端真正用的那个二进制一致(变量没 export 时
+# interop.py 看不到它, 会退回 PATH 里的 sing-box —— 那就是另一个内核了)。
+_sb_interop_decide() {
+    local py; py=$(_sb_interop_path) || { printf ''; return 0; }
+    SB_INTEROP_BIN="$CLIENT_BIN" python3 "$py" decide "$1" 2>/dev/null || true
+}
+
+_sb_interop_field() {  # <JSON> <字段>
+    printf '%s' "$1" | python3 -c 'import sys, json
+try: print((json.load(sys.stdin) or {}).get(sys.argv[1], "") or "")
+except Exception: print("")' "$2" 2>/dev/null || true
+}
+
+# 拉一个地址 → 打印 HTTP 状态码（失败打印 000）。
+# 永远返回 0: 调用方按状态码判断 —— helper 带非 0 退出会在 $(...) 赋值处
+# 把调用方打断(client.sh 是 set -u + 严格的调用约定)。
+_sb_fetch_url() { # <地址> <输出文件>
+    local url="$1" out="$2" code
+    code=$(curl -sSL -o "$out" -w '%{http_code}' --max-time 30 "$url" 2>/dev/null) || code="000"
+    printf '%s' "$code"
+}
+
+# 状态码 → 给人看的原因。返回 0 = 这是失败(调用方应中止), 1 = 200 正常。
+_sb_fetch_err() { # <状态码>
+    case "$1" in
+        200) return 1 ;;
+        410) print_err "分享链接已失效(用尽/过期/禁用)" ;;
+        404) print_err "链接不存在" ;;
+        503) print_err "服务端配置暂不可用, 未消耗次数" ;;
+        000) print_err "网络错误, 下载失败"
+             print_warn "可重试并在提示时选择走本机代理" ;;
+        *)   print_err "HTTP $1" ;;
+    esac
+    return 0
+}
+
 # ---------- add: share URL / 本地文件导入 ----------
 add_node() {
     local src="$1"
@@ -1165,23 +1224,41 @@ add_node() {
         # install 调用), 菜单 3 的拉取完全直连 —— 用户没安装时选过的通道,
         # 后面每次更新节点都用不上。这里复用同一个选择逻辑。
         sb_pick_proxy "拉取分享链接 (直连不通时可走本机代理)"
-        local code
-        code=$(curl -sSL -o "$tmp" -w '%{http_code}' --max-time 30 "$src" 2>/dev/null) || { rm -f "$tmp"; print_err "网络错误, 下载失败"
-            print_warn "可重试并在提示时选择走本机代理"; return 1; }
-        case "$code" in
-            200) ;;
-            410) rm -f "$tmp"; print_err "分享链接已失效(用尽/过期/禁用)"; return 1 ;;
-            404) rm -f "$tmp"; print_err "链接不存在"; return 1 ;;
-            503) rm -f "$tmp"; print_err "服务端配置暂不可用, 未消耗次数"; return 1 ;;
-            *)   rm -f "$tmp"; print_err "HTTP $code"; return 1 ;;
-        esac
+        # ---- 内核声明 → 拉原生还是普通话 ----
+        local pick choice rurl detail code got=0 mode=uri
+        pick=$(_sb_interop_decide "$src")
+        choice=$(_sb_interop_field "$pick" choice); [[ -n "$choice" ]] || choice=uri
+        rurl=$(_sb_interop_field "$pick" url)
+        detail=$(_sb_interop_field "$pick" detail)
+        if [[ -z "$pick" ]]; then
+            detail="声明解析器不可用($(_sb_interop_path 2>/dev/null || echo '缺失')) → 按'没有声明'处理, 走普通话(URI 列表)"
+        fi
+        if [[ "$choice" == native && -n "$rurl" ]]; then
+            code=$(_sb_fetch_url "$rurl" "$tmp")
+            if [[ "$code" == 200 ]]; then
+                got=1; mode=native
+            else
+                # 回退: 声明说原生在那边, 但那边取不到 → 回到最通用的普通话。
+                # **必须把原因打出来**（"不许为了看起来能用而静默降级"）。
+                detail="${detail}；原生取件失败(${rurl}, HTTP ${code}) → 回退"
+            fi
+        fi
+        if (( got == 0 )); then
+            mode=uri
+            code=$(_sb_fetch_url "$src" "$tmp")
+            if _sb_fetch_err "$code"; then rm -f "$tmp"; return 1; fi
+        fi
+        # 本次到底拉的是哪一种, 用户要能一眼看出来（原生 / 普通话 + 为什么）。
+        if [[ "$mode" == native ]]; then
+            print_ok "本次拉取: 原生 sing-box JSON —— ${detail}"
+        else
+            print_msg "本次拉取: 普通话 URI 列表 —— ${detail}"
+        fi
         print_ok "分享配置已获取"
+        # 登记的是**用户给的那个地址**(带声明): 刷新时重新决策, 而不是把
+        # 本次选中的原生产物地址写死 —— 服务端换了发行版/撤回原生之后,
+        # 写死的地址会变成一条永远拉不到的订阅。
         IF_SOURCE="$src"
-        # 自家 share 也要登记进订阅表。
-        # 以前只有走"格式转换"那条路的外部订阅才登记, 而自家 share 返回的
-        # 本来就是 sing-box JSON, 内核直接认 -> 压根不进那个分支 -> 永远
-        # 没被登记。后果是「一个订阅一个组」做出来, 自家那 16 个节点会跟
-        # 手动加的一起掉进「其它」组里, 分组等于没分。
         PENDING_SUB_URL="$src"
     else
         cp "$src" "$tmp" || { rm -f "$tmp"; print_err "无法读取 $src"; return 1; }

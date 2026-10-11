@@ -846,6 +846,38 @@ bash src/conf/share.sh check all                   # 生成后一致性校验 (�
 ```
 
 - URL 仅含 128-bit 随机 token，**不**包含任何节点信息；返回完整客户端 outbound JSON
+
+### 三家互通：地址上的内核声明 + 两条产品（URI 普通话 / 原生 sing-box JSON）
+
+SB 的分享地址**自己声明**"我是哪个内核的哪个发行版、我提供哪些格式、每种格式从哪取"：
+
+```
+http://<host>:9443/share/<token>?interop=1&kernel=sing-box&distribution=sing-box
+   &version=1.14.2&formats=uri,sing-box&url-sing-box=<原生 token 的地址>
+```
+
+* **主产品 = 普通话 = URI 列表**（一行一个分享链接）：xbd / mihomo / 第三方面板都能读。
+  改前 SB 的主产品是 sing-box JSON —— `xbd` 报"订阅里没有解析出节点"、mihomo 报
+  `file must have a 'proxies' field`，两格**恒失败**（跨生态格式边界）。
+* **附带产品 = 原生 = sing-box JSON**：只有同内核同发行版的客户端读，没有 URI 那层损失。
+  同内核客户端读声明后**自动**拉原生 —— 与改前**逐字节相同**的那份内容。
+* 声明放**查询串**：公共分享服务的路由先剥查询串再分发（`share_service.py:768`），所以
+  带声明与裸地址返回**逐字节相同**，对第三方客户端零影响。响应头 / `/meta` 两条路都被
+  冻结的公共服务堵死（设计文档 `proxy-node-compat/docs/three-way-interop.md` §1）。
+* **客户端决策**（`src/client/client.sh`）：同内核同发行版 → 原生；跨内核 / 声明缺失 /
+  声明不认识 / 发行版不在清单 → 普通话。原生取件失败（网络/404/空）**回退**普通话并把
+  原因打出来。日志一行：`本次拉取: 原生 sing-box JSON —— …` / `本次拉取: 普通话 URI 列表 —— …`。
+* **发布前四道闸门**：节点集合一致（两条产品同源）→ **链接校验**
+  （`src/conf/link_guard.py`，与 `tools/check_share_links.sh` 同一份规则）→ **URI 表达力标注**
+  （`src/conf/uri_express.py`，注册表驱动；URI 装不下的能力与 UNKNOWN **都打出来**）→
+  与真实配置一致。任一不过 = **拒绝发布**。
+* 一条分享是**两条记录**（主 + 附带原生）：停用 / 撤销 / 改次数 / 重建 token **成对**生效，
+  只动主记录会留下一条还活着的原生分享（这个错误是静默的）。
+* 门禁：`tools/check_share_links.sh`（含 F 段"声明/决策/回退链"断言与 E 段对角线）、
+  `tools/check_compat_wiring.sh`（接线断言）；端到端验证台 `tools/interop-e2e.sh`
+  （真 `share.sh create` + 真分享服务代码独立实例 + 真 `client.sh add`，可用
+  `SB_E2E_CORPUS=/root/catmi/sing-box` 直接吃真实部署的只读拷贝）。
+  真机验收：`proxy-node-compat/research/integration/three-way-interop-sb.md`。
 - `max_uses` / `expires_at` / `enabled` 三类独立失效，均可显式 DENY(410)
 - 并发安全：flock 串行 read-modify-write，10 并发抢 1 次授权仍只放行 1 个（已实测）
 - 客户端只有**收到完整 200 响应**才计数；服务端配置异常一律 `503` 且不消耗次数

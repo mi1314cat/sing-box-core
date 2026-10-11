@@ -584,6 +584,29 @@ if grep -q 'SB_COMPAT_ENGINE' "$CLIENT/compat2.py" && grep -q 'SB_COMPAT_ENGINE'
     ok "回滚开关读得到 SB_COMPAT_ENGINE"
 else bad "回滚开关没有实现"; fi
 
+# 三家互通接线: 声明/决策/回退链（服务端 conf/interop.py + 客户端读同一个文件）。
+# 这几条判的都是"**静默**失效"的形状: 少一个文件、少一行日志, 表现都是
+# "一切正常, 只是原生格式永远拿不到 / 用户不知道这次拉的是哪种产品"。
+if grep -q 'SB_INTEROP_PY' "$CLIENT/client.sh" && grep -q 'interop.py' "$CLIENT/client.sh"; then
+    ok "client.sh 认 SB_INTEROP_PY（客户端读声明）"
+else bad "client.sh 没接声明解析器"; fi
+if grep -q '本次拉取' "$CLIENT/client.sh"; then
+    ok "client.sh 把本次拉取的产品打到日志（原生/普通话一眼可见）"
+else bad "client.sh 没有决策日志 —— 用户看不出这次拉的是哪种"; fi
+if grep -q '原生取件失败' "$CLIENT/client.sh"; then
+    ok "原生取件失败会**回退**并打出原因（不静默降级）"
+else bad "缺回退链"; fi
+if grep -q 'share-state/lib/interop.py' "$REPO/install.sh"; then
+    ok "install.sh 会装消费者侧的 interop.py"
+else bad "install.sh 不装 interop.py（客户端只会走普通话, 且不报错）"; fi
+if [[ -f "$REPO/src/conf/interop.py" && -f "$CLIENT/lib/interop.py" ]] \
+   && cmp -s "$REPO/src/conf/interop.py" "$CLIENT/lib/interop.py"; then
+    ok "服务端与客户端的声明实现逐字节相同（字段名不会各写一套）"
+else bad "两份 interop.py 缺失或已漂移"; fi
+if grep -q 'interop.py' "$REPO/src/conf/share.sh"; then
+    ok "conf/share.sh 会在地址上写内核声明"
+else bad "conf/share.sh 没有产出声明"; fi
+
 if git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
     CHANGED="$(git -C "$REPO" status --porcelain | awk '{print $2}')"
     info "改动: $(printf '%s' "$CHANGED" | tr '\n' ' ')"

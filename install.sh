@@ -388,6 +388,11 @@ do_client() {
     cp -r "$SRC_DIR/src/client/lib/proxy_node_compat" "$CLI_ROOT/share-state/lib/" 2>/dev/null || true
     find "$CLI_ROOT/share-state/lib" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
     chmod +x "$CLI_ROOT/share-state/compat2.py" 2>/dev/null || true
+    # 三家互通: 读订阅地址上的**内核声明**决定"拉原生还是普通话"。
+    # 与**服务端** conf/interop.py 是同一份实现（门禁比对两份 sha256）——
+    # 缺了它的表现是**静默全部走普通话**: 不报错, 只是原生格式永远拿不到。
+    cp -f "$SRC_DIR/src/client/lib/interop.py" "$CLI_ROOT/share-state/lib/interop.py" 2>/dev/null \
+        || info "缺少 interop.py（客户端将只走普通话 URI 列表, 不报错）"
     # 配置分发服务: 让局域网其他设备通过 URL 拉取本客户端的完整配置。
     # 缺了它菜单 19 会起不来 —— 单独抽成文件而不是塞进 client.sh, 就是
     # 为了它只有几十行、但需要能单独读单独改。
