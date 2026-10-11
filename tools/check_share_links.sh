@@ -350,7 +350,13 @@ JSON
     command -v systemctl >/dev/null 2>&1 && prod_before=$(systemctl show -p MainPID --value sb-client 2>/dev/null || true)
 
     local out rc
-    out=$(CLIENT_ROOT="$W" CLIENT_BIN="$W/core/sing-box" CLIENT_CONF="$W/conf"           CLIENT_NODE_DIR="$W/nodes" SB_TO_SB="$W/share-state/to_sb.py"           SB_COMPAT_PY="$W/share-state/compat2.py"           SB_COMPAT_REPORT="$W/share-state/.compat-last.json"           bash -c '[[ "$CLIENT_ROOT" == "'"$W"'" ]] || { echo "FATAL: CLIENT_ROOT 被 /etc/sb-client.env 覆盖成 $CLIENT_ROOT"; exit 9; }
+    # ★ SB_SUBS_PREFIX 必须**显式**传: client.sh 在没有前缀时会走
+    #   `read -r -p "节点名前缀"`, 而这里 stdin 是 `</dev/null` —— read 立刻 EOF。
+    #   这一条曾是**静默失败**的源头（客户端只 echo 一个空行就 return 1）:
+    #   门禁只看到"导入 0 个节点", 看起来像订阅内容有问题, 于是去查内容,
+    #   而真正的原因是少了一个参数。真机表现就是 RN 上那句
+    #   `[FAIL] E1 … (rc=1, 导入 0 个节点)` 且下面一行原因都没有。
+    out=$(CLIENT_ROOT="$W" CLIENT_BIN="$W/core/sing-box" CLIENT_CONF="$W/conf"           CLIENT_NODE_DIR="$W/nodes" SB_TO_SB="$W/share-state/to_sb.py"           SB_COMPAT_PY="$W/share-state/compat2.py"           SB_COMPAT_REPORT="$W/share-state/.compat-last.json"           SB_SUBS_PREFIX="diag"           bash -c '[[ "$CLIENT_ROOT" == "'"$W"'" ]] || { echo "FATAL: CLIENT_ROOT 被 /etc/sb-client.env 覆盖成 $CLIENT_ROOT"; exit 9; }
                    exec bash "'"$csrc"'/client.sh" add "$1"' _ "$SHARE_URL" </dev/null 2>&1)
     rc=$?
     local n
@@ -360,7 +366,11 @@ JSON
           "$W/conf/90-outbounds.json" 2>/dev/null)
     if (( rc != 0 )) || [[ "${n:-0}" -lt 1 ]]; then
         bad "E1: 自家的分享自家客户端吃不下 (rc=$rc, 导入 ${n:-0} 个节点)"
+        # 失败时**无条件**把客户端输出的尾巴贴出来。以前只在输出里能 grep 到
+        # `ERR|Error|失败|FATAL` 时才贴 —— 于是"客户端一声不响地 return 1"
+        # 这种情况下面一行都没有, 读的人只能看到"导入 0 个节点"。
         printf '%s\n' "$out" | grep -E "ERR|Error|失败|FATAL" | tail -3 | sed 's/^/         /'
+        printf '%s\n' "$out" | tail -6 | sed 's/^/         | /'
         return 1
     fi
     ok "E1: client.sh add 导入 $n 个节点 (非 0), exit=0"

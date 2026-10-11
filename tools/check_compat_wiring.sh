@@ -703,21 +703,126 @@ else
     bad "部署布局下 conf/uri_express.py 跑不起来, create/create-all 会一律拒绝发布: $(head -3 "$DEPLOY/err" 2>/dev/null | tr '\n' ' ')"
 fi
 
+# ---- 8d: 对角线必须能在**非交互**环境下跑（SB_SUBS_PREFIX 要显式给）
+# client.sh 在"没有前缀 + 拿到的是需要转换的订阅"时会走
+#   `read -r -p "节点名前缀 (默认 …)"`, 而门禁/CI 的 stdin 是 `</dev/null`。
+# 客户端原来在那里只 `echo` 一个空行就 `return 1` —— **一声不响地失败**,
+# 门禁只看到"导入 0 个节点", 看起来像订阅内容有问题。真机表现就是
+# `[FAIL] E1 … (rc=1, 导入 0 个节点)` 且下面一行原因都没有。
+title "8d · 对角线: 非交互环境必须显式传前缀, 缺参数不许静默"
+# 判"对角线那次客户端调用有没有带前缀"要认准**那一行环境赋值**。
+# 不能按 `awk '/^run_diagonal\(\)/,/^}/'` 抽函数体 —— run_diagonal 里有 heredoc,
+# 里面 `^}` 会提前把范围截断（本次就踩到了: 抽出 45 行就停, 断言假红）。
+if grep -F 'SB_COMPAT_REPORT="$W/share-state/.compat-last.json"' "$REPO/tools/check_share_links.sh" \
+     | grep -q 'SB_SUBS_PREFIX='; then
+    ok "check_share_links 的对角线**显式**传 SB_SUBS_PREFIX（不依赖交互式 read）"
+else
+    bad "对角线不传 SB_SUBS_PREFIX —— stdin 是 /dev/null, 客户端会撞上交互式 read"
+fi
+# 行为验证: 拿**真的** client.sh 跑一次"非交互 + 不给前缀"。
+#   CLIENT_BIN 用"永远拒绝"的桩 → 迫使客户端进入格式转换分支（也就是那条
+#   带 prompt 的分支）; 订阅内容用本地 http 服务器提供, 不碰外网。
+D8="$TMP/d8"; rm -rf "$D8"; mkdir -p "$D8/conf" "$D8/nodes" "$D8/core" "$D8/share-state" "$D8/www"
+printf '#!/bin/sh\nexit 1\n' > "$D8/core/sing-box"; chmod +x "$D8/core/sing-box"
+printf 'ss://YWVzLTEyOC1nY206cHc=@1.2.3.4:8388#n1\n' > "$D8/www/uri.txt"
+cp -f "$REPO/src/client/compat2.py" "$D8/share-state/" 2>/dev/null
+cp -rf "$REPO/src/client/lib" "$D8/share-state/lib" 2>/dev/null
+D8PORT=$(python3 -c 'import socket
+s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+( cd "$D8/www" && exec python3 -m http.server "$D8PORT" --bind 127.0.0.1 ) >/dev/null 2>&1 &
+D8SRV=$!
+for _ in $(seq 1 20); do curl -s -o /dev/null -m 1 "http://127.0.0.1:$D8PORT/uri.txt" && break; sleep 0.2; done
+D8OUT=$(CLIENT_ROOT="$D8" CLIENT_BIN="$D8/core/sing-box" CLIENT_CONF="$D8/conf" \
+        CLIENT_NODE_DIR="$D8/nodes" SB_TO_SB="$REPO/src/client/to_sb.py" \
+        SB_COMPAT_PY="$D8/share-state/compat2.py" SB_COMPAT_REPORT="$D8/share-state/.compat.json" \
+        bash "$REPO/src/client/client.sh" add "http://127.0.0.1:$D8PORT/uri.txt" </dev/null 2>&1)
+D8RC=$?
+kill "$D8SRV" 2>/dev/null; wait "$D8SRV" 2>/dev/null
+# 门禁/对角线判失败时用的就是这条 grep —— 所以这里就按**同一条**判"原因有没有被打出来"
+if (( D8RC != 0 )) && printf '%s\n' "$D8OUT" | grep -qE "ERR|Error|失败|FATAL"; then
+    ok "非交互缺前缀: rc=$D8RC 且打出了原因（$(printf '%s\n' "$D8OUT" | grep -oE '\[ERR\][^]]*' | head -1 | cut -c1-44)…）"
+else
+    bad "非交互缺前缀时客户端没把原因打出来（rc=$D8RC, 匹配行 $(printf '%s\n' "$D8OUT" | grep -cE 'ERR|Error|失败|FATAL') 条）—— 这叫静默失败"
+fi
+
+# ---- 8e: 服务端一致性校验的**端口探活**（在听 / 没在听两个用例）
+# `share.sh:_sb_share_verify_file` 里的字符类写成 `[:]]PORT` 时, 在 ERE 里是
+# "字符类 [:](只有冒号) + 字面 ]", 只匹配 `:]PORT` 这种 ss 从不输出的形状 →
+# **每个非 loopback 节点都被判"没在听"**（真机实测 11/11 全中）, 而它同时是
+# create_share 的发布闸门, 于是"假绿 + 告警疲劳"一起发生: 告警长得和"端口真
+# 的挂了"一模一样, 真的挂了反而没人信。
+# 这里不测正则, 测**行为**: 造一个端口真的在听的节点和一个真的没在听的节点,
+# 跑真的 `share.sh check <tag>`, 看返回码与告警。
+title "8e · 端口探活: 在听=通过 / 没在听=拒发 / ss 全瞎=不假装知道"
+D8E="$TMP/srv8e"; rm -rf "$D8E"; mkdir -p "$D8E/conf" "$D8E/config" "$D8E/out"
+cp -f "$REPO"/src/conf/*.sh "$D8E/conf/" 2>/dev/null
+# ★ 探活**不靠本机真的 ss**: 这台跑门禁的机器上 `ss` 存在但**一条套接字都看不到**
+#   （`ss -tulnH` 空输出, 而同一端口 `/dev/tcp` 连得上）—— 拿它当夹具会把"工具瞎"
+#   误当成"端口挂了"。改成往 PATH 前面塞一个 `ss` 桩, 它吐出**真机捕获的**输出形态
+#   （RN 上 `ss -tulnH` 的原样三种形状）, 于是这条断言到哪台机器都成立, 且钉住的
+#   正是"解析真实 ss 输出"这件事本身。
+FAKEBIN="$TMP/fakebin"; rm -rf "$FAKEBIN"; mkdir -p "$FAKEBIN"
+cat > "$FAKEBIN/ss" <<'EOS'
+#!/bin/sh
+cat "$FAKE_SS_FILE" 2>/dev/null
+EOS
+chmod +x "$FAKEBIN/ss"
+# 真机（RN）`ss -tulnH` 原样捕获的三种形状 + 一条无关行
+SS_LIVE="$TMP/ss-live.txt"
+{
+    printf 'tcp LISTEN 0      4096           *:31000       *:*\n'
+    printf 'udp UNCONN 0      0           [::]:41871    [::]:*\n'
+    printf 'tcp LISTEN 0      4096   127.0.0.1:31003 0.0.0.0:*\n'
+} > "$SS_LIVE"
+: > "$TMP/ss-blind.txt"          # ss 什么都看不到（本机实测就是这个）
+for n in v4 v6 dead; do
+    p=31000; [[ "$n" == v6 ]] && p=41871; [[ "$n" == dead ]] && p=31099
+    cat > "$D8E/config/n-$n.json" <<JSON
+{"inbounds":[{"type":"mixed","tag":"n-$n","listen":"0.0.0.0","listen_port":$p}]}
+JSON
+    cat > "$D8E/out/sb_client-n-$n.json" <<JSON
+{"outbounds":[{"type":"shadowsocks","tag":"n-$n","server":"1.2.3.4","server_port":$p,
+"method":"aes-128-gcm","password":"pw"}]}
+JSON
+done
+srv_check() { # <tag> <ss管线> → 打印 "<rc>|<输出>"
+    local o rc
+    o=$(PATH="$FAKEBIN:$PATH" FAKE_SS_FILE="$2" SB_ROOT="$D8E" \
+        bash "$D8E/conf/share.sh" check "$1" 2>&1); rc=$?
+    printf '%s|%s' "$rc" "$o"
+}
+for spec in "n-v4:$SS_LIVE:IPv4 通配 *:PORT" "n-v6:$SS_LIVE:IPv6 方括号 [::]:PORT"; do
+    t=${spec%%:*}; rest=${spec#*:}; f=${rest%%:*}; shape=${rest#*:}
+    r=$(srv_check "$t" "$f"); rc=${r%%|*}; o=${r#*|}
+    if [[ "$rc" == 0 ]] && ! printf '%s' "$o" | grep -q '没有监听'; then
+        ok "端口在听的节点 ($shape) → check RC=0 且无'没有监听'（不再全量误报）"
+    else
+        bad "端口在听的节点被判没在听 (RC=$rc, $shape): $(printf '%s' "$o" | grep '没有监听' | head -1 | cut -c1-64)"
+    fi
+done
+r=$(srv_check n-dead "$SS_LIVE"); rc=${r%%|*}; o=${r#*|}
+if [[ "$rc" != 0 ]] && printf '%s' "$o" | grep -q '没有监听'; then
+    ok "端口没在听的节点 → check RC=$rc（非 0）且报出'没有监听' —— 死节点不会再被发布"
+else
+    bad "端口没在听的节点仍然 check RC=$rc —— 死节点会被当作'一致'发出去（假绿）"
+fi
+r=$(srv_check n-v4 "$TMP/ss-blind.txt"); rc=${r%%|*}; o=${r#*|}
+if [[ "$rc" == 0 ]] && printf '%s' "$o" | grep -q '探活\*\*跳过\*\*'; then
+    ok "ss 全瞎时不逐端口判死: 明确告警'探活跳过'且不拦发布（本地实测 ss 就是这种）"
+else
+    bad "ss 全瞎时被当成'每个端口都没在听' (RC=$rc) —— 会全量拒发, 那不是发现死节点而是我们瞎了"
+fi
+
 if git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
     CHANGED="$(git -C "$REPO" status --porcelain | awk '{print $2}')"
     info "改动: $(printf '%s' "$CHANGED" | tr '\n' ' ')"
-    # conf/share.sh / share_client.py 归另一个 agent。它俩在同一个工作区里必然也是
-    # dirty 的, 所以这里**不能**按"文件是否 dirty"判; 判的是"我们的改动有没有渗进去":
-    # 只要那两个文件的 diff 里出现本任务的任何标记就算越界。
-    if git -C "$REPO" status --porcelain | grep -qE 'conf/share(_client)?\.(sh|py)'; then
-        if git -C "$REPO" diff -- src/conf/share.sh src/conf/share_client.py 2>/dev/null \
-             | grep -qE 'compat2|proxy_node_compat|SB_COMPAT'; then
-            bad "conf/share.sh / share_client.py 的 diff 里出现了本任务的标记（越界）"
-        else
-            ok "conf/share.sh / share_client.py 的改动与本任务无关（另一个 agent 的）"
-        fi
+    # conf/share.sh 的所有权已在本轮**移交本任务**（探活正则 + ss 全瞎守卫都在
+    # 它里面）, 所以不再拿"没被动过"判它。conf/share_client.py 仍不属于本任务 ——
+    # 它一旦出现在 diff 里就是越界。
+    if git -C "$REPO" diff --name-only -- src/conf/share_client.py 2>/dev/null | grep -q .; then
+        bad "conf/share_client.py 被动过（不属于本任务）"
     else
-        ok "conf/share.sh / share_client.py 没被动过"
+        ok "conf/share_client.py 没被动过（share.sh 本轮已移交本任务, 不再当越界判据）"
     fi
     if printf '%s' "$CHANGED" | grep -qE '^(\.\./|/root/deepseek/repos/(xray|mihomo))'; then
         bad "改了 sing-box-core 之外的仓库"

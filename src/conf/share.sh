@@ -696,6 +696,18 @@ _sb_live_lookup() { # <tag> <索引文件> -> "listen\tport" (找不到则空)
 # 校验一份客户端产物 (单节点或聚合) -> 0=一致, 1=有不一致 (原因写 stderr)
 _sb_share_verify_file() { # <产物文件> <索引文件>
     local f="$1" ix="$2" bad=0 tag lport aport
+    # 套接字快照只取一次, 并且必须把两种"看不到端口"分开:
+    #   · ss 能用, 但**这个端口**没在听      → 真问题 → bad=1（拒发）
+    #   · ss **一条套接字都看不到**（或干脆没有 ss）→ 是**工具**的问题
+    #     （容器/权限/netns/精简系统）, 这时逐个端口判"没在听"会把**每个**节点
+    #     都判死, 于是发布闸门全量拒发 —— 那不是"发现了死节点", 那是我们瞎了
+    #     却假装看见。与"配置目录为空就跳过校验"同一条 fail-open 原则:
+    #     **明确告警说这一项本轮没验**, 不假装知道, 也不拿它去拦发布。
+    local ss_tbl="" ss_ok=0 ss_dim=0
+    if command -v ss >/dev/null 2>&1; then
+        ss_tbl=$(ss -tulnH 2>/dev/null | awk '{print $5}')
+        [[ -n "$ss_tbl" ]] && ss_ok=1
+    fi
     while IFS= read -r tag; do
         [[ -n "$tag" ]] || continue
         case "$tag" in PROXY|AUTO|direct|block|dns) continue ;; esac
@@ -713,9 +725,29 @@ _sb_share_verify_file() { # <产物文件> <索引文件>
         if [[ -n "$aport" && -n "$lport" && "$aport" != "$lport" ]]; then
             print_error "分享内容里的端口 ($aport) 与真实监听配置 ($lport) 不一致: $tag"
             bad=1
-        elif [[ -n "$lport" ]] && command -v ss >/dev/null 2>&1; then
-            ss -tulnH 2>/dev/null | awk '{print $5}' | grep -qE "[:]]${lport}$" \
-                || print_warn "服务端当前没有监听 $lport (配置里有, 套接字不在 —— 这个节点现在连不上): $tag"
+        elif [[ -n "$lport" ]]; then
+            if (( ss_ok )); then
+                # 探活。★ 字符类是 `[]:]`, **不是** `[:]` 后面跟个 `]`:
+                #   · `[:]]PORT$` 在 ERE 里是「字符类 `[:]`（只有 `:`）+ 字面 `]`」,
+                #     只匹配 `:]PORT` 这种 ss 从不输出的形状 → **全量误报**:
+                #     每个非 loopback 节点都被判"没在听"（真机实测 11/11）,
+                #     而告警长得和"端口真的挂了"一模一样 —— 假绿 + 告警疲劳,
+                #     真的挂掉时反而没人信。
+                #   · 本意 `[]:]PORT$` =「`]` 或 `:` 任一个, 再接 PORT」,
+                #     覆盖 `*:31000` / `0.0.0.0:31000`(IPv4) 与 `[::]:31000`(IPv6)。
+                #
+                # 归到 bad（不只是告警）: 一致性校验同时是 create_share 的**发布
+                # 闸门**, 而「端口必须与真实监听一致, 不通过就不发」是它写在
+                # create_share 里的既有约定 —— 发出去的是一条死节点, 且冻结在
+                # 公共分享服务里不会自愈。
+                if ! printf '%s\n' "$ss_tbl" | grep -qE "[]:]${lport}$"; then
+                    print_error "服务端当前没有监听 $lport (配置里有, 套接字不在 —— 这个节点现在连不上): $tag"
+                    bad=1
+                fi
+            elif (( ss_dim == 0 )); then
+                print_warn "套接字探活**跳过**: ss 看不到任何套接字（或没有 ss）—— 容器/权限/命名空间问题。端口一致性这一项本轮没验, 别当成验过了"
+                ss_dim=1
+            fi
         fi
     done < <(jq -r '.outbounds[]?.tag // empty' "$f" 2>/dev/null)
     return "$bad"

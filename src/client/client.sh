@@ -1287,7 +1287,18 @@ add_node() {
             if [[ -n "${SB_SUBS_PREFIX:-}" ]]; then
                 sp="$SB_SUBS_PREFIX"
             else
-                read -r -p "  这条订阅的节点名前缀 (默认 $guess): " sp || { echo; rm -f "$tmp"; return 1; }
+                # 非交互（stdin 关了 / `</dev/null`）时 read 立刻返回非 0。原来这里
+                # 只 `echo` 一个空行就 `return 1` —— 那是**一声不响地失败**: 调用方
+                # 只看到"导入 0 个节点", 看起来像订阅内容有问题, 于是去查内容, 而
+                # 真正的原因是少了一个参数。这个值本来就可以显式给（SB_SUBS_PREFIX）,
+                # 所以把原因和出路一起打出来（保持 return 1 —— 不替调用方猜前缀）。
+                if ! read -r -p "  这条订阅的节点名前缀 (默认 $guess): " sp; then
+                    rm -f "$tmp"
+                    print_err "读不到节点名前缀: stdin 不可用（非交互 / </dev/null）, 而这条订阅还没有前缀"
+                    print_err "  节点名不加前缀会与本机已有节点重名 —— 重名的后果是静默覆盖旧节点, 面板还报 [OK]"
+                    print_err "  非交互调用请显式指定: SB_SUBS_PREFIX=<前缀> bash sb-client add <地址>"
+                    return 1
+                fi
                 sp="${sp// /}"
                 [[ -z "$sp" ]] && sp="$guess"
             fi
