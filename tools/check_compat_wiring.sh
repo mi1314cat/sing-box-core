@@ -31,7 +31,7 @@ UPSTREAM="$COMPAT_REPO/proxy_node_compat"
 # 上游仓库当时有未提交的在途改动（mihomo 的 trojan uri_rule）, 那些不属于"已完成"的快照。
 # ★ 漂移检测:**pin 与 vendor 必须同步前进**。只 vendor 不挪 pin → 门禁按旧快照判
 #   "一致", 新 vendor 的语义其实没人验; 只挪 pin 不 vendor → 门禁立刻报漂移。
-COMPAT_REV="${PROXY_NODE_COMPAT_REV:-40a9441}"
+COMPAT_REV="${PROXY_NODE_COMPAT_REV:-692566c}"
 
 # 离线夹具: 两台真实部署机（CC/RW）上 `sing-box version` 打印的 Tags
 GATE_OFFLINE_VERSION="${GATE_OFFLINE_VERSION:-1.14.2}"
