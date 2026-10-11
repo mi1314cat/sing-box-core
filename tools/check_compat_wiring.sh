@@ -813,6 +813,100 @@ else
     bad "ss 全瞎时被当成'每个端口都没在听' (RC=$rc) —— 会全量拒发, 那不是发现死节点而是我们瞎了"
 fi
 
+# ---- 8f: URI 方言的**逐条可见性**（丢节点必须看得见）
+# 九宫格真机暴露: M 的分享 19 条里 3 条 anytls、SB 自己的普通话产品 13 条里 2 条
+# anytls —— **全部无声消失**; 另外 naive+https / shadowtls 两行连 to_sb 自己的
+# `共=` 都没算上（裸 `continue`, 连计数器都不加）。
+# 根因是**同一件事写了三份清单**: `URI_RE` 认哪些 scheme / `uri_to_outbound` 的
+# 分派表 / `_std_uri` 真实现了哪些分支。anytls 在 URI_RE 里、在 _std_uri 里有分支
+# （于是那段是跑不到的死代码）, 只有分派表漏了; socks5 在 URI_RE 里写作 `socks5?`、
+# `_URI_TYPE` 两个名字都映射了, 分派表只有 "socks"。
+# 这里把三份钉在一起, 并且**从 URI_RE 的模式展开**候选 —— 不写死清单, 以后谁再加
+# 一个 scheme 漏在分派里, 这条就会红。
+title "8f · URI 方言: scheme 分派对齐 + 丢节点必须可见（含 # 注释行）"
+F6="$TMP/f6"; rm -rf "$F6"; mkdir -p "$F6"
+cat > "$F6/probe.py" <<'PY'
+import base64, importlib.util, json, re, sys
+spec = importlib.util.spec_from_file_location("to_sb", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+
+vm = base64.b64encode(json.dumps(
+    {"v": "2", "ps": "n", "add": "1.2.3.4", "port": "443",
+     "id": "11111111-1111-1111-1111-111111111111"}).encode()).decode()
+FIX = {
+    "vmess": "vmess://" + vm,
+    "vless": "vless://11111111-1111-1111-1111-111111111111@1.2.3.4:443?encryption=none&type=tcp#n",
+    "trojan": "trojan://pw@1.2.3.4:443#n",
+    "ss": "ss://YWVzLTEyOC1nY206cHc=@1.2.3.4:8388#n",
+    "socks": "socks://1.2.3.4:1080#n",
+    "socks5": "socks5://1.2.3.4:1080#n",
+    "http": "http://1.2.3.4:8080#n",
+    "hysteria2": "hysteria2://pw@1.2.3.4:443?sni=a.com&alpn=h3#n",
+    "hy2": "hy2://pw@1.2.3.4:443?sni=a.com#n",
+    "tuic": "tuic://11111111-1111-1111-1111-111111111111:pw@1.2.3.4:443?sni=a.com&alpn=h3#n",
+    "anytls": "anytls://pw@1.2.3.4:8443?sni=a.com#n",
+}
+# ① 从 URI_RE 的模式展开它认的每个 scheme（`socks5?` → socks / socks5）
+#    `?` 作用于**它前面那个字符**, 所以两种形态是 alt[:-2] 与 alt[:-2]+alt[-2]。
+inner = re.search(r'^\^\((.*?)\)://', m.URI_RE.pattern).group(1)
+schemes = []
+for alt in inner.split("|"):
+    schemes += [alt[:-2], alt[:-2] + alt[-2]] if alt.endswith("?") else [alt]
+out = {"schemes_total": len(schemes),
+       "uncovered": [s for s in schemes if s not in FIX or not m.uri_to_outbound(FIX[s], "")]}
+# ② 一份"三种形态混在一起"的订阅: 注释行 / 能转的 anytls / 未收录的 scheme
+fx = ("# 这一行是注释 —— 不该被当成节点, 也不该被算成一次跳过\n"
+      "anytls://pw@1.2.3.4:8443?sni=a.com#anytls-ok\n"
+      "naive+https://u:p@1.2.3.4:443?sni=a.com#naive-unsupported\n")
+obs, rep = m.convert(fx, prefix="g-")
+out["fx_total"] = rep["total"]
+out["fx_ok"] = rep["ok"]
+out["anytls_converted"] = any(o.get("type") == "anytls" for o in obs)
+out["unlisted_reason"] = next((k for k in rep["reasons"] if "未收录" in k), "")
+print(json.dumps(out, ensure_ascii=False))
+PY
+F6JS=$(python3 "$F6/probe.py" "$REPO/src/client/to_sb.py" 2>/dev/null)
+if [[ -n "$(printf '%s' "$F6JS" | jq -r '.uncovered | join(",")' 2>/dev/null)" ]]; then
+    bad "URI_RE 认了但分派表不认的 scheme: $(printf '%s' "$F6JS" | jq -r '.uncovered|join(",")') —— 这些节点会被**无声**丢掉"
+else
+    ok "URI_RE 认的每个 scheme 都能被分派转换（$(printf '%s' "$F6JS" | jq -r '.schemes_total') 个, 从模式展开, 不写死清单）"
+fi
+if [[ "$(printf '%s' "$F6JS" | jq -r '.anytls_converted')" == "true" ]]; then
+    ok "anytls:// 真的会被转换（修前它被当成'不支持的 URI'丢掉: M 3 条 / SB 自己 2 条）"
+else
+    bad "anytls:// 仍然转换不出来 —— 节点会被丢掉"
+fi
+if [[ -n "$(printf '%s' "$F6JS" | jq -r '.unlisted_reason')" && "$(printf '%s' "$F6JS" | jq -r '.fx_total')" == 2 ]]; then
+    ok "未收录 scheme 进跳过原因（$(printf '%s' "$F6JS" | jq -r '.unlisted_reason')）; # 注释行**不被计数**（total=2 而非 3）"
+else
+    bad "未收录 scheme 不可见 或 # 注释被当成节点（total=$(printf '%s' "$F6JS" | jq -r '.fx_total')）"
+fi
+# ③ 端到端: client.sh 在**部分成功**时也必须把"跳过了什么"打给用户
+#   （修前只在"整份转换出 0 个节点"时才回显 —— 于是少几个节点是静默的）
+F6W="$TMP/f6c"; rm -rf "$F6W"; mkdir -p "$F6W/conf" "$F6W/nodes" "$F6W/core" "$F6W/share-state" "$F6W/www"
+printf '#!/bin/sh\nexit 1\n' > "$F6W/core/sing-box"; chmod +x "$F6W/core/sing-box"
+printf '%s\n' '# comment' 'anytls://pw@1.2.3.4:8443?sni=a.com#ok' \
+    'naive+https://u:p@1.2.3.4:443?sni=a.com#x' > "$F6W/www/uri.txt"
+cp -f "$REPO/src/client/compat2.py" "$F6W/share-state/" 2>/dev/null
+cp -rf "$REPO/src/client/lib" "$F6W/share-state/lib" 2>/dev/null
+F6P=$(python3 -c 'import socket
+s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+( cd "$F6W/www" && exec python3 -m http.server "$F6P" --bind 127.0.0.1 ) >/dev/null 2>&1 &
+F6SRV=$!
+for _ in $(seq 1 20); do curl -s -o /dev/null -m 1 "http://127.0.0.1:$F6P/uri.txt" && break; sleep 0.2; done
+F6OUT=$(CLIENT_ROOT="$F6W" CLIENT_BIN="$F6W/core/sing-box" CLIENT_CONF="$F6W/conf" \
+        CLIENT_NODE_DIR="$F6W/nodes" SB_TO_SB="$REPO/src/client/to_sb.py" \
+        SB_COMPAT_PY="$F6W/share-state/compat2.py" SB_COMPAT_REPORT="$F6W/share-state/.compat.json" \
+        SB_SUBS_PREFIX="f6" \
+        bash "$REPO/src/client/client.sh" add "http://127.0.0.1:$F6P/uri.txt" </dev/null 2>&1)
+kill "$F6SRV" 2>/dev/null; wait "$F6SRV" 2>/dev/null
+if printf '%s' "$F6OUT" | grep -q '转换器跳过了'; then
+    ok "client.sh 在部分成功时也回显跳过（$(printf '%s\n' "$F6OUT" | grep -o '转换器跳过了 [0-9]* 条' | head -1)）"
+else
+    bad "client.sh 把转换器的跳过理由吞了 —— 用户只看到'转换出 N 个节点', 不知道 N 比订阅里少"
+fi
+
 if git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
     CHANGED="$(git -C "$REPO" status --porcelain | awk '{print $2}')"
     info "改动: $(printf '%s' "$CHANGED" | tr '\n' ' ')"

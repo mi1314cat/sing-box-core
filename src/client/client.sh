@@ -1326,6 +1326,17 @@ add_node() {
         fmt=$(printf '%s' "$rep" | sed -n 's/.*格式=\([^ ]*\).*/\1/p')
         cnt=$(jq '.outbounds|length' "$conv" 2>/dev/null || echo 0)
         print_ok "识别为 ${fmt:-未知} 格式, 转换出 $cnt 个节点"
+        # ★ 转换器**跳过了什么**必须回显, 不只在"整份转换出 0 个节点"的时候。
+        #   原来 `rep` 只在上面那个失败分支里打印 —— 于是"部分成功"时, 被丢掉的
+        #   节点**一声不响**: 用户只看到"转换出 N 个节点", 不知道 N 比订阅里少。
+        #   真机实测: M 的分享 19 条里 3 条 anytls、SB 自己的普通话产品 13 条里
+        #   2 条 anytls, 就是这样消失的（连 to_sb 自己的 `共=` 都没算上那 2 条）。
+        #   这不是"多打一行日志", 而是"少一个节点时用户能不能发现"。
+        local skipn; skipn=$(printf '%s' "$rep" | sed -n 's/.*跳过=\([0-9]*\).*/\1/p')
+        if [[ -n "$skipn" && "$skipn" != 0 ]]; then
+            print_warn "转换器跳过了 $skipn 条（订阅里的节点数与实际导入数因此不同）:"
+            printf '%s' "$rep" | sed -n 's/^\[to_sb\] //p' | cut -c1-400 | sed 's/^/    /' >&2
+        fi
         compat_brief "$SB_COMPAT_REPORT"
         mv -f "$conv" "$tmp"
 

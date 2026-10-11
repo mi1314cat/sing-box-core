@@ -397,7 +397,20 @@ def uri_to_outbound(line, prefix=""):
 
     if scheme == "vmess":
         return _vmess_uri(rest, frag, prefix)
-    if scheme in ("vless", "trojan", "ss", "socks", "http", "hysteria2", "hy2", "tuic"):
+    # ★ 这个分派必须与 `URI_RE` 认的 scheme **逐个对齐**, 也要与 `_std_uri` 真实现了的
+    # 分支对齐。三份清单各写一次、又没有门禁比对, 就是漂移的入口 —— 真机上已经漂了
+    # 两处, 形状一模一样（URI_RE 认 → 计入 total → 这里 return None → 节点无声消失）:
+    #   · `anytls` : URI_RE 里有, `_std_uri` 里有分支(于是那段是跑不到的死代码),
+    #                只有这个分派表漏了。实测 M 分享 19 条里 3 条、SB 自己的普通话
+    #                产品 13 条里 2 条 anytls, 全部无声消失。
+    #   · `socks5` : URI_RE 写的是 `socks5?`（socks / socks5 都认）, `_URI_TYPE`
+    #                也两张都映射到 socks, 而这里只有 "socks"。
+    # 门禁 8f 段按 URI_RE 的模式**逐个展开**做一致性断言, 以后再加 scheme 漏在这
+    # 里就会红。
+    if scheme == "socks5":
+        scheme = "socks"
+    if scheme in ("vless", "trojan", "ss", "socks", "http", "hysteria2", "hy2",
+                  "tuic", "anytls"):
         return _std_uri(scheme, rest, frag, prefix)
     return None
 
@@ -836,7 +849,18 @@ def convert(data, prefix=""):
         obs = []
         for l in lines:
             l = l.strip()
-            if not l or not URI_RE.match(l):
+            if not l:
+                continue
+            # ★ 不匹配 URI_RE 的行**也要报出来**。原来这里是裸 `continue` —— 连
+            #   `rep["total"]` 都不加, 于是这些行在 to_sb 自己的报告里也**完全不存在**
+            #   （不是"跳过 1 条", 是根本不计数）。真机实测: SB 自己的普通话产品有
+            #   13 行, 而 to_sb 报 `共=11` —— naive+https 与 shadowtls 这两行就是
+            #   这样消失的; M 那边同理。注释行(`#`)是有意不算的, 走下面那支。
+            if l.startswith("#"):
+                continue
+            if not URI_RE.match(l):
+                rep["total"] += 1
+                _note("URI 协议未收录: %s" % (l.split("://", 1)[0] if "://" in l else l[:24]))
                 continue
             rep["total"] += 1
             try:
