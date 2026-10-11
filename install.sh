@@ -160,8 +160,31 @@ status_block() {
     [[ -d /run/systemd/system ]] && printf "服务(systemd): %s%s%s\n" "$([[ $(systemctl is-enabled sing-box 2>/dev/null) == enabled ]] && echo $GREEN已启用 || echo $YELLOW未启用)" "$PLAIN" ""
 }
 
+# 服务端 conf/ 必须**自包含**。
+#
+# conf/uri_express.py 是发布前的 URI 表达力闸门, 它 `import compat2`; 而 compat2
+# 又把**它自己同目录**下的 `lib/` 加进 sys.path, 再 `import proxy_node_compat`。
+# 所以 `compat2.py` 与 `lib/proxy_node_compat/` 必须**成对落在 conf/ 里**。
+#
+# 部署树上没有 src/client/ —— 只 `cp src/conf/.` 的话:
+#   uri_express.py → ModuleNotFoundError: No module named 'compat2' → 退出非 0
+#   → share.sh 的发布闸门「URI 表达力标注失败 —— 拒绝发布」
+#   → **整个分享功能不可用**（`create` / `create-all` 一律返回 1）。
+# 失败信息只有一句 traceback, 很容易被当成环境问题放过; 而这条闸门按设计
+# 就是"不过就不发", 所以它坏掉时面板不会给出任何像样的提示。
+# 与客户端同构: install.sh 也是把这两份装到 $CLI_ROOT/share-state/ 的。
+install_server_compat() {
+    cp -f "$SRC_DIR/src/client/compat2.py" "$SRV_ROOT/conf/compat2.py" 2>/dev/null
+    rm -rf "$SRV_ROOT/conf/lib/proxy_node_compat"
+    mkdir -p "$SRV_ROOT/conf/lib" 2>/dev/null
+    cp -r "$SRC_DIR/src/client/lib/proxy_node_compat" "$SRV_ROOT/conf/lib/" 2>/dev/null
+    find "$SRV_ROOT/conf/lib" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null
+    return 0
+}
+
 rsync_files() {
     cp -rf "$SRC_DIR/src/conf/." "$SRV_ROOT/conf/" 2>/dev/null
+    install_server_compat
     cp -f "$SRC_DIR/src/sing-box.sh" "$SRV_ROOT/" 2>/dev/null
     chmod +x "$SRV_ROOT/sing-box.sh" "$SRV_ROOT/conf/"*.sh 2>/dev/null
     ok "服务端脚本已热更新"
@@ -268,6 +291,7 @@ do_server() {
     info "正在初始化 Sing-box 服务端..."
     mkdir -p "$SRV_ROOT"/{conf,config,out,backup,share/shares} || die "目录创建失败"
     cp -rf "$SRC_DIR/src/conf/." "$SRV_ROOT/conf/" || die "模块复制失败"
+    install_server_compat
     cp -f "$SRC_DIR/src/sing-box.sh" "$SRV_ROOT/" || die "面板复制失败"
     chmod +x "$SRV_ROOT/sing-box.sh" "$SRV_ROOT/conf/"*.sh 2>/dev/null
     ok "项目文件"

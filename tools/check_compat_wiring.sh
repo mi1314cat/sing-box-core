@@ -663,6 +663,44 @@ else
     ok "未编码裸查询串（url-* 含字面 ://）→ 与完整地址同解（不静默 no-declaration）"
 fi
 
+# ---- 8c: 服务端发布闸门在**部署布局**下必须能跑（conf/ 自包含）
+# `share.sh create` 发布前要跑 conf/uri_express.py 做 URI 表达力标注, 而它
+# `import compat2`（compat2 再把**它自己同目录**下的 lib/ 加进 sys.path, 去
+# import proxy_node_compat）。部署树上**没有** src/client/, 所以这两份必须由
+# install.sh 装进 conf/ —— 只 `cp src/conf/.` 的话, 部署机上 import 必失败,
+# uri_express 非 0 退出, 发布闸门据此「拒绝发布」: `create`/`create-all` 全废,
+# 而面板只会吐一句 traceback。
+#
+# 这里不"模拟"install.sh 的行为, 而是**直接把它自己的 rsync_files() 抠出来跑**
+# 到沙箱, 再按 share.sh 的方式调 uri_express.py —— 它装什么就验什么。
+title "8c · 服务端发布闸门在部署布局下能跑（conf/ 自包含）"
+DEPLOY="$TMP/deploy"
+rm -rf "$DEPLOY"; mkdir -p "$DEPLOY/conf"
+(
+    ok() { :; }                       # install.sh 的日志函数, 只在子 shell 里桩掉
+    eval "$(awk '/^install_server_compat\(\)/,/^}/' "$REPO/install.sh")"
+    eval "$(awk '/^rsync_files\(\)/,/^}/' "$REPO/install.sh")"
+    SRC_DIR="$REPO" SRV_ROOT="$DEPLOY" rsync_files
+) >/dev/null 2>&1
+rm -rf "$DEPLOY/client" 2>/dev/null
+info "沙箱: $(ls "$DEPLOY/conf" 2>/dev/null | wc -l | tr -d ' ') 个文件, client/ 不存在(与真实部署树一致)"
+if [[ -f "$DEPLOY/conf/compat2.py" && -d "$DEPLOY/conf/lib/proxy_node_compat" ]]; then
+    ok "install.sh 的 rsync_files() 把 compat2.py + lib/proxy_node_compat 装进了服务端 conf/"
+else
+    bad "install.sh 装完 conf/ 仍缺 compat2.py / lib/proxy_node_compat —— 部署机上发布闸门必失败"
+fi
+cat > "$DEPLOY/native.json" <<'JSON'
+{"outbounds":[{"type":"shadowsocks","tag":"ss01","server":"1.2.3.4","server_port":8388,
+"method":"aes-128-gcm","password":"pw"}]}
+JSON
+printf '%s\n' 'ss://YWVzLTEyOC1nY206cHc=@1.2.3.4:8388#ss01' > "$DEPLOY/link.txt"
+if python3 "$DEPLOY/conf/uri_express.py" report "$DEPLOY/native.json" \
+        --link "ss01=$DEPLOY/link.txt" --json >/dev/null 2>"$DEPLOY/err"; then
+    ok "部署布局下 conf/uri_express.py report 返回 0（发布闸门过得去）"
+else
+    bad "部署布局下 conf/uri_express.py 跑不起来, create/create-all 会一律拒绝发布: $(head -3 "$DEPLOY/err" 2>/dev/null | tr '\n' ' ')"
+fi
+
 if git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
     CHANGED="$(git -C "$REPO" status --porcelain | awk '{print $2}')"
     info "改动: $(printf '%s' "$CHANGED" | tr '\n' ' ')"
