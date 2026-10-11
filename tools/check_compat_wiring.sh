@@ -616,7 +616,8 @@ else bad "conf/share.sh 没有产出声明"; fi
 # 坑的形状: 判"是不是完整地址"若按串里有没有字面 `://`, 则一个含**未编码**取件
 # 地址的裸查询串（`…&url-sing-box=http://h/share/n`）会被误当成完整地址, 再去取
 # `urlsplit(s).query` —— 而它前面是 `interop=1&…`（含 `=`/`&`, 不构成 scheme）,
-# query 是**空串** → 声明丢了。判据只能看**有没有 scheme**。
+# query 是**空串** → 声明丢了。判据只能看**有没有 scheme**（真探测, 不是换个
+# 子串判据 —— 只把 `elif` 那句的 `://` 挪个位置**修不好**, 见下面 raw/?raw 两格）。
 title "8b · 声明解析: 三种入参形态 × 编码/未编码 必须同解"
 DECL_JS=$(python3 - "$REPO/src/conf/interop.py" <<'PY'
 import importlib.util, json, sys
@@ -626,7 +627,7 @@ spec.loader.exec_module(m)
 d = m.build_declaration("sing-box", "sing-box", "1.14.2",
                         formats=("uri", "sing-box"),
                         urls={"sing-box": "http://h:9443/share/native"})
-full = m.declare_url("http://h:9443/share/tok", d)
+full = m.declare_url("http://h:9443/share/tok", d)                      # 形态③ 完整地址
 enc = m.declaration_query(d)                                            # 已编码
 raw = enc.replace("%3A", ":").replace("%2F", "/").replace("%2C", ",")   # 未编码
 base = m.decide(m.parse_declaration(full), "sing-box", "sing-box")[:3]  # choice/reason/url
@@ -640,15 +641,19 @@ def probe(s):
     return "" if t == base else "decide 与完整地址不同: %r vs %r" % (t, base)
 
 
-print(json.dumps({"enc": probe(enc), "q": probe("?" + enc), "raw": probe(raw)},
+# 形态① 裸查询串（raw = url-* 未编码, 含字面 ://）/ 形态② `?`+裸查询串
+# 形态③ 完整地址即 base; 另附编码版裸查询串（SB 自己 declaration_query 的产物）
+print(json.dumps({"enc": probe(enc), "q": probe("?" + enc),
+                  "raw": probe(raw), "qraw": probe("?" + raw)},
                  ensure_ascii=False))
 PY
 )
 E_ENC=$(printf '%s' "$DECL_JS" | jq -r '.enc' 2>/dev/null)
 E_Q=$(printf '%s' "$DECL_JS" | jq -r '.q' 2>/dev/null)
 E_RAW=$(printf '%s' "$DECL_JS" | jq -r '.raw' 2>/dev/null)
-if [[ -n "$E_ENC" || -n "$E_Q" ]]; then
-    bad "编码裸查询串 / '?' 前缀形态解析不一致: ${E_ENC}${E_Q}"
+E_QRAW=$(printf '%s' "$DECL_JS" | jq -r '.qraw' 2>/dev/null)
+if [[ -n "$E_ENC" || -n "$E_Q" || -n "$E_QRAW" ]]; then
+    bad "编码裸查询串 / '?' 前缀形态解析不一致: ${E_ENC}${E_Q}${E_QRAW}"
 else
     ok "编码裸查询串 / '?' 前缀形态 → 与完整地址同解（choice/reason/url）"
 fi
