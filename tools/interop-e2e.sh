@@ -70,6 +70,7 @@ rm -rf "$WORK"; mkdir -p "$WORK/etc" "$WORK/data" "$WORK/srv/out"
 printf 'x' > "$WORK/etc/admin.token"
 printf 'SHARE_PORT=%s\n' "$PORT" > "$WORK/etc/env"
 
+
 # ---- 语料: 合成最小集, 或真实部署的只读拷贝 ----
 if [[ -n "$CORPUS" && -d "$CORPUS" ]]; then
   echo "=== 语料: 真实部署（只读拷贝）$CORPUS ==="
@@ -130,6 +131,43 @@ PY
 fi
 # 聚合产物: 真实语料自带 sb_client-all.json; 合成语料用**生产路径**生成一份
 # （带 "<服务器前缀>-" 的 tag）—— 前缀剥离是发布闸门的一部分, 必须被验到。
+# ---- 端口探活: 给一个 `ss` 桩, 只声明"语料里配置的端口都在听" ----
+# 服务端的一致性校验（`share.sh check` / create 的发布闸门）会探活 `ss`，而
+# **死端口是拒绝发布的**（`bad=1`）。本验证台吃的常常是**另一台机器**上真实部署
+# 的只读语料 —— 那些端口当然不在本机监听。拿本机 ss 去判, 结果是"语料来自别的
+# 机器"被误判成"节点全挂了" → 发布闸门拒绝发布 → 验证台在第 2 段就死掉。
+#
+# 这不是在放宽断言: 端口在不在听是**宿主**的属性, 不是本验证台要验的东西
+# （它验的是两条产品/声明/决策/回退/成对生命周期）。那条语义由
+# `check_compat_wiring.sh` 8e 段用**真机捕获的 ss 输出形状**钉死, 真机上还有
+# `bash conf/share.sh check all` 这一关。
+# 桩的输出从语料自己的 config/*.json 生成 —— 声明"语料说要听的, 就当它在听"。
+mkdir -p "$WORK/fakebin"
+python3 - "$WORK" <<'PY'
+import glob, json, os, sys
+work = sys.argv[1]
+lines = []
+for f in glob.glob(os.path.join(work, "srv", "config", "*.json")):
+    try:
+        d = json.load(open(f, encoding="utf-8"))
+    except Exception:
+        continue
+    for i in d.get("inbounds") or []:
+        p = i.get("listen_port")
+        listen = i.get("listen") or "0.0.0.0"
+        if not p:
+            continue
+        host = "[::]" if listen in ("::", "[::]") else ("*" if listen in ("0.0.0.0", "*", "") else listen)
+        lines.append("tcp LISTEN 0      4096   %s:%s    *:*" % (host, p))
+        if i.get("type") in ("hysteria2", "tuic"):
+            lines.append("udp UNCONN 0      0      %s:%s    *:*" % (host, p))
+open(os.path.join(work, "fakebin", "ss"), "w", encoding="utf-8").write(
+    "#!/bin/sh\ncat <<'TBL'\n" + "\n".join(lines) + "\nTBL\n")
+os.chmod(os.path.join(work, "fakebin", "ss"), 0o755)
+print("=== 端口探活: ss 桩声明语料里 %d 个端口在听（本机不是那台服务器） ===" % len(lines))
+PY
+export PATH="$WORK/fakebin:$PATH"
+
 echo "e2e" > "$WORK/srv/share-state/server-name"
 export SB_ROOT="$WORK/srv" SB_CONFIG_DIR="$WORK/srv/config" SB_OUT_DIR="$WORK/srv/out" \
        SB_SERVER_NAME="e2e" SB_BIN="${SB_E2E_CLIENT_BIN:-sing-box}"
