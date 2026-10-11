@@ -12,6 +12,15 @@ SRV_ROOT="${SRV_ROOT:-/root/catmi/sing-box}"
 CLI_ROOT="${CLI_ROOT:-/opt/sb-client}"
 SRC_DIR="${SRC_DIR:-$SRV_ROOT/src-upstream}"
 RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; BLUE='\033[36m'; PLAIN='\033[0m'
+
+# 界面符号。★ **必须在这里给默认值**，理由不是好看：
+#   本脚本第 9 行是 `set -u`，而它在**全新机器**上跑的第一段就是服务端初始化 ——
+#   一个"只在某一行用到"的装饰符号漏了定义，就会让整个安装**直接中断**。
+#   实测（2026-10-11 全新机，服务端初始化）：
+#       /tmp/catmi-proxy.XXXX: line 303: ARROW: unbound variable
+#   卡在「正在初始化 Sing-box 服务端...」。装饰性符号**永远不该有能力让安装失败**，
+#   所以统一放在这里兜底，而不是在用到的地方随手写一个 —— 那样下一次改版还会漏。
+ARROW='→'
 info(){ printf "${BLUE}[INFO] %s${PLAIN}\n" "$*"; }
 ok(){   printf "${GREEN}[OK]   %s${PLAIN}\n" "$*"; }
 warn(){ printf "${YELLOW}[WARN] %s${PLAIN}\n" "$*"; }
