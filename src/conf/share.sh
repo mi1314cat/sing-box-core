@@ -172,19 +172,55 @@ except Exception: print("")' "$2" 2>/dev/null
 
 # 把声明并进订阅地址 —— 声明只有 interop.py 一处实现（客户端读的是同一份定义,
 # 门禁比对两份拷贝的 sha256）。
-sb_share_declare_url() { # <主地址> <发行版> <版本> [原生地址]
-    local url="$1" dist="$2" ver="$3" native="${4:-}"
+sb_share_declare_url() { # <主地址> <发行版> [原生地址]
+    # ★ 不再在地址上产出 `version`（用户拍板: 声明要短）。版本不会丢 —— 原生
+    #   产品与分享 meta 里本来就有自描述(kernel / distribution / kernel_version)。
+    #   解析侧**仍然接受** `version`（第三方可能写）, 只是不参与决策 —— 所以这里
+    #   不传就够了, 不需要改契约、也不需要 bump schema。
+    local url="$1" dist="$2" native="${3:-}"
     local -a extra=()
     [[ -n "$native" && -n "$dist" ]] && extra=(--url-"$dist" "$native")
     python3 "$SB_INTEROP_PY" declare --kernel sing-box --distribution "$dist" \
-        --version "$ver" --url "$url" "${extra[@]}" 2>/dev/null
+        --url "$url" "${extra[@]}" 2>/dev/null
+}
+
+# 同源判定: 严格按 **(scheme, host, port)** 比 —— **必须比端口**。
+# 只比 host 会把"同一台机器上的另一个分享服务"误判成同源, 于是写出一个指向
+# **自己**的相对路径, 客户端拼出来的原生地址是错的, 而两边都不报错。
+# 端口缺省要归一（http→80 / https→443）, 否则 `http://h/x` 与 `http://h:80/x`
+# 会被判成异源。
+sb_same_origin() { # <地址A> <地址B> → 0=同源
+    python3 - "$1" "$2" <<'PY'
+import sys, urllib.parse
+
+
+def key(u):
+    p = urllib.parse.urlsplit(str(u or "").strip())
+    sch = (p.scheme or "").lower()
+    default = {"http": 80, "https": 443}.get(sch)
+    return (sch, (p.hostname or "").lower(), p.port or default)
+
+
+sys.exit(0 if key(sys.argv[1]) == key(sys.argv[2]) else 1)
+PY
+}
+
+# 同源 → 只留 path(+query)。**不**做 urljoin, 不猜: 这个函数只在调用方已经
+# 判定过同源之后才用。
+sb_rel_path() { # <绝对地址> → 相对路径
+    python3 - "$1" <<'PY'
+import sys, urllib.parse
+p = urllib.parse.urlsplit(str(sys.argv[1] or "").strip())
+q = ("?" + p.query) if p.query else ""
+sys.stdout.write(p.path + q)
+PY
 }
 
 # 一条分享 → 该给用户的**带声明地址**。
 # 地址**不落盘**, 每次现算: 地址族切换 (sb_switch_addr_family) 会改对外 host,
 # 落盘的声明会留着旧 host 而面板显示一切正常 —— 那就是一条死链。
 sb_share_declared_url() { # <主 token> [原生 token]
-    local tok="$1" ntok="${2:-}" port host url facts dist ver d
+    local tok="$1" ntok="${2:-}" port host url facts dist d nurl
     port=$(sb_share_port)
     host="${SB_SHARE_HOST:-}"
     [[ -n "$host" ]] || host=$(sb_addr_current)
@@ -193,14 +229,16 @@ sb_share_declared_url() { # <主 token> [原生 token]
     url="http://$(sb_url_host "$host"):$port/share/$tok"
     facts=$(sb_share_self_facts)
     dist=$(sb_share_fact "$facts" distribution)
-    ver=$(sb_share_fact "$facts" version)
     if [[ -z "$ntok" || -z "$dist" ]]; then
         # 没有原生也要声明 —— 声明"我只提供普通话"比不声明更诚实:
         # 客户端日志里会写"服务端清单里没有本机发行版", 而不是"地址上没有声明"。
-        d=$(sb_share_declare_url "$url" "" "$ver" "")
+        d=$(sb_share_declare_url "$url" "" "")
     else
-        d=$(sb_share_declare_url "$url" "$dist" "$ver" \
-              "http://$(sb_url_host "$host"):$port/share/$ntok")
+        nurl="http://$(sb_url_host "$host"):$port/share/$ntok"
+        # ★ 同源 → 相对路径（缩短下发地址）; **异源仍写绝对地址**。
+        #   这一步只影响"地址长什么样", 解析侧两边都认。
+        sb_same_origin "$url" "$nurl" && nurl=$(sb_rel_path "$nurl")
+        d=$(sb_share_declare_url "$url" "$dist" "$nurl")
     fi
     printf '%s' "${d:-$url}"
 }

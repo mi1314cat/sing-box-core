@@ -925,6 +925,109 @@ if git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
     fi
 fi
 
+# ---- 8g: 声明缩短（去 version + 同源相对路径）—— 三家契约必须逐条相同
+# 用户拍板: 声明里去掉 `version`, 原生产品地址在同源时写成相对路径。
+# 三件事都不能错:
+#   · 去 version 只是**产出侧**不再写; **解析侧仍必须接受**（第三方可能写）,
+#     且不参与决策 —— 所以不 bump schema, 旧地址照样判 native。
+#   · 同源判定要严格按 (scheme, host: **port**) —— 只比 host 会把同机另一个分享
+#     服务误判成同源, 于是写出指向自己的相对路径, 两边都不报错。
+#   · 拼回绝对地址时**不许引入 urljoin 语义、不许猜**: `//other.host/x`、`/share/`、
+#     `../x` 一律原样保留 → bad-native-url。判"末段非空"必须看**原样**串:
+#     先 rstrip("/") 会把 `/share/` 看成末段="share" → 拼出一条看起来合法的死链。
+title "8g · 声明缩短: 去 version + 同源相对路径（异源/畸形一律不猜）"
+F7="$TMP/f7"; rm -rf "$F7"; mkdir -p "$F7"
+if grep -A6 '^sb_share_declare_url() {' "$REPO/src/conf/share.sh" | grep -q -- '--version'; then
+    bad "share.sh 仍在声明里产出 version"
+else
+    ok "服务端产出侧不再带 version（解析侧仍接受, 见下）"
+fi
+cat > "$F7/probe.py" <<'PY'
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("it", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+
+
+def decl_of(url, native):
+    d = m.build_declaration("sing-box", "sing-box", "",
+                            formats=("uri", "sing-box"), urls={"sing-box": native})
+    return m.declare_url(url, d)
+
+
+out = {}
+out["has_version"] = "version=" in m.declaration_query(
+    m.build_declaration("sing-box", "sing-box", "", formats=("uri", "sing-box"),
+                        urls={"sing-box": "/share/n"}))
+g = m.parse_declaration(decl_of("http://h:9443/share/tok", "/share/native"))
+out["rel_resolved"] = g["urls"].get("sing-box")
+out["rel_decide"] = list(m.decide(g, "sing-box", "sing-box")[:2])
+old = m.declare_url("http://h:9443/share/tok", m.build_declaration(
+    "sing-box", "sing-box", "1.14.2", formats=("uri", "sing-box"),
+    urls={"sing-box": "http://h:9443/share/native"}))
+go = m.parse_declaration(old)
+out["old_has_version"] = "version=" in old
+out["old_decide"] = list(m.decide(go, "sing-box", "sing-box")[:2])
+out["bad"] = {}
+for v in ("/share/", "//other.host/x", "/", "../x"):
+    gb = m.parse_declaration(decl_of("http://h:9443/share/tok", v))
+    ch, rs = m.decide(gb, "sing-box", "sing-box")[:2]
+    out["bad"][v] = {"kept": gb["urls"].get("sing-box"), "reason": rs, "choice": ch}
+bare = m.declaration_query(m.build_declaration(
+    "sing-box", "sing-box", "", formats=("uri", "sing-box"),
+    urls={"sing-box": "/share/native"}))
+gb = m.parse_declaration(bare)
+out["bare_kept"] = gb["urls"].get("sing-box")
+out["bare_reason"] = m.decide(gb, "sing-box", "sing-box")[1]
+print(json.dumps(out, ensure_ascii=False))
+PY
+F7JS=$(python3 "$F7/probe.py" "$REPO/src/conf/interop.py" 2>/dev/null)
+j() { printf '%s' "$F7JS" | jq -r "$1" 2>/dev/null; }
+[[ "$(j .has_version)" == "false" ]] \
+    && ok "build_declaration(version=\"\") 产出的查询串里没有 version" \
+    || bad "产出侧仍在写 version"
+[[ "$(j .rel_resolved)" == "http://h:9443/share/native" && "$(j '.rel_decide|join("/")')" == "native/native-listed" ]] \
+    && ok "相对路径 → 拼回绝对（$(j .rel_resolved)）且判 native" \
+    || bad "相对路径没拼回来或没判 native: $(j .rel_resolved) / $(j '.rel_decide|join("/")')"
+[[ "$(j .old_has_version)" == "true" && "$(j '.old_decide|join("/")')" == "native/native-listed" ]] \
+    && ok "旧格式（绝对 + 带 version）仍判 native —— 解析侧接受 version, 只是不用它" \
+    || bad "旧格式被改判了: version在=$(j .old_has_version) decide=$(j '.old_decide|join("/")')"
+BADOK=1
+for v in "/share/" "//other.host/x" "/" "../x"; do
+    k=$(j ".bad[\"$v\"].kept"); r=$(j ".bad[\"$v\"].reason"); c=$(j ".bad[\"$v\"].choice")
+    [[ "$k" == "$v" && "$r" == "bad-native-url" && "$c" == "uri" ]] || BADOK=0
+done
+(( BADOK )) \
+    && ok "/share/ · //other.host/x · / · ../x → 原样保留且 bad-native-url（末段判据看原样串, 无 urljoin 语义）" \
+    || bad "畸形相对形态被误拼或误判"
+[[ "$(j .bare_kept)" == "/share/native" && "$(j .bare_reason)" == "bad-native-url" ]] \
+    && ok "裸查询串形态没有 base → 不猜（原样保留 → bad-native-url）" \
+    || bad "裸查询串把相对路径猜成了绝对: $(j .bare_kept)"
+# 同源 helper 用**真 share.sh 的代码**测（含端口不同这一格 —— M 侧踩过的坑）
+F7FNS=$(python3 - "$REPO/src/conf/share.sh" <<'PY'
+import re, sys
+src = open(sys.argv[1], encoding="utf-8").read()
+for n in ("sb_same_origin", "sb_rel_path"):
+    m = re.search(r'^%s\(\) \{.*?^\}' % n, src, re.S | re.M)
+    sys.stdout.write(m.group(0) + "\n")
+PY
+)
+F7R=$(bash -c "$F7FNS"'
+r=""
+for pair in "http://h:9443/share/a|http://h:9443/share/b:同源" \
+            "http://h:9443/share/a|http://h:8443/share/b:异源" \
+            "http://h/share/a|http://h:80/share/b:同源" \
+            "http://h/x|https://h/y:异源"; do
+  p=${pair%:*}; want=${pair##*:}; a=${p%%|*}; b=${p##*|}
+  if sb_same_origin "$a" "$b"; then got=同源; else got=异源; fi
+  [ "$got" = "$want" ] || r="$r [$a vs $b 期望$want 得到$got]"
+done
+[ "$(sb_rel_path http://h:9443/share/tok)" = "/share/tok" ] || r="$r [rel_path 错]"
+printf "%s" "$r"')
+[[ -z "$F7R" ]] \
+    && ok "同源判定按 (scheme, host, port)：端口不同=异源, 80/443 缺省归一（用真 share.sh 的 helper 测）" \
+    || bad "同源判定错:$F7R"
+
 # ------------------------------------------------------------------ 汇总
 title "汇总"
 printf '  \033[32m通过 %d\033[0m / \033[31m失败 %d\033[0m\n' "$PASS" "$FAIL"

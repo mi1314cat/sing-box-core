@@ -165,6 +165,28 @@ def declare_url(url, decl) -> str:
         (u.scheme, u.netloc, u.path, urllib.parse.urlencode(q + extra), frag))
 
 
+def _is_rel_path(v) -> bool:
+    """`url-*` 的取值是不是「同源相对路径」。
+
+    **只认**「单个 `/` 开头 且 **原样末段非空**」:
+
+      · `/share/<token>`   → 是
+      · `/share/`          → **不是**（末段为空）
+      · `/`                → **不是**
+      · `//other.host/x`   → **不是**（协议相对, 指向**另一个源**, 不是同源相对）
+      · `../x` / `x/y`     → **不是**（不发散、不猜 —— 没有 urljoin 语义）
+
+    ★ 判末段必须看**原样**字符串。先 `rstrip("/")` 再看的话, `/share/` 会变成
+      `/share`、末段成 "share" → 被判成合法 → 拼出 `http://h:9443/share/` 这条
+      "看起来完全合法"的死链, 而两边都不报错。X 侧第一版就踩了这个坑。
+    """
+    s = str(v or "")
+    if not s.startswith("/") or s.startswith("//"):
+        return False
+    path = s.split("?", 1)[0].split("#", 1)[0]
+    return bool(path.rsplit("/", 1)[-1])
+
+
 def parse_declaration(text):
     """从订阅地址（或裸查询串）里读声明。读不到返回 None。
 
@@ -183,10 +205,15 @@ def parse_declaration(text):
         # 客户端悄悄走普通话, 不报错。本函数的 docstring 承诺支持「或裸查询串」,
         # 承诺了就得做到（三家实现也必须对同一入参同解, 不许各写一套判据）。
         _u = urllib.parse.urlsplit(s)
+        base = ""                      # 相对取件地址的 base（见下面的拼回）
         if s.startswith("?"):
             q = s.lstrip("?")          # `?a=1&b=2` 形态
         elif _u.scheme:
             q = _u.query               # 完整地址 → 取它的查询串
+            # ★ 只有「完整地址」形态才**有 base**。裸查询串形态没有来源, 也就
+            #   拼不回绝对地址 —— 那种情况下相对路径**原样留着**, 由 _usable_url
+            #   判成 bad-native-url。**不猜**（没有 origin 可比, 拿谁当 base 都是编）。
+            base = "%s://%s" % (_u.scheme, _u.netloc)
         elif "=" in s:
             q = s                      # 裸查询串（测试/手工调试用）
         else:
@@ -205,6 +232,14 @@ def parse_declaration(text):
         for k, v in low.items():
             if k.startswith(URL_PREFIX) and len(k) > len(URL_PREFIX):
                 urls[k[len(URL_PREFIX):]] = str(v or "").strip()
+        # 同源取件地址允许写成**相对路径**（`/share/<token>`）—— 服务端在同源时才
+        # 这么写, 用来缩短下发地址。这里拼回绝对地址; **拼不回来的一律原样保留**,
+        # 让它照旧走 bad-native-url（旧实现读相对路径就是这个结果: 安全、可见）。
+        for _k in list(urls):
+            _v = urls[_k]
+            if not _is_rel_path(_v) or not base:
+                continue
+            urls[_k] = base + _v
         fmts = [normalize_label(x) for x in
                 str(low.get(PARAM_FORMATS, "")).split(",") if x.strip()]
         return {
