@@ -176,9 +176,18 @@ def parse_declaration(text):
         s = str(text or "").strip()
         if not s:
             return None
-        if "?" in s and "://" in s or s.startswith("?"):
-            q = urllib.parse.urlsplit(s).query if "://" in s else s.lstrip("?")
-        elif "=" in s and "://" not in s:
+        # 「是不是完整地址」只能按**有没有 scheme** 判, 不能按串里有没有字面 `://`:
+        # 裸查询串里未编码的取件地址（`…&url-sing-box=http://h/share/n`）也含 `://`,
+        # 而它前面是 `interop=1&…`（含 `=`/`&`, 不构成 scheme）—— 先判 `://` 就会去取
+        # `urlsplit(s).query`, 那是**空串** → 声明丢了 → 静默 `no-declaration` →
+        # 客户端悄悄走普通话, 不报错。本函数的 docstring 承诺支持「或裸查询串」,
+        # 承诺了就得做到（三家实现也必须对同一入参同解, 不许各写一套判据）。
+        _u = urllib.parse.urlsplit(s)
+        if s.startswith("?"):
+            q = s.lstrip("?")          # `?a=1&b=2` 形态
+        elif _u.scheme:
+            q = _u.query               # 完整地址 → 取它的查询串
+        elif "=" in s:
             q = s                      # 裸查询串（测试/手工调试用）
         else:
             q = ""                     # 没有查询串 → 没有声明
