@@ -6,8 +6,7 @@
 # 管理: Clash API (external_controller) + metacubexd Web UI
 # 服务: systemd sb-client.service (缺失时回退 transient sb-client-adhoc)
 # 导入: client.sh add <share-url | local.json>
-# CLI: bash client.sh {install|init|add|list|update|del|start|stop|restart|reload|status|info|check|compat|install-ui|service|settings}
-# 兼容性判定: proxy-node-compat(判定层) + compat2.py(适配层), 详见 src/client/compat2.py
+# CLI: bash client.sh {install|init|add|list|update|del|start|stop|restart|reload|status|info|check|install-ui|service|settings}
 # 部署根目录默认 /opt/sb-client (可在 /etc/sb-client.env 覆盖)
 # ==============================================================
 set -u
@@ -292,12 +291,9 @@ SUB_PORT="${SUB_PORT:-9293}"
 SUB_SERVER="${SUB_SERVER:-$CLIENT_ROOT/share-state/sub_server.py}"
 # 订阅格式转换器 (install.sh 随 client.sh 一起复制过来)
 SB_TO_SB="${SB_TO_SB:-$CLIENT_ROOT/share-state/to_sb.py}"
-# 兼容性判定适配层 (proxy-node-compat 的 vendored 副本 + compat2.py)。
-# 判定只在 compat 里发生一次; 这里是**消费方**: 丢掉它明确说"内核没有"的节点,
+# （互通期的兼容性判定适配层 compat2.py + vendored proxy_node_compat 已随互通移除;
+#   现在只保留转换器自身的表达能力闸门, 见 to_sb.py 的 _keep()。）
 # 并把 reason_code 生成的说明打给用户。缺文件/异常/回滚开关下自动回到旧路径。
-SB_COMPAT_PY="${SB_COMPAT_PY:-$CLIENT_ROOT/share-state/compat2.py}"
-# compat 最近一次的判定结果 (losses/unknowns/extensions/raw_uri 都在里面)
-SB_COMPAT_REPORT="${SB_COMPAT_REPORT:-$CLIENT_ROOT/share-state/.compat-last.json}"
 
 # 下载通道选择 (auto / off / 代理地址)。
 # 必须放在 CLIENT_ROOT 之后 —— 之前它写在前面, set -u 下引用未定义的
@@ -1090,102 +1086,6 @@ sub_menu() {
     done
 }
 
-# ---------- compat: 判定结果摘要 ----------
-# 只做展示: 判定与文案都由 compat2.py 出, 这里不重新判断任何东西。
-compat_brief() { # compat_brief <report.json>
-    local rep="$1"
-    [[ -s "$rep" ]] || return 0
-    python3 - "$rep" <<'PYEOF2' >&2
-import json, sys
-try:
-    d = json.load(open(sys.argv[1], encoding="utf-8"))
-except Exception:
-    sys.exit(0)
-# to_sb.py 的报告: {"compat": {"nodes": [...]}}
-nodes = (d.get("compat") or {}).get("nodes") or d.get("nodes") or []
-drop = [n for n in nodes if not n.get("ok", True)]
-loss = [n for n in nodes if n.get("ok", True) and n.get("client_losses")]
-tgt = (d.get("compat") or {}).get("target") or d.get("target") or {}
-if not nodes:
-    sys.exit(0)
-print("  compat 判定: %d 个节点, 跳过 %d, 转换有损失 %d (内核 %s %s)"
-      % (len(nodes), len(drop), len(loss), tgt.get("version") or "?",
-         ("tags=" + ",".join(tgt.get("build_tags") or [])) if tgt.get("build_tags") else "tags=未知"))
-for n in drop[:6]:
-    print("    ✗ %s -> %s" % (n.get("tag"), (n.get("message") or ["不支持"])[0][:160]))
-for n in loss[:6]:
-    print("    ⚠ %s: %s" % (n.get("tag"), n["client_losses"][0].get("what", "")[:160]))
-if len(drop) > 6:
-    print("    … 其余 %d 条见 %s" % (len(drop) - 6, sys.argv[1]))
-PYEOF2
-}
-
-# ---------- compat 闸门: 输入已经是 sing-box JSON ----------
-# 客户端的自家 share / 本地配置走这条路（以前一个字段都不判）。过滤是**原地**的:
-# 只有 compat 明确说 UNSUPPORTED 的出站会被拿掉, 其余原样保留。
-compat_gate_json() { # compat_gate_json <profile.json>; 返回非 0 = 全被拿掉了
-    local f="$1" out="$1.gated"
-    [[ -s "$f" ]] || return 0
-    if [[ ! -f "$SB_COMPAT_PY" ]]; then
-        print_warn "compat 适配层缺失 ($SB_COMPAT_PY), 本次不做兼容性判定 (重跑安装脚本可补上)"
-        return 0
-    fi
-    command -v python3 >/dev/null 2>&1 || return 0
-    rm -f "$out" "$SB_COMPAT_REPORT"
-    local line
-    while IFS= read -r line; do [[ -n "$line" ]] && print_warn "$line"; done < <(
-        python3 "$SB_COMPAT_PY" filter-json "$f" --out "$out" --report "$SB_COMPAT_REPORT" 2>&1 >/dev/null
-    )
-    local n; n=$(jq '.outbounds|length' "$out" 2>/dev/null || echo 0)
-    if [[ -s "$out" ]] && [[ "$n" != "0" ]]; then
-        mv -f "$out" "$f"
-        compat_brief "$SB_COMPAT_REPORT"
-        return 0
-    fi
-    rm -f "$out"
-    compat_brief "$SB_COMPAT_REPORT"
-    if [[ "$n" == "0" ]]; then
-        print_err "compat 判定后这份配置里没有可用节点了 (逐条原因见 $SB_COMPAT_REPORT)"
-        return 1
-    fi
-    return 0
-}
-
-# ---------------------------------------------------------------- 三家互通
-# 订阅地址上的**内核声明** → 这次拉哪一份产品。设计:
-# proxy-node-compat/docs/three-way-interop.md
-#
-#   同内核**同发行版** → 原生(sing-box JSON, URI 装不下的字段不丢)
-#   跨内核 / 声明缺失 / 声明不认识 / 发行版不在清单 → 普通话(URI 列表)
-#
-# 决策只看**地址本身**: 不额外发请求、不看 User-Agent、不做任何协商。
-# 服务端声明用的是查询串, 而公共分享服务的路由先剥查询串再分发
-# (share_service.py:768) —— 所以带声明的地址对第三方客户端零影响。
-#
-# 声明解析器与**服务端**用的是同一份实现(sha256 相同), 放在
-# share-state/lib/interop.py（install.sh 随 compat 层一起装）。
-_sb_interop_path() {   # 找得到打印路径, 找不到返回 1
-    local p="${SB_INTEROP_PY:-$CLIENT_ROOT/share-state/lib/interop.py}"
-    if [[ -s "$p" ]]; then printf '%s' "$p"; return 0; fi
-    if [[ -s "$CLIENT_ROOT/share-state/interop.py" ]]; then
-        printf '%s' "$CLIENT_ROOT/share-state/interop.py"; return 0
-    fi
-    return 1
-}
-
-# <订阅地址> → 一行 JSON（读不到打印空串）。CLIENT_BIN 显式传给解析器:
-# "我是哪个发行版"必须与客户端真正用的那个二进制一致(变量没 export 时
-# interop.py 看不到它, 会退回 PATH 里的 sing-box —— 那就是另一个内核了)。
-_sb_interop_decide() {
-    local py; py=$(_sb_interop_path) || { printf ''; return 0; }
-    SB_INTEROP_BIN="$CLIENT_BIN" python3 "$py" decide "$1" 2>/dev/null || true
-}
-
-_sb_interop_field() {  # <JSON> <字段>
-    printf '%s' "$1" | python3 -c 'import sys, json
-try: print((json.load(sys.stdin) or {}).get(sys.argv[1], "") or "")
-except Exception: print("")' "$2" 2>/dev/null || true
-}
 
 # 拉一个地址 → 打印 HTTP 状态码（失败打印 000）。
 # 永远返回 0: 调用方按状态码判断 —— helper 带非 0 退出会在 $(...) 赋值处
@@ -1224,36 +1124,12 @@ add_node() {
         # install 调用), 菜单 3 的拉取完全直连 —— 用户没安装时选过的通道,
         # 后面每次更新节点都用不上。这里复用同一个选择逻辑。
         sb_pick_proxy "拉取分享链接 (直连不通时可走本机代理)"
-        # ---- 内核声明 → 拉原生还是普通话 ----
-        local pick choice rurl detail code got=0 mode=uri
-        pick=$(_sb_interop_decide "$src")
-        choice=$(_sb_interop_field "$pick" choice); [[ -n "$choice" ]] || choice=uri
-        rurl=$(_sb_interop_field "$pick" url)
-        detail=$(_sb_interop_field "$pick" detail)
-        if [[ -z "$pick" ]]; then
-            detail="声明解析器不可用($(_sb_interop_path 2>/dev/null || echo '缺失')) → 按'没有声明'处理, 走普通话(URI 列表)"
-        fi
-        if [[ "$choice" == native && -n "$rurl" ]]; then
-            code=$(_sb_fetch_url "$rurl" "$tmp")
-            if [[ "$code" == 200 ]]; then
-                got=1; mode=native
-            else
-                # 回退: 声明说原生在那边, 但那边取不到 → 回到最通用的普通话。
-                # **必须把原因打出来**（"不许为了看起来能用而静默降级"）。
-                detail="${detail}；原生取件失败(${rurl}, HTTP ${code}) → 回退"
-            fi
-        fi
-        if (( got == 0 )); then
-            mode=uri
-            code=$(_sb_fetch_url "$src" "$tmp")
-            if _sb_fetch_err "$code"; then rm -f "$tmp"; return 1; fi
-        fi
-        # 本次到底拉的是哪一种, 用户要能一眼看出来（原生 / 普通话 + 为什么）。
-        if [[ "$mode" == native ]]; then
-            print_ok "本次拉取: 原生 sing-box JSON —— ${detail}"
-        else
-            print_msg "本次拉取: 普通话 URI 列表 —— ${detail}"
-        fi
+        # 直接拉取; 失败/非 200 由 _sb_fetch_err 说清原因并中止。
+        # （互通期这里会先读地址上的内核声明、决定拉原生还是普通话并留回退链;
+        #   回退后不再需要 —— 地址上也没有声明了。）
+        local code
+        code=$(_sb_fetch_url "$src" "$tmp")
+        if _sb_fetch_err "$code"; then rm -f "$tmp"; return 1; fi
         print_ok "分享配置已获取"
         # 登记的是**用户给的那个地址**(带声明): 刷新时重新决策, 而不是把
         # 本次选中的原生产物地址写死 —— 服务端换了发行版/撤回原生之后,
@@ -1312,10 +1188,7 @@ add_node() {
         # 会被分词成多个参数, 前缀里有空格就彻底错位。
         local cargs=("$tmp")
         [[ -n "$prefix" ]] && cargs+=(--prefix "$prefix")
-        rm -f "$SB_COMPAT_REPORT"
-        # --compat-report: 把 compat 的全量结果(losses/unknowns/extensions/raw_uri)
-        # 落一份到 share-state, 供这里打印与事后核对。
-        python3 "$SB_TO_SB" "${cargs[@]}" --compat-report "$SB_COMPAT_REPORT" > "$conv" 2>"$cerr"
+        python3 "$SB_TO_SB" "${cargs[@]}" > "$conv" 2>"$cerr"
         local rep; rep=$(cat "$cerr" 2>/dev/null)
         if [[ ! -s "$conv" ]] || [[ "$(jq '.outbounds|length' "$conv" 2>/dev/null || echo 0)" == "0" ]]; then
             rm -f "$tmp"; print_err "无法识别的订阅格式"
@@ -1337,7 +1210,6 @@ add_node() {
             print_warn "转换器跳过了 $skipn 条（订阅里的节点数与实际导入数因此不同）:"
             printf '%s' "$rep" | sed -n 's/^\[to_sb\] //p' | cut -c1-400 | sed 's/^/    /' >&2
         fi
-        compat_brief "$SB_COMPAT_REPORT"
         mv -f "$conv" "$tmp"
 
         # 登记订阅, 供「订阅管理」页列出/更新
@@ -1354,15 +1226,6 @@ add_node() {
                 --arg nm "$prefix" --argjson n "$cnt" --arg ts "$(date -Is)" \
                 '{id:$id,name:$nm,prefix:$pre,url:$url,kind:"external",nodes:$n,added_at:$ts}')"
             print_msg "已登记订阅「$prefix」($cnt 个节点), 可在「订阅管理」里更新"
-        fi
-    else
-        # 自家 share / 本地 sing-box JSON: 客户端以前**完全不判**（只靠整份
-        # sing-box check + 真实拨测）, 于是内核根本没有的字段只能等用户发现
-        # "这个节点连不上"。这里补一道 compat 闸门: 判定仍然是 compat 出的,
-        # 本脚本只决定"留还是丢"。
-        if ! compat_gate_json "$tmp"; then
-            rm -f "$tmp"
-            return 1
         fi
     fi
     local n_count
@@ -2108,18 +1971,6 @@ do_info(){ # Web UI / Clash API
     echo; echo
 }
 
-compat_cli(){ # 兼容性判定自检: 目标四元组(真探测的版本+build tags) + 适配层自检
-    if [[ ! -f "$SB_COMPAT_PY" ]]; then
-        print_err "compat 适配层缺失: $SB_COMPAT_PY (重跑安装脚本可补上)"
-        return 1
-    fi
-    command -v python3 >/dev/null 2>&1 || { print_err "需要 python3"; return 1; }
-    print_title "compat 目标 (真读 sing-box version)"
-    python3 "$SB_COMPAT_PY" version || return 1
-    echo
-    python3 "$SB_COMPAT_PY" selftest
-}
-
 check_menu(){ # 配置检查
     collect_status
     ui_title "配置检查"
@@ -2460,7 +2311,6 @@ case "${1:-}" in
     del) shift; del_node "$@" ;;
     update) shift; update_node ;;
     check) client_check_cli ;;
-    compat) compat_cli ;;
     start) do_start ;;
     stop) do_stop ;;
     restart) do_restart ;;
@@ -2470,5 +2320,5 @@ case "${1:-}" in
     settings) settings_menu ;;
     install-ui) download_ui ;;
     info) do_info ;;
-    *) echo "用法: client.sh {install|init|add <url>|list|del <tag>|update|start|stop|restart|reload|status|check|compat|service|install-ui|info}"; exit 1 ;;
+    *) echo "用法: client.sh {install|init|add <url>|list|del <tag>|update|start|stop|restart|reload|status|check|service|install-ui|info}"; exit 1 ;;
 esac

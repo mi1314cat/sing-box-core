@@ -206,13 +206,10 @@ def _ech_loss_note(ref):
     return {"feature": "standard:ech", "source": "to_sb", "what": what}
 
 
-def _unwritable_reason(name, r):
+def _unwritable_reason(name, r=None):
     """转换器写不出这个传输 → 明确拒绝（并说清这不是"内核不支持"的判定）。"""
-    v = (r or {}).get("verdict") or "（compat 未接入）"
-    msgs = (r or {}).get("message") or []
-    extra = ("; compat: " + msgs[0][:160]) if msgs else ""
-    return ("本转换器不会写 transport '%s'（compat 判定=%s%s）—— 明确拒绝, 不静默"
-            "降级成 tcp（内核侧不会报错, 只会永远连不上）" % (name, v, extra))
+    return ("本转换器不会写 transport '%s' —— 明确拒绝, 不静默降级成 tcp"
+            "（内核侧不会报错, 只会永远连不上）" % (name,))
 
 
 # --------------------------------------------------------------------------
@@ -630,86 +627,9 @@ def _std_uri(scheme, rest, frag, prefix):
 
 
 # --------------------------------------------------------------------------
-# compat 接入（proxy-node-compat 适配层 = compat2.py, 与本文件同目录）
-#
-# 分工: 这里**不判**任何能力, 只把"这个节点是什么"（原文链接 / 出站 dict）交给
-# compat2, 由它调 check_node 判一次, 然后消费结论。判定只在 compat 发生一次。
-#
-# 三条纪律:
-#   * compat 只能收紧: 它说 UNSUPPORTED 才丢节点; 其余一律保留（旧行为不变）
-#   * 回滚: SB_COMPAT_ENGINE=legacy 或 SB_COMPAT_DISABLE=1 → 完全回到旧路径
-#   * compat2 缺失/异常 → 自动落回旧路径, 绝不让导入失败
-# --------------------------------------------------------------------------
-_COMPAT = None
-
-
-def _compat_mod():
-    global _COMPAT
-    if _COMPAT is None:
-        try:
-            here = os.path.dirname(os.path.abspath(__file__))
-            if here not in sys.path:
-                sys.path.insert(0, here)
-            import compat2                                  # noqa: WPS433
-            _COMPAT = compat2
-        except Exception:                                   # noqa: BLE001
-            _COMPAT = False
-    return _COMPAT or None
-
-
-def compat_enabled():
-    return (_compat_mod() is not None
-            and os.environ.get("SB_COMPAT_ENGINE", "").strip().lower() != "legacy"
-            and os.environ.get("SB_COMPAT_DISABLE", "") != "1")
-
-
-def _compat_gate(rep, uri, ob, tag, declare=None):
-    """判一个节点 → 记录到 rep["compat"]; 返回 (结果 dict, 报告里那条记录)。
-
-    未接入 compat / compat 异常 → (None, None)（自动落回旧路径）。
-
-    declare: 转换器自己产生的"损失声明"（如 ECH 写不成 PEM）。它是**声明**, 不是
-    判定 —— 判定仍然只由 compat 出; 这里只把它挂到同一个节点记录上, 让 client.sh
-    的摘要和报告都能看见（绝不静默丢能力）。
-    """
-    mod = _compat_mod() if compat_enabled() else None
-    if mod is None:
-        return None, None
-    try:
-        r = mod.judge(uri=uri, outbound=ob, tag=tag or (ob or {}).get("tag"))
-    except Exception as e:                                  # noqa: BLE001
-        rep.setdefault("compat", {}).setdefault("errors", []).append(
-            "%s: %s" % (type(e).__name__, e))
-        return None, None
-    declare = [d for d in (declare or [])
-               if d.get("feature") not in
-               {(c or {}).get("feature") for c in (r.get("client_losses") or [])}]
-    for d in declare:
-        r["client_losses"] = list(r.get("client_losses") or []) + [d]
-        r["message"] = list(r.get("message") or []) + [d["what"]]
-    slot = rep.setdefault("compat", {})
-    slot.setdefault("target", r.get("target"))
-    rec = {
-        "tag": r.get("tag"), "type": (ob or {}).get("type"),
-        "verdict": r["verdict"], "verdict_source": r["verdict_source"],
-        "ok": r["ok"], "reason_codes": r["reason_codes"], "message": r["message"],
-        "raw_uri": r.get("raw_uri"), "extensions": r.get("extensions"),
-        "unknowns": r.get("unknowns"), "client_losses": r.get("client_losses"),
-        "downgrades": r.get("downgrades"),
-        "losses": (r.get("compat") or {}).get("losses"),
-        "warnings": r.get("warnings"),
-        "legacy": r.get("legacy"),
-    }
-    slot.setdefault("nodes", []).append(rec)
-    return r, rec
-
-
-def _compat_reason(r):
-    """跳过原因: 用 compat 的第一条文案（由 reason_code 生成, 已经说了缺什么/支持什么）"""
-    msgs = r.get("message") or []
-    m = msgs[0] if msgs else "compat 判定不支持"
-    rc = ",".join(r.get("reason_codes") or [])
-    return "compat[%s] %s" % (rc or "?", m[:180])
+# 三家互通的 compat 判定层（compat2.py + vendored proxy_node_compat）已随互通一起移除。
+# 注意: **转换闸门**（本转换器写不写得出的传输 / ECH）不是互通带来的, 它留在这里 ——
+# 见下面 _keep()。
 
 
 # --------------------------------------------------------------------------
@@ -745,56 +665,25 @@ def convert(data, prefix=""):
     def _keep(ob, uri=None, tag=None):
         """闸门。返回 True = 这条出站可以进配置。
 
-        两道闸门, 顺序固定:
+        **转换闸门**（本转换器写不写得出 —— 不是内核能力）:
+        链接里的传输 / ECH, to_sb 写不出就**明确拒绝**, 绝不静默降级成 tcp、
+        也绝不静默丢 ECH。标记由 uri_to_outbound / clash_to_outbound 挂在出站
+        dict 上（_TR_KEY / _ECH_KEY）, 这里第一件事就是取走 —— 保证内部键绝不
+        会落进配置文件。
 
-          ① **转换闸门**（本转换器写不写得出 —— 不是内核能力）
-            链接里的传输 / ECH, to_sb 写不出就**明确拒绝**, 绝不静默降级成 tcp、
-             也绝不静默丢 ECH。标记由 uri_to_outbound / clash_to_outbound 挂在
-             出站 dict 上（_TR_KEY / _ECH_KEY）, 这里第一件事就是取走 ——
-             保证内部键绝不会落进配置文件。
-             为什么必须写不出就拒: 静默成 tcp 的出站内核不报错, 只是永远连不上
-             （M 分享的 xhttp 节点就是这样被"导入成功"的）。
-          ② **compat 闸门**（内核能不能用）—— 判定与文案全部出自 compat;
-             它说 UNSUPPORTED 才丢节点。
+        为什么必须"写不出就拒": 静默成 tcp 的出站内核不报错, 只是永远连不上
+        （M 分享的 xhttp 节点就是这样被"导入成功"的）。
 
-        ①的判定也要 compat 的结论来兜底/说明: 把链接里**真实的**传输 / ECH
-        写进一份"只为判定"的副本交给 compat（它绝不进配置）。
+        （互通期的第二道 compat 闸门已随互通移除; 上面这道是转换器自身的表达
+          能力闸门, 与互通无关, 保留。ECH 的损失**照旧显式声明**, 不静默丢。）
         """
         tr_ref = ob.pop(_TR_KEY, None)
         ech_ref = ob.pop(_ECH_KEY, None)
-        judge_ob = ob
-        declare = []
-        if (tr_ref or ech_ref) and not uri:
-            # 没有原文链接时（mihomo YAML 片段 / 手贴 JSON）, compat 只能看出站 ——
-            # 那就把"链接里真实的传输 / ECH"写进一份**只为判定**的副本, 让它有的判。
-            # 有原文链接时**不这么做**: 原文才是权威, 而且必须保住 compat 自己那条
-            # "客户端转换环节丢了 X" 的对比（不能让它以为转换器把 X 写出来了）。
-            judge_ob = dict(ob)
-            if tr_ref:
-                judge_ob["transport"] = {"type": tr_ref}
-            if ech_ref:
-                t = dict(judge_ob.get("tls") or {})
-                t["enabled"] = True
-                t["ech"] = {"enabled": True,
-                            "query_server_name": ech_ref.get("query") or ""}
-                judge_ob["tls"] = t
-                declare.append(_ech_loss_note(ech_ref))
-        r, rec = _compat_gate(rep, uri, judge_ob, tag, declare=declare)
-        if r is not None and not r["ok"]:
-            _note(_compat_reason(r))
-            return False
         if tr_ref:
-            why = _unwritable_reason(tr_ref, r)
-            _note(why)
-            if rec is not None:
-                # 报告必须与最终结果一致: compat 没判死, 是**转换闸门**拒的 ——
-                # 记录成"跳过 + 原因", 否则摘要里会显示成"留着但有损失"。
-                rec["ok"] = False
-                rec["dropped_by"] = "to_sb.transport"
-                rec["message"] = list(rec.get("message") or []) + [why]
+            _note(_unwritable_reason(tr_ref, None))
             return False
-        if declare:
-            rep.setdefault("conversion_losses", []).extend(declare)
+        if ech_ref:
+            rep.setdefault("conversion_losses", []).append(_ech_loss_note(ech_ref))
         return True
 
     text = data.decode("utf-8", "replace") if isinstance(data, bytes) else data

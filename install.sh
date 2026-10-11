@@ -160,31 +160,8 @@ status_block() {
     [[ -d /run/systemd/system ]] && printf "服务(systemd): %s%s%s\n" "$([[ $(systemctl is-enabled sing-box 2>/dev/null) == enabled ]] && echo $GREEN已启用 || echo $YELLOW未启用)" "$PLAIN" ""
 }
 
-# 服务端 conf/ 必须**自包含**。
-#
-# conf/uri_express.py 是发布前的 URI 表达力闸门, 它 `import compat2`; 而 compat2
-# 又把**它自己同目录**下的 `lib/` 加进 sys.path, 再 `import proxy_node_compat`。
-# 所以 `compat2.py` 与 `lib/proxy_node_compat/` 必须**成对落在 conf/ 里**。
-#
-# 部署树上没有 src/client/ —— 只 `cp src/conf/.` 的话:
-#   uri_express.py → ModuleNotFoundError: No module named 'compat2' → 退出非 0
-#   → share.sh 的发布闸门「URI 表达力标注失败 —— 拒绝发布」
-#   → **整个分享功能不可用**（`create` / `create-all` 一律返回 1）。
-# 失败信息只有一句 traceback, 很容易被当成环境问题放过; 而这条闸门按设计
-# 就是"不过就不发", 所以它坏掉时面板不会给出任何像样的提示。
-# 与客户端同构: install.sh 也是把这两份装到 $CLI_ROOT/share-state/ 的。
-install_server_compat() {
-    cp -f "$SRC_DIR/src/client/compat2.py" "$SRV_ROOT/conf/compat2.py" 2>/dev/null
-    rm -rf "$SRV_ROOT/conf/lib/proxy_node_compat"
-    mkdir -p "$SRV_ROOT/conf/lib" 2>/dev/null
-    cp -r "$SRC_DIR/src/client/lib/proxy_node_compat" "$SRV_ROOT/conf/lib/" 2>/dev/null
-    find "$SRV_ROOT/conf/lib" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null
-    return 0
-}
-
 rsync_files() {
     cp -rf "$SRC_DIR/src/conf/." "$SRV_ROOT/conf/" 2>/dev/null
-    install_server_compat
     cp -f "$SRC_DIR/src/sing-box.sh" "$SRV_ROOT/" 2>/dev/null
     chmod +x "$SRV_ROOT/sing-box.sh" "$SRV_ROOT/conf/"*.sh 2>/dev/null
     ok "服务端脚本已热更新"
@@ -291,7 +268,6 @@ do_server() {
     info "正在初始化 Sing-box 服务端..."
     mkdir -p "$SRV_ROOT"/{conf,config,out,backup,share/shares} || die "目录创建失败"
     cp -rf "$SRC_DIR/src/conf/." "$SRV_ROOT/conf/" || die "模块复制失败"
-    install_server_compat
     cp -f "$SRC_DIR/src/sing-box.sh" "$SRV_ROOT/" || die "面板复制失败"
     chmod +x "$SRV_ROOT/sing-box.sh" "$SRV_ROOT/conf/"*.sh 2>/dev/null
     ok "项目文件"
@@ -403,20 +379,6 @@ do_client() {
     # 会让那个文件凭空多几百行, 而且没法单独更新。
     mkdir -p "$CLI_ROOT/share-state"
     cp -f "$SRC_DIR/src/client/to_sb.py" "$CLI_ROOT/share-state/to_sb.py" 2>/dev/null || true
-    # 兼容性判定层: 适配层 compat2.py + vendored 的 proxy-node-compat(含 rules.json)。
-    # 判定只在 compat 里发生一次, to_sb.py/client.sh 只消费结论。缺了它就自动回到
-    # 旧路径(只靠 sing-box check + 拨测), 不会因为少文件而拒绝导入。
-    cp -f "$SRC_DIR/src/client/compat2.py" "$CLI_ROOT/share-state/compat2.py" 2>/dev/null || true
-    rm -rf "$CLI_ROOT/share-state/lib"
-    mkdir -p "$CLI_ROOT/share-state/lib"
-    cp -r "$SRC_DIR/src/client/lib/proxy_node_compat" "$CLI_ROOT/share-state/lib/" 2>/dev/null || true
-    find "$CLI_ROOT/share-state/lib" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
-    chmod +x "$CLI_ROOT/share-state/compat2.py" 2>/dev/null || true
-    # 三家互通: 读订阅地址上的**内核声明**决定"拉原生还是普通话"。
-    # 与**服务端** conf/interop.py 是同一份实现（门禁比对两份 sha256）——
-    # 缺了它的表现是**静默全部走普通话**: 不报错, 只是原生格式永远拿不到。
-    cp -f "$SRC_DIR/src/client/lib/interop.py" "$CLI_ROOT/share-state/lib/interop.py" 2>/dev/null \
-        || info "缺少 interop.py（客户端将只走普通话 URI 列表, 不报错）"
     # 配置分发服务: 让局域网其他设备通过 URL 拉取本客户端的完整配置。
     # 缺了它菜单 19 会起不来 —— 单独抽成文件而不是塞进 client.sh, 就是
     # 为了它只有几十行、但需要能单独读单独改。
